@@ -1,12 +1,15 @@
-"""前処理1.xls（機械メンテナンス履歴）を SQLite に取り込む。
+"""機械メンテナンス履歴（前処理1.xls など）を SQLite に取り込む。
 
 使い方:
-    python import_xls.py [前処理1.xls] [--reset]
+    python import_xls.py [ファイル.xls ...] [--reset]
+    （ファイル省略時は、このフォルダの *.xls をすべて取り込む）
 
-1 シート = 1 設備。シート上部の設備情報・取引業者と、11 行目以降の履歴を読む。
-読めない日付や前後関係がおかしい日付は date_uncertain=1（要確認）にして元の表記を残す。
+1 シート = 1 設備。「実施年月日」の見出し行と「設備名」の行を探して位置を合わせるので、
+取引業者欄が 2 段あるなどで行がずれたシートも読める。
+読めない日付・日付なし・前後関係がおかしい日付は date_uncertain=1（要確認）にして元の表記を残す。
 """
 import argparse
+import glob
 import datetime as dt
 import os
 import re
@@ -15,15 +18,19 @@ import unicodedata
 
 import xlrd
 
-from db import connect, init_db, DB_PATH
+from db import DB_PATH, connect, guess_category, init_db, make_nickname, norm
 
-SKIP_SHEETS = {"原紙", "原紙 (17)", "Sheet1", "ﾐｰﾄｾﾊﾟﾚｰﾀｰｽｸﾘｭｰﾌｨﾙﾀｰ"}
-RETIRED_SHEETS = {"旧ｷｬﾘｱｸﾞﾗｲﾝﾀﾞｰ1号 (2)"}
-
-# 履歴部分の列位置（全シート共通）
+# 履歴部分の列位置（全ファイル共通。行位置はシートごとに見出しを探す）
 COL_TEIKI, COL_FUTEIKI, COL_DATE, COL_TIME = 0, 2, 4, 8
 COL_CONTENT, COL_REASON, COL_RESULT, COL_NOTE, COL_AUTHOR = 11, 16, 20, 27, 34
-FIRST_RECORD_ROW = 11
+
+# ファイル名 → エリア（職場）
+AREA_BY_FILE = [
+    ("前処理", "前処理"), ("後処理", "後処理"), ("タレ", "タレ工程"), ("原動機", "原動機"),
+    ("排水", "排水施設"), ("洗浄", "洗浄関係"), ("X線", "X線・金検"),
+]
+# 定期項目・部品の初期値は前処理1.xls の内容から作っている
+SEED_FILE = "前処理1.xls"
 
 # 履歴と備考から読み取った定期交換・点検ルール（間隔は現場確認前の仮設定を含む）
 RULE_SEEDS = [
@@ -68,16 +75,6 @@ PART_TYPE = "フィルタースクリュー"
 SERIAL_RE = re.compile(r"M?\d{4,5}\.\d", re.IGNORECASE)
 
 
-def norm(s):
-    """半角カナと全角英数だけを正規化する（①や㈱はそのまま残す）。"""
-    if s is None:
-        return ""
-    s = str(s)
-    s = re.sub(r"[｡-ﾟ]+", lambda m: unicodedata.normalize("NFKC", m.group()), s)
-    s = re.sub(r"[！-～]+", lambda m: unicodedata.normalize("NFKC", m.group()), s)
-    return s.replace("　", " ").strip()
-
-
 def cell_text(sheet, r, c):
     if r >= sheet.nrows or c >= sheet.ncols:
         return ""
@@ -100,9 +97,10 @@ def parse_date(sheet, r, c, datemode):
             return f"{y:04d}-{m:02d}-{d:02d}", str(v), 0
         v = str(v)
     raw = norm(v)
-    s = raw.replace(" ", "")
-    m = re.fullmatch(r"(\d{2}|\d{4})[./](\d{1,2})[./](\d{1,2})", s)
-    if m:
+    s = re.sub(r"[/,、]", ".", raw.replace(" ", ""))
+    # 年.月.日（後ろに「~15」「・14」など期間の続きがあれば最初の日付を採用）
+    m = re.match(r"(\d{2}|\d{4})\.(\d{1,2})\.(\d{1,2})(?!\d)(.*)", s)
+    if m and (not m.group(4) or not m.group(4)[0].isdigit()):
         y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
         if y < 100:
             y += 2000
@@ -110,6 +108,10 @@ def parse_date(sheet, r, c, datemode):
             return dt.date(y, mo, d).isoformat(), raw, 0
         except ValueError:
             return None, raw, 1
+    # 年.月 のみ（「2020.5月」「2018/5/某」など）→ 月初として並べ、要確認にする
+    m = re.fullmatch(r"(\d{4})\.(\d{1,2})(?:月|\.某)?", s)
+    if m and 1 <= int(m.group(2)) <= 12:
+        return f"{m.group(1)}-{int(m.group(2)):02d}-01", raw, 1
     m = re.fullmatch(r"(\d{4})年", s)
     if m:
         return f"{m.group(1)}-01-01", raw, 1  # 年のみ
@@ -131,18 +133,30 @@ def parse_time(raw):
     s = norm(raw)
     if not s:
         return None, None
-    if re.search(r"停止(は)?な", s):
+    if re.search(r"停止(は)?(な|ゼロ)", s) or s == "なし":
         return 0, None
     m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*[hH]", s)
     if m:
         return None, float(m.group(1))
+    m = re.search(r"停止(\d+)(?!時間)", s)  # 「660(停止305)」
+    if m:
+        return int(m.group(1)), None
+    m = re.fullmatch(r"(?:停止)?(\d+(?:\.\d+)?)時間", s)  # 「停止4時間」
+    if m:
+        return round(float(m.group(1)) * 60), None
+    ranges = re.findall(r"(\d{1,2}):(\d{2})[~\-](\d{1,2}):(\d{2})", s)  # 「10:00~14:00」（複数は合計）
+    if ranges:
+        return sum(((int(c) * 60 + int(d)) - (int(a) * 60 + int(b))) % (24 * 60) for a, b, c, d in ranges), None
+    m = re.match(r"(\d+(?:\.\d+)?)\s*[(\n]", s)  # 「100(実際の修理時間は690分)」は先頭の数値
+    if m:
+        return int(float(m.group(1))), None
     minutes = re.findall(r"(\d+)分", s)
     if minutes:
         return sum(int(x) for x in minutes), None
-    try:
-        return int(float(s)), None  # 数値のみは分とみなす
-    except ValueError:
-        return None, None
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)(?:停止)?", s)  # 数値のみは分とみなす
+    if m:
+        return int(float(m.group(1))), None
+    return None, None
 
 
 def parse_cost(text):
@@ -167,7 +181,7 @@ def guess_status(content, result, note):
 
 def vendor_key(name):
     s = unicodedata.normalize("NFKC", name)
-    for w in ("株式会社", "(株)", " ", "　"):
+    for w in ("株式会社", "有限会社", "(株)", "(有)", " ", "・"):
         s = s.replace(w, "")
     return s
 
@@ -193,49 +207,113 @@ def upsert_vendor(conn, cache, info):
     return cur.lastrowid
 
 
-def import_sheet(conn, sheet, datemode, vendor_cache):
+def area_of(path):
+    name = os.path.basename(path)
+    for key, area in AREA_BY_FILE:
+        if key in name:
+            return area
+    return os.path.splitext(name)[0]
+
+
+def find_layout(sheet):
+    """見出し行（実施年月日）と設備名の行を探す。記録簿の書式でなければ None。"""
+    name_row = None
+    for r in range(min(sheet.nrows, 30)):
+        if cell_text(sheet, r, 1) == "設備名":
+            name_row = r
+        if cell_text(sheet, r, COL_DATE) == "実施年月日":
+            return (r, name_row) if name_row is not None else None
+    return None
+
+
+def has_records(sheet, header):
+    return any(cell_text(sheet, r, c) for r in range(header + 1, sheet.nrows)
+               for c in (COL_CONTENT, COL_REASON, COL_RESULT))
+
+
+def skip_reason(sheet, layout):
+    if layout is None:
+        return "記録簿の書式ではない"
+    if sheet.name.startswith("原紙"):
+        return "原紙（ひな形）"
+    if re.search(r" \(\d+\)$", sheet.name) and not has_records(sheet, layout[0]):
+        return "複製シート（履歴なし）"
+    return None
+
+
+def import_sheet(conn, sheet, layout, datemode, vendor_cache, area, source_file):
+    header, nr = layout
     t = lambda r, c: cell_text(sheet, r, c)
-    vendor = {
-        "name": t(2, 16), "tel": t(2, 28), "fax": t(2, 33),
-        "address": t(3, 16), "contact": t(3, 28), "mobile": t(3, 33),
-    }
-    vendor_id = upsert_vendor(conn, vendor_cache, vendor)
+
+    # 取引業者（2 段ある場合は 1 つ目を主とし、残りはメモへ）
+    vendor_ids, extra_info = [], []
+    for r in range(1, nr):
+        label = t(r, 14)
+        if label == "取引業者名":
+            vid = upsert_vendor(conn, vendor_cache, {
+                "name": t(r, 16), "tel": t(r, 28), "fax": t(r, 33), "address": "", "contact": "", "mobile": ""})
+            if vid:
+                vendor_ids.append(vid)
+            filled = False
+        elif label == "住所" and vendor_ids:
+            info = {"address": t(r, 16), "contact": t(r, 28), "mobile": t(r, 33)}
+            if not any(info.values()):
+                continue
+            if not filled:
+                for k, v in info.items():
+                    if v:
+                        conn.execute(f"UPDATE vendors SET {k}=COALESCE(NULLIF({k},''),?) WHERE id=?", (v, vendor_ids[-1]))
+                filled = True
+            else:
+                extra_info.append("連絡先: " + " / ".join(v for v in info.values() if v))
+    vendor_id = vendor_ids[0] if vendor_ids else None
+    if len(vendor_ids) > 1:
+        names = [r["name"] for r in conn.execute(
+            f"SELECT name FROM vendors WHERE id IN ({','.join('?' * (len(vendor_ids) - 1))})", vendor_ids[1:])]
+        extra_info.append("他の取引業者: " + "、".join(names))
 
     # 欄外メモ（左上・右側）
     notes = []
-    for r in range(0, 10):
+    for r in range(0, header):
         for c in [1] + list(range(36, sheet.ncols)):
             v = t(r, c)
             if v and not re.fullmatch(r"\d+(\.0)?", v) and v not in ("設備名", "設備No", "資産№", "メーカー名"):
                 notes.append(v)
+    notes += extra_info
 
-    code = t(6, 4).upper() or None
+    name = t(nr, 4)
+    asset_no = t(nr + 2, 4)
+    if re.fullmatch(r"\d{9,}", name):  # 設備名欄に資産番号が書かれている
+        asset_no, name = asset_no or name, ""
+    name = name.replace("\n", " ") or sheet.name
+    retired = sheet.name.startswith("旧")
+    code = t(nr + 1, 4).upper() or None
     cur = conn.execute(
         """INSERT INTO equipment(code,name,model,maker,vendor_id,supplier,asset_no,serial_no,
-               manufactured,delivered,status,note,sheet_name)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               manufactured,delivered,area,status,note,sheet_name,source_file,nickname,category)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
-            code, (t(5, 4) or sheet.name) + ("（旧機）" if sheet.name in RETIRED_SHEETS else ""), t(5, 13), t(8, 4), vendor_id, t(5, 24),
-            t(7, 4), t(7, 13), parse_ym(t(6, 13)), parse_ym(t(8, 13)),
-            "廃止" if sheet.name in RETIRED_SHEETS else "稼働",
-            "\n".join(notes) or None, sheet.name,
+            code, name + ("（旧機）" if retired and "旧" not in name else ""), t(nr, 13), t(nr + 3, 4),
+            vendor_id, t(nr, 24), asset_no, t(nr + 2, 13), parse_ym(t(nr + 1, 13)), parse_ym(t(nr + 3, 13)),
+            area, "廃止" if retired else "稼働", "\n".join(notes) or None, sheet.name, source_file,
+            make_nickname(sheet.name, name), guess_category(sheet.name, name),
         ),
     )
     eq_id = cur.lastrowid
 
     count = 0
     latest = None
-    for r in range(FIRST_RECORD_ROW, sheet.nrows):
+    for r in range(header + 1, sheet.nrows):
         content, reason, result = t(r, COL_CONTENT), t(r, COL_REASON), t(r, COL_RESULT)
         note, author = t(r, COL_NOTE), t(r, COL_AUTHOR)
         extras = [t(r, c) for c in range(COL_AUTHOR + 1, sheet.ncols) if t(r, c)]
         done_date, date_raw, uncertain = parse_date(sheet, r, COL_DATE, datemode)
         time_raw = t(r, COL_TIME)
-        if not (content or reason or result or date_raw):
+        # 本文がない行（例: 「そしておよそ2年後・・・」や日付だけの行）は取り込まない
+        if not (content or reason or result):
             continue
-        # 対象外の書き込み（例: 「そしておよそ2年後・・・」）
-        if not (content or reason or result) and not done_date:
-            continue
+        if not done_date:
+            uncertain = 1  # 日付なし・読めない日付
         # 直前の行より明らかに古い日付は記入ミスの可能性
         if done_date and latest and done_date < latest and not uncertain:
             if (dt.date.fromisoformat(latest) - dt.date.fromisoformat(done_date)).days > 60:
@@ -247,7 +325,7 @@ def import_sheet(conn, sheet, datemode, vendor_cache):
         downtime, hours = parse_time(time_raw)
         if extras:
             note = (note + "\n" if note else "") + "\n".join(extras)
-        serials = sorted({s.upper() for s in SERIAL_RE.findall(note)}) if "セパレーター" in t(5, 4) else []
+        serials = sorted({s.upper() for s in SERIAL_RE.findall(note)}) if "セパレーター" in name else []
         cost = parse_cost(note)
         cur = conn.execute(
             """INSERT INTO records(equipment_id,kind,status,done_date,date_raw,date_uncertain,
@@ -314,7 +392,7 @@ def seed_rules(conn, eq_by_sheet):
         )
 
 
-def run(xls_path, reset):
+def run(paths, reset):
     if reset and os.path.exists(DB_PATH):
         os.remove(DB_PATH)
     conn = connect()
@@ -322,26 +400,37 @@ def run(xls_path, reset):
     if conn.execute("SELECT COUNT(*) FROM equipment").fetchone()[0]:
         print("既にデータがあります。作り直す場合は --reset を付けてください。")
         return
-    wb = xlrd.open_workbook(xls_path)
-    vendor_cache, eq_by_sheet = {}, {}
-    total = 0
-    for s in wb.sheets():
-        if s.name in SKIP_SHEETS:
-            continue
-        eq_id, n = import_sheet(conn, s, wb.datemode, vendor_cache)
-        eq_by_sheet[s.name] = eq_id
-        total += n
-        print(f"  {s.name}: {n} 件")
-    seed_parts(conn, eq_by_sheet)
-    seed_rules(conn, eq_by_sheet)
+    vendor_cache, seed_eq = {}, {}
+    total_eq = total_rec = 0
+    for path in paths:
+        wb = xlrd.open_workbook(path)
+        fname, area = os.path.basename(path), area_of(path)
+        print(f"■ {fname}（エリア: {area}）")
+        for s in wb.sheets():
+            layout = find_layout(s)
+            why = skip_reason(s, layout)
+            if why:
+                if s.nrows:
+                    print(f"  - {s.name}: 取り込まない（{why}）")
+                continue
+            eq_id, n = import_sheet(conn, s, layout, wb.datemode, vendor_cache, area, fname)
+            if fname == SEED_FILE:
+                seed_eq[s.name] = eq_id
+            total_eq += 1
+            total_rec += n
+            print(f"  {s.name}: {n} 件")
+    if seed_eq:
+        seed_parts(conn, seed_eq)
+        seed_rules(conn, seed_eq)
     conn.commit()
     uncertain = conn.execute("SELECT COUNT(*) FROM records WHERE date_uncertain=1").fetchone()[0]
-    print(f"設備 {len(eq_by_sheet)} 台 / 履歴 {total} 件（日付要確認 {uncertain} 件）を {DB_PATH} に取り込みました")
+    print(f"設備 {total_eq} 台 / 履歴 {total_rec} 件（日付要確認 {uncertain} 件）を {DB_PATH} に取り込みました")
 
 
 if __name__ == "__main__":
+    here = os.path.dirname(os.path.abspath(__file__))
     ap = argparse.ArgumentParser()
-    ap.add_argument("xls", nargs="?", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "前処理1.xls"))
+    ap.add_argument("xls", nargs="*", help="取り込むファイル（省略時はフォルダ内の *.xls すべて）")
     ap.add_argument("--reset", action="store_true", help="既存の DB を削除して取り込み直す")
     args = ap.parse_args()
-    run(args.xls, args.reset)
+    run(args.xls or sorted(glob.glob(os.path.join(here, "*.xls"))), args.reset)

@@ -4,7 +4,10 @@
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 const view = $("#view");
-const state = { meta: null, equipment: [], recordQuery: { q: "", sort: "done_date", dir: "desc" }, wrap: false };
+const state = { meta: null, equipment: [], recordQuery: { q: "", sort: "done_date", dir: "desc" }, wrap: false, area: "" };
+/* 画面右上で選んだエリア（前処理・後処理など）を API に渡す */
+const areaQS = (sep = "?") => (state.area ? `${sep}area=${encodeURIComponent(state.area)}` : "");
+const inArea = e => !state.area || e.area === state.area;
 
 function h(v) {
   return String(v ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -74,11 +77,13 @@ document.addEventListener("mousemove", e => {
 const routes = {
   dashboard: ["ダッシュボード", renderDashboard],
   records: ["作業計画/履歴", renderRecords],
+  calendar: ["点検計画", renderCalendar],
   plans: ["交換アラート", renderPlans],
   equipment: ["設備台帳", renderEquipment],
   parts: ["部品・研磨管理", renderParts],
   analytics: ["分析", renderAnalytics],
   vendors: ["取引業者", renderVendors],
+  notify: ["通知設定", renderNotify],
 };
 
 async function router() {
@@ -86,7 +91,7 @@ async function router() {
   const route = routes[name] || routes.dashboard;
   $$("#sidebar nav a").forEach(a => a.classList.toggle("active", a.dataset.nav === name));
   $("#page-title").textContent = route[0];
-  document.title = `${route[0]} | 前処理 設備保全`;
+  document.title = `${route[0]} | 設備保全`;
   document.body.classList.remove("nav-open");
   $("#scrim").hidden = true;
   view.innerHTML = `<p class="muted">読み込み中…</p>`;
@@ -100,7 +105,7 @@ async function router() {
 
 async function refreshBadges() {
   try {
-    const d = await api("/dashboard");
+    const d = await api("/dashboard" + areaQS());
     setBadge("#badge-plans", d.rules_over.length + d.rules_soon.length);
     setBadge("#badge-parts", d.parts_alert.length);
   } catch { /* バッジは補助表示なので無視 */ }
@@ -113,7 +118,7 @@ function setBadge(sel, n) {
 
 /* ================================================================ ダッシュボード */
 async function renderDashboard() {
-  const d = await api("/dashboard");
+  const d = await api("/dashboard" + areaQS());
   const ruleRow = r => `
     <tr data-rule="${r.id}">
       <td>${lvBadge(r.level)}</td>
@@ -191,7 +196,7 @@ async function renderRecords() {
       <a class="btn" id="csv" href="#">CSV出力</a>
     </div>
     <div class="filters">
-      <label>設備 <select id="f-eq"><option value="">すべて</option>${state.equipment.map(e => `<option value="${e.id}" ${q.equipment_id == e.id ? "selected" : ""}>${h((e.code ? e.code + " " : "") + e.name)}</option>`).join("")}</select></label>
+      <label>設備 <select id="f-eq"><option value="">すべて</option>${equipmentOptions(inArea, q.equipment_id)}</select></label>
       <label>区分 <select id="f-kind"><option value="">すべて</option><option ${q.kind === "定期" ? "selected" : ""}>定期</option><option ${q.kind === "不定期" ? "selected" : ""}>不定期</option></select></label>
       <label>作業状況 <select id="f-status"><option value="">すべて</option><option value="${statuses.filter(s => s !== "完了").join(",")}" ${q.status && q.status !== "完了" ? "selected" : ""}>未完了のみ</option>${statuses.map(s => `<option ${q.status === s ? "selected" : ""}>${s}</option>`).join("")}</select></label>
       <label>期間 <input type="date" id="f-from" value="${h(q.from || "")}">〜<input type="date" id="f-to" value="${h(q.to || "")}"></label>
@@ -205,13 +210,13 @@ async function renderRecords() {
         <th class="sortable" data-sort="kind">区分</th>
         <th class="sortable" data-sort="equipment_code">設備</th>
         <th>実施内容</th><th>理由・状況</th><th>今後の対策</th>
-        <th class="sortable num" data-sort="downtime_min">停止(分)</th>
+        <th class="sortable num" data-sort="downtime_min">停止・修理(分)</th>
         <th class="sortable" data-sort="author">記入者</th>
         <th class="sortable" data-sort="status">作業状況</th>
       </tr></thead><tbody></tbody></table></div>`;
 
   const reload = async () => {
-    const params = new URLSearchParams(Object.entries(q).filter(([, v]) => v));
+    const params = new URLSearchParams(Object.entries({ ...q, area: state.area }).filter(([, v]) => v));
     const recs = await api("/records?" + params);
     $("#rec-count").textContent = `${recs.length}件が検索されました`;
     $("#csv").href = "/api/records.csv?" + params;
@@ -227,7 +232,7 @@ async function renderRecords() {
         <td class="clip" data-label="内容">${h(r.content)}</td>
         <td class="clip" data-label="理由">${h(r.reason)}${r.result ? `\n→ ${h(r.result)}` : ""}</td>
         <td class="clip" data-label="対策">${h(r.countermeasure)}</td>
-        <td class="num" data-label="停止(分)">${r.downtime_min != null ? fmtNum(r.downtime_min) : r.hour_meter != null ? `<span class="muted">${r.hour_meter}h</span>` : ""}</td>
+        <td class="num" data-label="停止・修理(分)">${r.downtime_min != null ? fmtNum(r.downtime_min) : r.hour_meter != null ? `<span class="muted">${r.hour_meter}h</span>` : ""}</td>
         <td class="nowrap" data-label="記入者">${h(r.author)}</td>
         <td class="st-cell">${statusBadge(r.status)}</td>
       </tr>`).join("") : `<tr><td colspan="9" class="empty">該当する履歴はありません</td></tr>`;
@@ -256,8 +261,7 @@ async function openRecordForm(id, preset = {}) {
   const rec = id ? await api(`/records/${id}`) : {
     kind: "不定期", status: "完了", done_date: state.meta.today, author: currentUser(), ...preset,
   };
-  const eqOptions = state.equipment.filter(e => e.status !== "廃止" || e.id === rec.equipment_id)
-    .map(e => `<option value="${e.id}" ${rec.equipment_id == e.id ? "selected" : ""}>${h((e.code ? e.code + " " : "") + e.name)}</option>`).join("");
+  const eqOptions = equipmentOptions(e => (e.status !== "廃止" && inArea(e)) || e.id == rec.equipment_id, rec.equipment_id);
   const body = `
     <div class="form-grid">
       <label class="field full"><span>設備<em class="req">*</em></span><select name="equipment_id" required><option value="">選択してください</option>${eqOptions}</select></label>
@@ -266,14 +270,14 @@ async function openRecordForm(id, preset = {}) {
         <label><input type="radio" name="kind" value="不定期" ${rec.kind === "不定期" ? "checked" : ""}>不定期（故障）</label>
       </div></div>
       <label class="field"><span>作業状況</span><select name="status">${state.meta.record_statuses.map(s => `<option ${rec.status === s ? "selected" : ""}>${s}</option>`).join("")}</select></label>
-      <label class="field"><span>実施日</span><input type="date" name="done_date" value="${h(rec.done_date || "")}">
+      <label class="field"><span>実施日<em class="hint" style="font-weight:400">（未完了なら予定日）</em></span><input type="date" name="done_date" value="${h(rec.done_date || "")}">
         ${rec.date_uncertain ? `<span class="hint">⚠ 元の表記「${h(rec.date_raw)}」。正しい日付を入れると要確認が外れます</span>` : ""}</label>
       <label class="field"><span>記入者</span><input name="author" list="author-list" value="${h(rec.author || "")}"></label>
       <label class="field full"><span>実施内容<em class="req">*</em></span><textarea name="content" rows="2" required>${h(rec.content || "")}</textarea></label>
       <label class="field full"><span>実施の理由・状況</span><textarea name="reason" rows="3">${h(rec.reason || "")}</textarea></label>
       <label class="field full"><span>実施の結果</span><textarea name="result" rows="2">${h(rec.result || "")}</textarea></label>
       <label class="field full"><span>備考（今後の対策）</span><textarea name="countermeasure" rows="2">${h(rec.countermeasure || "")}</textarea></label>
-      <label class="field"><span>ライン停止時間（分）</span><input type="number" min="0" name="downtime_min" value="${h(rec.downtime_min ?? "")}" inputmode="numeric">
+      <label class="field"><span>停止・修理時間（分）</span><input type="number" min="0" name="downtime_min" value="${h(rec.downtime_min ?? "")}" inputmode="numeric">
         ${rec.downtime_raw && rec.downtime_min == null && rec.hour_meter == null ? `<span class="hint">元の表記: ${h(rec.downtime_raw)}</span>` : ""}</label>
       <label class="field"><span>部品の稼働時間（h）</span><input type="number" min="0" step="0.1" name="hour_meter" value="${h(rec.hour_meter ?? "")}" inputmode="decimal"><span class="hint">フィルタースクリュー交換時のアワーメーター等</span></label>
       <label class="field"><span>関連する定期項目</span><select name="rule_id"><option value="">なし</option></select><span class="hint">完了で保存すると前回実施日が更新されます</span></label>
@@ -334,7 +338,7 @@ async function openRecordForm(id, preset = {}) {
 
 /* ================================================================ 交換アラート（定期項目） */
 async function renderPlans() {
-  const rules = await api("/rules");
+  const rules = await api("/rules" + areaQS());
   const counts = { over: 0, soon: 0, unknown: 0, ok: 0 };
   rules.filter(r => r.active).forEach(r => counts[r.level]++);
   view.innerHTML = `
@@ -409,7 +413,7 @@ async function openRuleForm(rule, preset = {}) {
   const r = rule || { active: 1, ...preset };
   openModal(rule ? "定期項目の設定" : "定期項目を追加", `
     <div class="form-grid">
-      <label class="field full"><span>設備<em class="req">*</em></span><select name="equipment_id">${state.equipment.filter(e => e.status !== "廃止").map(e => `<option value="${e.id}" ${r.equipment_id == e.id ? "selected" : ""}>${h((e.code ? e.code + " " : "") + e.name)}</option>`).join("")}</select></label>
+      <label class="field full"><span>設備<em class="req">*</em></span><select name="equipment_id">${equipmentOptions(e => (e.status !== "廃止" && inArea(e)) || e.id == r.equipment_id, r.equipment_id)}</select></label>
       <label class="field full"><span>項目名<em class="req">*</em></span><input name="title" value="${h(r.title || "")}" placeholder="例: フィルタースクリュー交換"></label>
       <label class="field"><span>間隔（日数）</span><input type="number" min="1" name="interval_days" value="${h(r.interval_days ?? "")}"></label>
       <label class="field"><span>間隔（稼働時間 h）</span><input type="number" min="1" step="0.1" name="interval_hours" value="${h(r.interval_hours ?? "")}"></label>
@@ -438,56 +442,477 @@ async function openRuleForm(rule, preset = {}) {
   });
 }
 
+/* ================================================================ 点検計画（カレンダー） */
+const pad2 = n => String(n).padStart(2, "0");
+const isoDate = d => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+const parseISO = s => { const [y, m, d] = s.split("-").map(Number); return new Date(y, m - 1, d); };
+const WEEKDAYS = ["日", "月", "火", "水", "木", "金", "土"];
+/* 色だけに頼らないよう、種類はラベルでも示す */
+const EV_TYPES = {
+  planned: { label: "予定", desc: "日付を決めた作業（未完了）" },
+  due: { label: "期限", desc: "定期項目の次回期限" },
+  projected: { label: "見込み", desc: "期限どおりに実施した場合のその次" },
+  done: { label: "実績", desc: "完了した定期・その他の作業" },
+  failure: { label: "故障", desc: "完了した不定期（故障）の作業" },
+};
+const evKey = ev => (ev.type === "done" && ev.kind === "不定期" ? "failure" : ev.type);
+const calState = {
+  mode: "month", ym: null, year: null, selected: null,
+  show: { planned: true, due: true, projected: true, done: true, failure: false },
+};
+
+async function renderCalendar(arg) {
+  const today = state.meta.today;
+  calState.mode = arg === "year" ? "year" : "month";
+  calState.ym ||= today.slice(0, 7);
+  calState.year ||= +today.slice(0, 4);
+  view.innerHTML = `
+    <div class="toolbar cal-toolbar">
+      <div class="seg small" id="cal-mode">
+        <label><input type="radio" name="cal-mode" value="month" ${calState.mode === "month" ? "checked" : ""}>月</label>
+        <label><input type="radio" name="cal-mode" value="year" ${calState.mode === "year" ? "checked" : ""}>年間計画表</label>
+      </div>
+      <div class="cal-nav">
+        <button class="btn small" id="cal-prev" aria-label="前へ">‹</button>
+        <strong id="cal-label"></strong>
+        <button class="btn small" id="cal-next" aria-label="次へ">›</button>
+        <button class="btn small" id="cal-today">今日</button>
+      </div>
+      <span class="spacer"></span>
+      <button class="btn" id="cal-print">印刷</button>
+      <button class="btn primary" id="cal-add">予定を追加</button>
+    </div>
+    <div id="cal-body"></div>`;
+  $$("#cal-mode input").forEach(r => r.addEventListener("change", () => { setCalMode(r.value); drawCalendar(); }));
+  const move = step => {
+    if (calState.mode === "year") calState.year += step;
+    else {
+      const d = parseISO(calState.ym + "-01");
+      d.setMonth(d.getMonth() + step);
+      calState.ym = isoDate(d).slice(0, 7);
+    }
+    drawCalendar();
+  };
+  $("#cal-prev").addEventListener("click", () => move(-1));
+  $("#cal-next").addEventListener("click", () => move(1));
+  $("#cal-today").addEventListener("click", () => {
+    calState.ym = today.slice(0, 7); calState.year = +today.slice(0, 4); calState.selected = today; drawCalendar();
+  });
+  $("#cal-print").addEventListener("click", () => window.print());
+  $("#cal-add").addEventListener("click", () => openPlanForm(calState.selected || today));
+  await drawCalendar();
+}
+
+/* 表示切替は URL にも残す（#/calendar/year で年間計画表を直接開ける） */
+function setCalMode(mode) {
+  calState.mode = mode;
+  history.replaceState(null, "", mode === "year" ? "#/calendar/year" : "#/calendar");
+}
+
+async function drawCalendar() {
+  return calState.mode === "year" ? drawYearPlan() : drawMonth();
+}
+
+/* 未完了（未着手）の作業として予定を入れる。完了にすると定期項目の前回実施日が更新される */
+function openPlanForm(date, preset = {}) {
+  openRecordForm(null, { status: "未着手", kind: "定期", done_date: date, ...preset });
+}
+async function scheduleRule(ruleInfo, date) {
+  await api("/records", {
+    method: "POST",
+    body: { equipment_id: ruleInfo.equipment_id, rule_id: ruleInfo.rule_id, kind: "定期", status: "未着手",
+            done_date: date, content: ruleInfo.title, author: currentUser() },
+  });
+  toast(`${fmtDate(date)} に予定を入れました`);
+}
+async function completePlanned(ev) {
+  // 予定日より前に終わった場合は今日の日付で完了にする
+  const date = ev.date > state.meta.today ? state.meta.today : ev.date;
+  await api(`/records/${ev.id}`, { method: "PUT", body: { status: "完了", done_date: date } });
+  toast("完了にしました");
+}
+
+function evChip(ev, i) {
+  const key = evKey(ev);
+  const late = ev.type === "planned" && ev.date < state.meta.today;
+  const cls = ["ev", `ev-${key}`, ev.type === "due" ? ev.level : "", late ? "late" : ""].join(" ");
+  const eq = ev.equipment_nickname || ev.equipment_name || "";
+  const drag = ev.type === "planned" || ev.type === "due";
+  return `<div class="${cls}" data-ev="${i}" ${drag ? 'draggable="true"' : ""} title="${h(`${EV_TYPES[key].label}${late ? "（遅れ）" : ""}：${eq} ${ev.title || ""}`)}">
+    <span class="ev-tag">${late ? "遅れ" : EV_TYPES[key].label}</span>${h(eq)} <span class="ev-title">${h(ev.title || "")}</span></div>`;
+}
+
+async function drawMonth() {
+  const today = state.meta.today;
+  const first = parseISO(calState.ym + "-01");
+  const month = first.getMonth();
+  const gridStart = new Date(first);
+  gridStart.setDate(1 - first.getDay());
+  const last = new Date(first.getFullYear(), month + 1, 0);
+  const gridEnd = new Date(last);
+  gridEnd.setDate(last.getDate() + (6 - last.getDay()));
+  $("#cal-label").textContent = `${first.getFullYear()}年${month + 1}月`;
+
+  const d = await api(`/schedule?from=${isoDate(gridStart)}&to=${isoDate(gridEnd)}${areaQS("&")}`);
+  if (!calState.selected || calState.selected.slice(0, 7) !== calState.ym) {
+    calState.selected = today.slice(0, 7) === calState.ym ? today : calState.ym + "-01";
+  }
+  const byDate = {};
+  d.events.forEach((ev, i) => { ev.i = i; (byDate[ev.date] ||= []).push(ev); });
+  const visible = ev => calState.show[evKey(ev)];
+  const counts = {};
+  d.events.filter(ev => ev.date.slice(0, 7) === calState.ym).forEach(ev => (counts[evKey(ev)] = (counts[evKey(ev)] || 0) + 1));
+
+  const cells = [];
+  for (let c = new Date(gridStart); c <= gridEnd; c.setDate(c.getDate() + 1)) {
+    const iso = isoDate(c);
+    const evs = (byDate[iso] || []).filter(visible);
+    const MAX = 3;
+    cells.push(`<div class="cal-day ${c.getMonth() !== month ? "out" : ""} ${iso === today ? "today" : ""} ${iso === calState.selected ? "sel" : ""} wd${c.getDay()}" data-date="${iso}" tabindex="0">
+      <div class="cal-dnum">${c.getDate()}${evs.length ? `<span class="cal-dots" aria-label="${evs.length}件">${evs.length}</span>` : ""}</div>
+      <div class="cal-evs">${evs.slice(0, MAX).map(ev => evChip(ev, ev.i)).join("")}
+        ${evs.length > MAX ? `<div class="ev-more">他 ${evs.length - MAX} 件</div>` : ""}</div>
+    </div>`);
+  }
+
+  $("#cal-body").innerHTML = `
+    ${overduePanel(d.overdue)}
+    <div class="filters cal-legend">
+      ${Object.entries(EV_TYPES).map(([k, t]) => `<label title="${h(t.desc)}"><input type="checkbox" data-show="${k}" ${calState.show[k] ? "checked" : ""}>
+        <span class="ev ev-${k} ${k === "due" ? "soon" : ""} legend-chip"><span class="ev-tag">${t.label}</span></span>${counts[k] || 0}</label>`).join("")}
+      <span class="muted cal-hint">予定・期限はドラッグで別の日へ動かせます</span>
+    </div>
+    <div class="cal-layout">
+      <div class="cal-grid" role="grid">
+        ${WEEKDAYS.map((w, i) => `<div class="cal-wd wd${i}">${w}</div>`).join("")}
+        ${cells.join("")}
+      </div>
+      <aside class="card cal-side" id="cal-side"></aside>
+    </div>
+    ${d.hours_only.length ? `<p class="muted" style="font-size:13px">※ 稼働時間だけで管理している ${d.hours_only.length} 項目は日付が決まらないためカレンダーには出ません（<a href="#/plans">交換アラート</a>で確認）。</p>` : ""}`;
+
+  const drawSide = () => {
+    const iso = calState.selected;
+    const evs = byDate[iso] || [];
+    const dd = parseISO(iso);
+    $("#cal-side").innerHTML = `
+      <h3>${dd.getMonth() + 1}月${dd.getDate()}日（${WEEKDAYS[dd.getDay()]}）${iso === today ? '<span class="sub">今日</span>' : ""}</h3>
+      ${evs.length ? `<ul class="day-list">${evs.map(ev => dayItem(ev)).join("")}</ul>` : `<p class="empty">予定はありません</p>`}
+      <button class="btn small" id="day-add">＋ この日に予定を追加</button>`;
+    $("#day-add").addEventListener("click", () => openPlanForm(iso));
+    $$("#cal-side [data-act]").forEach(b => b.addEventListener("click", async e => {
+      e.stopPropagation();
+      const ev = d.events[+b.dataset.i];
+      try {
+        if (b.dataset.act === "open") openRecordForm(ev.id);
+        else if (b.dataset.act === "complete") { await completePlanned(ev); router(); }
+        else if (b.dataset.act === "schedule") { await scheduleRule(ev, iso); router(); }
+        else if (b.dataset.act === "record") recordForRule({ id: ev.rule_id, equipment_id: ev.equipment_id, title: ev.title });
+        else if (b.dataset.act === "rule") openRuleActions(ev.rule_id);
+      } catch (ex) { toast(ex.message); }
+    }));
+  };
+  const select = iso => {
+    calState.selected = iso;
+    $$(".cal-day.sel").forEach(x => x.classList.remove("sel"));
+    $(`.cal-day[data-date="${iso}"]`)?.classList.add("sel");
+    drawSide();
+  };
+
+  $$(".cal-day").forEach(cell => {
+    cell.addEventListener("click", () => select(cell.dataset.date));
+    cell.addEventListener("keydown", e => { if (e.key === "Enter") select(cell.dataset.date); });
+    cell.addEventListener("dblclick", () => openPlanForm(cell.dataset.date));
+    cell.addEventListener("dragover", e => { e.preventDefault(); cell.classList.add("drop"); });
+    cell.addEventListener("dragleave", () => cell.classList.remove("drop"));
+    cell.addEventListener("drop", async e => {
+      e.preventDefault();
+      cell.classList.remove("drop");
+      const date = cell.dataset.date;
+      try {
+        const src = JSON.parse(e.dataTransfer.getData("text/plain") || "{}");
+        if (src.record) {
+          await api(`/records/${src.record}`, { method: "PUT", body: { done_date: date } });
+          toast(`${fmtDate(date)} に移しました`);
+        } else if (src.rule) {
+          await scheduleRule(src.rule, date);
+        } else return;
+        calState.selected = date;
+        router();
+      } catch (ex) { toast(ex.message); }
+    });
+  });
+  $$(".cal-grid .ev[draggable]").forEach(chip => chip.addEventListener("dragstart", e => {
+    const ev = d.events[+chip.dataset.ev];
+    e.dataTransfer.setData("text/plain", JSON.stringify(ev.type === "planned" ? { record: ev.id } : { rule: pickRule(ev) }));
+  }));
+  $$(".cal-grid .ev").forEach(chip => chip.addEventListener("click", e => {
+    // チップを押したらその日を選ぶ（詳細は右の一覧から操作する）
+    e.stopPropagation();
+    select(chip.closest(".cal-day").dataset.date);
+  }));
+  $$("[data-show]").forEach(c => c.addEventListener("change", () => { calState.show[c.dataset.show] = c.checked; drawMonth(); }));
+  bindOverdue(d.overdue);
+  drawSide();
+}
+const pickRule = r => ({ rule_id: r.rule_id, equipment_id: r.equipment_id, title: r.title });
+
+function dayItem(ev) {
+  const key = evKey(ev);
+  const late = ev.type === "planned" && ev.date < state.meta.today;
+  const btn = (act, label, primary) => `<button class="btn small ${primary ? "primary" : ""}" data-act="${act}" data-i="${ev.i}">${label}</button>`;
+  const actions = {
+    planned: btn("complete", "完了にする", true) + btn("open", "開く"),
+    due: btn("schedule", "この日に予定を入れる", true) + btn("record", "実施を記録") + btn("rule", "設定"),
+    projected: btn("rule", "設定"),
+    done: btn("open", "開く"),
+    failure: btn("open", "開く"),
+  }[key];
+  return `<li class="day-item">
+    <div class="day-head"><span class="ev ev-${key} ${ev.type === "due" ? ev.level : ""} ${late ? "late" : ""} legend-chip"><span class="ev-tag">${late ? "遅れ" : EV_TYPES[key].label}</span></span>
+      ${ev.type === "planned" && ev.status !== "未着手" ? statusBadge(ev.status) : ""}</div>
+    <div class="day-eq">${eqLabel({ equipment_code: ev.equipment_code, equipment_name: ev.equipment_nickname || ev.equipment_name })}</div>
+    <div class="day-title">${h(ev.title || "")}</div>
+    ${ev.type === "projected" ? `<div class="muted" style="font-size:12px">${ev.interval_days}日ごと。前回の実施日によって前後します</div>` : ""}
+    ${ev.author ? `<div class="muted" style="font-size:12px">記入者 ${h(ev.author)}</div>` : ""}
+    <div class="day-actions">${actions}</div>
+  </li>`;
+}
+
+function overduePanel(list) {
+  if (!list.length) return "";
+  return `<details class="card overdue-panel" ${calState.overdueOpen ? "open" : ""}>
+    <summary>${lvBadge("over", `⚠ 期限超過・予定未定 ${list.length}項目`)}<span class="muted">日付を決めて予定に入れてください（カレンダーへドラッグしても入れられます）</span></summary>
+    <div class="table-wrap"><table class="list responsive plain"><thead><tr><th>設備</th><th>項目</th><th>前回実施</th><th>期限</th><th>予定日</th></tr></thead><tbody>
+      ${list.map((r, i) => `<tr>
+        <td class="eqcol" data-label="設備"><span class="ev-grip" draggable="true" data-od="${i}" title="カレンダーの日付へドラッグ">⠿</span> ${eqLabel({ equipment_code: r.equipment_code, equipment_name: r.equipment_nickname || r.equipment_name })}</td>
+        <td data-label="項目"><strong>${h(r.title)}</strong> <span class="muted">${r.interval_days}日ごと</span></td>
+        <td class="nowrap" data-label="前回">${fmtDate(r.last_done_date) || '<span class="muted">未登録</span>'}</td>
+        <td class="nowrap" data-label="期限">${r.due_date ? `${fmtDate(r.due_date)} <span class="warn-date">${-r.days_left}日超過</span>` : '<span class="muted">前回不明</span>'}</td>
+        <td class="nowrap"><input type="date" class="od-date" data-od="${i}" value="${state.meta.today}"> <button class="btn small primary od-go" data-od="${i}">予定に入れる</button></td>
+      </tr>`).join("")}
+    </tbody></table></div>
+  </details>`;
+}
+function bindOverdue(list) {
+  const panel = $(".overdue-panel");
+  if (!panel) return;
+  panel.addEventListener("toggle", () => (calState.overdueOpen = panel.open));
+  $$(".od-go").forEach(b => b.addEventListener("click", async () => {
+    const date = $(`.od-date[data-od="${b.dataset.od}"]`).value;
+    if (!date) return toast("予定日を入れてください");
+    try { await scheduleRule(list[+b.dataset.od], date); router(); } catch (ex) { toast(ex.message); }
+  }));
+  $$(".ev-grip").forEach(g => g.addEventListener("dragstart", e => {
+    e.dataTransfer.setData("text/plain", JSON.stringify({ rule: pickRule(list[+g.dataset.od]) }));
+  }));
+}
+
+/* 年間計画表：定期項目 × 12か月。工場でよく使う「年間保全計画表」の形 */
+async function drawYearPlan() {
+  const y = calState.year;
+  $("#cal-label").textContent = `${y}年`;
+  const d = await api(`/schedule?from=${y}-01-01&to=${y}-12-31${areaQS("&")}`);
+  const marks = {}; // rule_id → month(1-12) → Set(種類)
+  const put = (rid, date, kind) => {
+    if (!rid || !date || +date.slice(0, 4) !== y) return;
+    ((marks[rid] ||= {})[+date.slice(5, 7)] ||= new Set()).add(kind);
+  };
+  d.events.forEach(ev => put(ev.rule_id, ev.date, ev.type === "planned" && ev.date < d.today ? "late" : ev.type));
+  d.rules.forEach(r => put(r.id, r.last_done_date, "done"));
+  const overdue = new Set(d.overdue.map(r => r.rule_id));
+  const curMonth = +d.today.slice(0, 4) === y ? +d.today.slice(5, 7) : 0;
+  const SYM = { done: ["●", "実施済み"], planned: ["◎", "予定"], late: ["◎", "予定（遅れ）"], due: ["○", "期限"], projected: ["◌", "見込み"] };
+  const cell = (r, m) => {
+    const set = marks[r.id]?.[m];
+    let inner = set ? ["done", "late", "planned", "due", "projected"].filter(k => set.has(k)).map(k => `<span class="ym ym-${k}" title="${SYM[k][1]}">${SYM[k][0]}</span>`).join("") : "";
+    if (!inner && overdue.has(r.id) && m === curMonth) inner = `<span class="ym ym-over" title="期限超過">⚠</span>`;
+    return `<td class="ym-cell ${m === curMonth ? "cur" : ""}">${inner}</td>`;
+  };
+  const byCode = [...d.rules].sort((x, z) => (x.equipment_code || "ZZZ").localeCompare(z.equipment_code || "ZZZ") || x.equipment_id - z.equipment_id);
+  const groups = groupBy(byCode, r => String(r.equipment_id));
+  const eqName = r => `${r.equipment_code || ""} ${r.equipment_nickname || r.equipment_name}`.trim();
+  $("#cal-body").innerHTML = `
+    <div class="filters ym-legend">${Object.entries(SYM).filter(([k]) => k !== "late").map(([k, [s, l]]) => `<span><span class="ym ym-${k}">${s}</span> ${l}</span>`).join("")}
+      <span><span class="ym ym-over">⚠</span> 期限超過（今月に表示）</span>
+      <span class="muted">月の見出しを押すとその月のカレンダーを開きます</span></div>
+    ${d.rules.length ? `<div class="table-wrap"><table class="list plain year-plan"><thead><tr>
+      <th>設備</th><th>項目</th><th>間隔</th>${Array.from({ length: 12 }, (_, i) => `<th class="ym-head ${i + 1 === curMonth ? "cur" : ""}" data-month="${i + 1}">${i + 1}月</th>`).join("")}
+    </tr></thead><tbody>
+      ${groups.map(([, rs]) => rs.map((r, i) => `<tr>
+        ${i === 0 ? `<td rowspan="${rs.length}" class="eqcol"><a href="#/equipment/${r.equipment_id}">${h(eqName(r))}</a></td>` : ""}
+        <td><a href="#" data-rule-open="${r.id}">${h(r.title)}</a>${overdue.has(r.id) ? ` ${lvBadge("over", "超過")}` : ""}</td>
+        <td class="nowrap muted">${[r.interval_days ? `${r.interval_days}日` : "", r.interval_hours ? `${r.interval_hours}h` : ""].filter(Boolean).join(" / ")}</td>
+        ${Array.from({ length: 12 }, (_, m) => cell(r, m + 1)).join("")}
+      </tr>`).join("")).join("")}
+    </tbody></table></div>` : `<p class="empty">定期項目がありません。<a href="#/plans">交換アラート</a>から追加してください</p>`}`;
+  $$(".ym-head").forEach(th => th.addEventListener("click", () => {
+    setCalMode("month");
+    calState.ym = `${y}-${pad2(th.dataset.month)}`;
+    $(`#cal-mode input[value="month"]`).checked = true;
+    drawMonth();
+  }));
+  $$("[data-rule-open]").forEach(a => a.addEventListener("click", e => { e.preventDefault(); openRuleActions(+a.dataset.ruleOpen); }));
+}
+
 /* ================================================================ 設備台帳 */
+function equipmentOptions(filter, selected) {
+  const groups = {};
+  state.equipment.filter(filter).forEach(e => (groups[e.area || "未分類"] ||= []).push(e));
+  const opt = e => `<option value="${e.id}" ${selected == e.id ? "selected" : ""}>${h((e.code ? e.code + " " : "") + eqTitle(e))}${e.status === "廃止" ? "（廃止）" : ""}</option>`;
+  const names = Object.keys(groups);
+  if (names.length === 1) return groups[names[0]].map(opt).join("");
+  return names.map(a => `<optgroup label="${h(a)}">${groups[a].map(opt).join("")}</optgroup>`).join("");
+}
+
 async function loadEquipment(force) {
   if (!state.meta) state.meta = await api("/meta");
   if (force || !state.equipment.length) state.equipment = await api("/equipment");
   return state.equipment;
 }
 
+const eqTitle = e => e.nickname || e.name;
+const eqPrefs = (() => {
+  const def = { view: "card", group: "area", retired: false };
+  try { return { ...def, ...JSON.parse(localStorage.getItem("maint-eq-prefs") || "{}") }; } catch { return def; }
+})();
+function saveEqPrefs() {
+  try { localStorage.setItem("maint-eq-prefs", JSON.stringify(eqPrefs)); } catch { /* 保存できなくても動作には影響しない */ }
+}
+const eqCollapsed = new Set();
+
+/* 配列を key ごとにまとめる（並び順は order の順、なければ出てきた順） */
+function groupBy(list, key, order = []) {
+  const map = new Map(order.map(k => [k, []]));
+  list.forEach(x => { const k = key(x) || "その他"; if (!map.has(k)) map.set(k, []); map.get(k).push(x); });
+  return [...map].filter(([, v]) => v.length);
+}
+
+function alertChips(list) {
+  const over = list.reduce((s, e) => s + e.alerts.over, 0);
+  const soon = list.reduce((s, e) => s + e.alerts.soon, 0);
+  return `${over ? lvBadge("over", `⚠ 期限超過 ${over}`) : ""}${soon ? lvBadge("soon", `● まもなく ${soon}`) : ""}`;
+}
+
+function eqCard(e) {
+  return `<div class="eq-card ${e.status === "廃止" ? "retired" : ""}" data-eq="${e.id}">
+    <div class="eq-name">${h(eqTitle(e))}${e.status === "廃止" ? ' <span class="lv unknown">廃止</span>' : ""}</div>
+    ${e.nickname ? `<div class="eq-formal" title="${h(e.name)}">${h(e.name)}</div>` : ""}
+    <div class="eq-meta">${e.code ? `<span class="code">${h(e.code)}</span>` : ""}<span title="全${e.record_count}件のうち故障${e.failure_count}件">故障 ${e.failure_count}/${e.record_count}件</span><span>最終 ${h(fmtDate(e.last_date) || "—")}</span></div>
+    ${e.alerts.over || e.alerts.soon || e.current_hours != null ? `<div class="eq-badges">${alertChips([e])}${e.current_hours != null ? `<span class="lv unknown">メーター ${e.current_hours}h</span>` : ""}</div>` : ""}
+  </div>`;
+}
+
+function eqTable(list) {
+  return `<div class="table-wrap"><table class="list responsive eq-table"><thead><tr>
+    <th>設備No</th><th>通称</th><th>正式名</th><th>メーカー</th><th class="num">故障</th><th class="num">履歴</th><th>最終作業</th><th>アラート</th>
+  </tr></thead><tbody>${list.map(e => `<tr data-eq="${e.id}" class="${e.status === "廃止" ? "retired" : ""}">
+    <td class="code nowrap" data-label="設備No">${h(e.code || "—")}</td>
+    <td data-label="通称"><strong>${h(eqTitle(e))}</strong>${e.status === "廃止" ? ' <span class="lv unknown">廃止</span>' : ""}</td>
+    <td class="clip muted" data-label="正式名">${e.nickname ? h(e.name) : ""}</td>
+    <td class="clip" data-label="メーカー">${h(e.maker)}</td>
+    <td class="num" data-label="故障">${e.failure_count}</td>
+    <td class="num" data-label="履歴">${e.record_count}</td>
+    <td class="nowrap" data-label="最終作業">${h(fmtDate(e.last_date) || "—")}</td>
+    <td data-label="アラート">${alertChips([e])}</td>
+  </tr>`).join("")}</tbody></table></div>`;
+}
+
 async function renderEquipment(id) {
   if (id) return renderEquipmentDetail(+id);
-  const eqs = await loadEquipment(true);
+  const all = await loadEquipment(true);
+  let category = "";
   view.innerHTML = `
     <div class="toolbar">
-      <div class="search"><span>🔍</span><input id="eq-q" type="search" placeholder="設備名・設備No・メーカーで絞り込み"></div>
-      <label class="muted"><input type="checkbox" id="eq-retired"> 廃止設備も表示</label>
+      <div class="search"><span>🔍</span><input id="eq-q" type="search" placeholder="通称・正式名・設備No・メーカーで絞り込み"></div>
       <button class="btn primary lg" id="new-eq">設備を追加</button>
     </div>
-    <div class="eq-grid" id="eq-grid"></div>`;
-  const draw = () => {
-    const q = $("#eq-q").value.trim().toLowerCase();
-    const showRetired = $("#eq-retired").checked;
-    $("#eq-grid").innerHTML = eqs.filter(e => (showRetired || e.status !== "廃止") &&
-      (!q || [e.code, e.name, e.maker, e.vendor_name].join(" ").toLowerCase().includes(q))).map(e => `
-      <div class="eq-card ${e.status === "廃止" ? "retired" : ""}" data-eq="${e.id}">
-        <div class="eq-code code">${h(e.code || "設備No未採番")}${e.status === "廃止" ? " ・廃止" : ""}</div>
-        <div class="eq-name">${h(e.name)}</div>
-        <div class="eq-meta">${h(e.maker || "メーカー未登録")}${e.delivered ? ` ・ 納入 ${h(e.delivered.replaceAll("-", "/"))}` : ""}</div>
-        <div class="eq-meta">履歴 ${e.record_count}件（故障 ${e.failure_count}件） ・ 最終 ${h(fmtDate(e.last_date) || "—")}</div>
-        <div class="eq-badges">
-          ${e.alerts.over ? lvBadge("over", `⚠ 期限超過 ${e.alerts.over}`) : ""}
-          ${e.alerts.soon ? lvBadge("soon", `● まもなく ${e.alerts.soon}`) : ""}
-          ${e.current_hours != null ? `<span class="lv unknown">メーター ${e.current_hours}h</span>` : ""}
-        </div>
-      </div>`).join("") || `<p class="empty">該当なし</p>`;
-    bindRowClicks($("#eq-grid"));
+    <div class="filters eq-controls">
+      <span class="ctl-label">まとめ方</span>
+      <div class="seg small" id="eq-group">
+        <label><input type="radio" name="eq-group" value="area" ${eqPrefs.group === "area" ? "checked" : ""}>エリア → 種類</label>
+        <label><input type="radio" name="eq-group" value="category" ${eqPrefs.group === "category" ? "checked" : ""}>種類だけ</label>
+      </div>
+      <span class="ctl-label">表示</span>
+      <div class="seg small" id="eq-view">
+        <label><input type="radio" name="eq-view" value="card" ${eqPrefs.view === "card" ? "checked" : ""}>カード</label>
+        <label><input type="radio" name="eq-view" value="list" ${eqPrefs.view === "list" ? "checked" : ""}>一覧</label>
+      </div>
+      <label><input type="checkbox" id="eq-retired" ${eqPrefs.retired ? "checked" : ""}> 廃止設備も表示</label>
+      <span class="spacer"></span>
+      <button class="btn small" id="eq-open">すべて開く</button>
+      <button class="btn small" id="eq-close">すべて閉じる</button>
+    </div>
+    <div class="cat-chips" id="cat-chips"></div>
+    <div id="eq-body"></div>`;
+
+  const groupHtml = (key, label, list, level) => {
+    const open = !eqCollapsed.has(key);
+    return `<details class="eq-group lv${level}" data-key="${h(key)}" ${open ? "open" : ""}>
+      <summary><span class="g-title">${h(label)}</span><span class="g-count">${list.length}台</span>${alertChips(list)}</summary>
+      ${eqPrefs.view === "list" ? eqTable(list) : `<div class="eq-grid">${list.map(eqCard).join("")}</div>`}
+    </details>`;
   };
+
+  const draw = () => {
+    const q = norm($("#eq-q").value).toLowerCase();
+    const base = all.filter(e => inArea(e) && (eqPrefs.retired || e.status !== "廃止") &&
+      (!q || norm([e.code, e.name, e.nickname, e.maker, e.vendor_name, e.category].join(" ")).toLowerCase().includes(q)));
+    // 種類チップ（件数つき）
+    const cats = groupBy(base, e => e.category, state.meta.categories);
+    $("#cat-chips").innerHTML = `<button class="chip ${category ? "" : "on"}" data-cat="">すべて <b>${base.length}</b></button>` +
+      cats.map(([c, l]) => `<button class="chip ${category === c ? "on" : ""}" data-cat="${h(c)}">${h(c)} <b>${l.length}</b></button>`).join("");
+    $$("#cat-chips .chip").forEach(b => b.addEventListener("click", () => { category = b.dataset.cat; draw(); }));
+
+    const list = base.filter(e => !category || e.category === category);
+    if (!list.length) { $("#eq-body").innerHTML = `<p class="empty">該当する設備はありません</p>`; return; }
+    const byCat = items => groupBy(items, e => e.category, state.meta.categories);
+    let html;
+    if (eqPrefs.group === "area" && !state.area) {
+      html = groupBy(list, e => e.area, state.meta.areas).map(([area, items]) => `
+        <section class="eq-area">
+          <h2 class="area-title">${h(area)} <span class="g-count">${items.length}台</span>${alertChips(items)}</h2>
+          ${byCat(items).map(([c, l]) => groupHtml(`${area}|${c}`, c, l, 2)).join("")}
+        </section>`).join("");
+    } else {
+      html = byCat(list).map(([c, l]) => groupHtml(`*|${c}`, c, l, 1)).join("");
+    }
+    // 検索中・種類で絞り込み中は全部開いて見せる
+    $("#eq-body").innerHTML = html;
+    if (q || category) $$("#eq-body details").forEach(d => (d.open = true));
+    $$("#eq-body details").forEach(d => d.addEventListener("toggle", () => {
+      if (q || category) return;
+      d.open ? eqCollapsed.delete(d.dataset.key) : eqCollapsed.add(d.dataset.key);
+    }));
+    bindRowClicks($("#eq-body"));
+  };
+
   $("#eq-q").addEventListener("input", draw);
-  $("#eq-retired").addEventListener("change", draw);
+  $$("#eq-group input").forEach(r => r.addEventListener("change", () => { eqPrefs.group = r.value; saveEqPrefs(); draw(); }));
+  $$("#eq-view input").forEach(r => r.addEventListener("change", () => { eqPrefs.view = r.value; saveEqPrefs(); draw(); }));
+  $("#eq-retired").addEventListener("change", e => { eqPrefs.retired = e.target.checked; saveEqPrefs(); draw(); });
+  $("#eq-open").addEventListener("click", () => { $$("#eq-body details").forEach(d => (d.open = true)); });
+  $("#eq-close").addEventListener("click", () => { $$("#eq-body details").forEach(d => (d.open = false)); });
   $("#new-eq").addEventListener("click", () => openEquipmentForm(null));
   draw();
 }
 
+/* 半角カナ・全角英数をそろえる（サーバー側の norm と同じ考え方） */
+function norm(s) {
+  return String(s ?? "").normalize("NFKC").trim();
+}
+
 async function renderEquipmentDetail(id) {
   const [eq, recs] = await Promise.all([api(`/equipment/${id}`), api(`/records?equipment_id=${id}`)]);
-  $("#page-title").textContent = eq.name;
+  $("#page-title").textContent = eqTitle(eq);
   view.innerHTML = `
-    <a class="back" href="#/equipment">← 設備台帳へ戻る</a>
+    <a class="back" href="#/equipment">← 設備台帳へ戻る</a> <span class="muted crumb">${h(eq.area)} ＞ ${h(eq.category)}</span>
     <div class="grid cols-2">
       <div class="card">
-        <h3>${h(eq.code || "設備No未採番")} ${h(eq.name)} ${eq.status === "廃止" ? '<span class="lv unknown">廃止</span>' : ""}</h3>
+        <h3>${h(eq.code || "設備No未採番")} ${h(eqTitle(eq))} ${eq.status === "廃止" ? '<span class="lv unknown">廃止</span>' : ""}</h3>
         <dl class="info">
+          <dt>正式名</dt><dd>${h(eq.name)}</dd>
+          <dt>エリア・種類</dt><dd>${h(eq.area)} ／ ${h(eq.category)}</dd>
           <dt>型式</dt><dd>${h(eq.model)}</dd>
           <dt>メーカー</dt><dd>${h(eq.maker)}</dd>
           <dt>納入業者</dt><dd>${h(eq.supplier)}</dd>
@@ -555,7 +980,9 @@ async function openEquipmentForm(eq) {
   const f = (name, label, cls = "") => `<label class="field ${cls}"><span>${label}</span><input name="${name}" value="${h(e[name] ?? "")}"></label>`;
   openModal(eq ? "設備情報の編集" : "設備を追加", `
     <div class="form-grid">
-      ${f("code", "設備No")}${f("name", "設備名 *")}
+      ${f("code", "設備No")}${f("nickname", "通称（現場での呼び名）")}
+      ${f("name", "正式名 *", "full")}
+      <label class="field"><span>種類</span><select name="category">${state.meta.categories.map(c => `<option ${e.category === c ? "selected" : ""}>${h(c)}</option>`).join("")}</select></label>
       ${f("model", "型式")}${f("maker", "メーカー")}
       ${f("supplier", "納入業者名")}
       <label class="field"><span>取引業者</span><select name="vendor_id"><option value="">なし</option>${vendors.map(v => `<option value="${v.id}" ${e.vendor_id == v.id ? "selected" : ""}>${h(v.name)}</option>`).join("")}</select></label>
@@ -667,7 +1094,7 @@ async function openPartForm(p) {
     <div class="form-grid">
       <label class="field"><span>種別 *</span><input name="part_type" value="${h(v.part_type)}"></label>
       <label class="field"><span>シリアル *</span><input name="serial" value="${h(v.serial || "")}" ${p ? "readonly" : ""}></label>
-      <label class="field"><span>専用機</span><select name="equipment_id"><option value="">共通/不明</option>${state.equipment.map(e => `<option value="${e.id}" ${v.equipment_id == e.id ? "selected" : ""}>${h((e.code ? e.code + " " : "") + e.name)}</option>`).join("")}</select></label>
+      <label class="field"><span>専用機</span><select name="equipment_id"><option value="">共通/不明</option>${equipmentOptions(e => inArea(e) || e.id == v.equipment_id, v.equipment_id)}</select></label>
       <label class="field"><span>状態</span><select name="status">${state.meta.part_statuses.map(s => `<option ${v.status === s ? "selected" : ""}>${s}</option>`).join("")}</select></label>
       <label class="field"><span>研磨回数</span><input type="number" min="0" name="grind_count" value="${h(v.grind_count ?? "")}"></label>
       <label class="field"><span>研磨上限</span><input type="number" min="1" name="grind_limit" value="${h(v.grind_limit ?? 10)}"></label>
@@ -689,7 +1116,7 @@ async function openPartForm(p) {
 /* ================================================================ 分析 */
 async function renderAnalytics() {
   const years = state.analyticsYears || 5;
-  const a = await api(`/analytics?years=${years}`);
+  const a = await api(`/analytics?years=${years}${areaQS("&")}`);
   const byYear = a.by_year.filter(y => y.year >= a.since.slice(0, 4));
   const eqs = a.by_equipment.filter(e => e.downtime > 0 || e.futeiki > 0);
   const kw = a.keywords.filter(k => k.count > 0);
@@ -705,7 +1132,7 @@ async function renderAnalytics() {
     </div>
     <div class="grid kpi">
       <div class="kpi-tile"><div class="kpi-label">故障（不定期）件数</div><div class="kpi-value">${totalFail}<small>件</small></div></div>
-      <div class="kpi-tile"><div class="kpi-label">ライン停止時間（記録分）</div><div class="kpi-value">${fmtNum(Math.round(totalDown / 60 * 10) / 10)}<small>時間</small></div></div>
+      <div class="kpi-tile"><div class="kpi-label">停止・修理時間（記録分）</div><div class="kpi-value">${fmtNum(Math.round(totalDown / 60 * 10) / 10)}<small>時間</small></div></div>
       <div class="kpi-tile"><div class="kpi-label">修繕費用（記録分）</div><div class="kpi-value">${totalCost ? fmtNum(Math.round(totalCost / 10000)) : 0}<small>万円</small></div></div>
     </div>
     <div class="grid cols-2">
@@ -713,12 +1140,12 @@ async function renderAnalytics() {
         <h3>年別の作業件数</h3>
         <div class="legend"><span><i class="sw" style="background:var(--series-1)"></i>定期</span><span><i class="sw" style="background:var(--series-2)"></i>不定期（故障）</span></div>
         ${stackedYearChart(byYear)}
-        ${tableView(["年", "定期", "不定期", "区分なし", "停止(分)"], byYear.map(y => [y.year, y.teiki, y.futeiki, y.other, y.downtime]))}
+        ${tableView(["年", "定期", "不定期", "区分なし", "停止・修理(分)"], byYear.map(y => [y.year, y.teiki, y.futeiki, y.other, y.downtime]))}
       </div>
       <div class="card chart-card">
-        <h3>設備別のライン停止時間 <span class="sub">分・停止時間の記載がある履歴のみ</span></h3>
-        ${hbarChart(eqs.filter(e => e.downtime > 0).slice(0, 10).map(e => ({ label: e.name, value: e.downtime, tip: `<div class='tip-title'>${h(e.name)}</div>停止 ${fmtNum(e.downtime)}分 / 故障 ${e.futeiki}件` })), v => `${fmtNum(v)}分`)}
-        ${tableView(["設備", "停止(分)", "故障件数", "費用"], eqs.map(e => [e.name, e.downtime, e.futeiki, yen(e.cost)]))}
+        <h3>設備別の停止・修理時間 <span class="sub">分・時間の記載がある履歴のみ</span></h3>
+        ${hbarChart(eqs.filter(e => e.downtime > 0).slice(0, 10).map(e => ({ label: e.name, value: e.downtime, tip: `<div class='tip-title'>${h(e.name)}</div>停止・修理 ${fmtNum(e.downtime)}分 / 故障 ${e.futeiki}件` })), v => `${fmtNum(v)}分`)}
+        ${tableView(["設備", "停止・修理(分)", "故障件数", "費用"], eqs.map(e => [e.name, e.downtime, e.futeiki, yen(e.cost)]))}
       </div>
       <div class="card chart-card">
         <h3>故障内容のキーワード <span class="sub">不定期の履歴に出てくる回数</span></h3>
@@ -781,6 +1208,73 @@ function tableView(head, body) {
 }
 
 /* ================================================================ 取引業者 */
+/* ================================================================ 通知設定 */
+async function renderNotify() {
+  const d = await api("/notify");
+  const st = d.status;
+  const areas = ["*", ...state.meta.areas];
+  const areaLabel = a => (a === "*" ? "全エリア共通" : a);
+  view.innerHTML = `
+    <div class="grid cols-2">
+      <div class="card">
+        <h3>送信設定 ${st.configured ? lvBadge("ok", "✓ 設定済み") : lvBadge("over", "未設定")}</h3>
+        <dl class="info">
+          <dt>メールサーバー</dt><dd>${st.host ? `${h(st.host)}:${st.port}${st.starttls ? "（STARTTLS）" : ""}${st.auth ? "（認証あり）" : ""}` : '<span class="muted">未設定</span>'}</dd>
+          <dt>差出人</dt><dd>${h(st.from_addr) || '<span class="muted">未設定</span>'}</dd>
+          <dt>本文のリンク</dt><dd>${h(st.app_url)}</dd>
+          <dt>送るタイミング</dt><dd>平日の朝（タスクスケジューラで設定）。期限超過のままの項目は毎週${h(st.reminder_weekday)}曜にまとめて送る</dd>
+          <dt>通知済み</dt><dd>${d.sent_count}件${d.last_sent ? `（最終 ${h(d.last_sent)}）` : ""}</dd>
+        </dl>
+        <p class="muted" style="font-size:13px">サーバーやパスワードは画面からは変更できません。サーバー上の <span class="code">${h(st.config_path)}</span> を編集してください${st.config_exists ? "" : "（まだありません。notify.ini.example をコピーして作成）"}。</p>
+        <form id="test-form" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">
+          <input type="email" name="email" placeholder="テスト送信先のアドレス" required style="flex:1;min-width:200px;padding:8px;border:1px solid #cfcec9;border-radius:6px">
+          <button class="btn" ${st.configured ? "" : "disabled"}>テスト送信</button>
+        </form>
+      </div>
+      <div class="card">
+        <h3>宛先 <span class="sub">エリアごと。複数はカンマか改行で区切る</span></h3>
+        <form id="recip-form" class="form-grid">
+          ${areas.map(a => `<label class="field ${a === "*" ? "full" : ""}"><span>${h(areaLabel(a))}${a === "*" ? '<em class="hint" style="font-weight:400"> ・全エリアの通知が届く</em>' : ""}</span>
+            <textarea name="${h(a)}" rows="2" placeholder="name@example.co.jp">${h((d.recipients[a] || []).join("\n"))}</textarea></label>`).join("")}
+          <div class="full"><button class="btn primary">宛先を保存</button> <span class="err" id="recip-err" hidden></span></div>
+        </form>
+      </div>
+    </div>
+    <div class="section-title"><h2>送信内容のプレビュー</h2>
+      <div style="display:flex;gap:8px;align-items:center">
+        <label class="muted" style="font-size:13px"><input type="checkbox" id="pv-all"> 通知済みも含める</label>
+        <button class="btn" id="pv-btn">今送るとどうなるか見る</button>
+      </div>
+    </div>
+    <div id="preview"><p class="muted">ボタンを押すと、次回の送信で届くメールを表示します（実際には送りません）。</p></div>`;
+
+  $("#recip-form").addEventListener("submit", async e => {
+    e.preventDefault();
+    try {
+      const r = await api("/notify/recipients", { method: "PUT", body: Object.fromEntries(new FormData(e.target)) });
+      $("#recip-err").hidden = true;
+      toast(`宛先を保存しました（${r.count}件）`);
+    } catch (ex) { $("#recip-err").textContent = ex.message; $("#recip-err").hidden = false; }
+  });
+  $("#test-form").addEventListener("submit", async e => {
+    e.preventDefault();
+    try {
+      await api("/notify/test", { method: "POST", body: { email: e.target.email.value } });
+      toast("テストメールを送信しました");
+    } catch (ex) { toast(ex.message, 6000); }
+  });
+  $("#pv-btn").addEventListener("click", async () => {
+    const r = await api("/notify/preview" + ($("#pv-all").checked ? "?all=1" : ""));
+    $("#preview").innerHTML =
+      r.warnings.map(w => `<p class="err">⚠ ${h(w)}</p>`).join("") +
+      (r.messages.length ? r.messages.map(m => `
+        <div class="card mail-preview">
+          <div class="mail-head"><div><span class="muted">宛先</span> ${h(m.to.join(", "))}</div><div><span class="muted">件名</span> <strong>${h(m.subject)}</strong></div></div>
+          <pre>${h(m.body)}</pre>
+        </div>`).join("") : `<p class="empty">今送る項目はありません${r.warnings.length ? "（宛先未設定のエリアを除く）" : ""}</p>`);
+  });
+}
+
 async function renderVendors() {
   const vendors = await api("/vendors");
   view.innerHTML = `<div class="table-wrap"><table class="list responsive plain"><thead><tr>
@@ -824,6 +1318,16 @@ async function init() {
   $("#scrim").addEventListener("click", () => { document.body.classList.remove("nav-open"); $("#scrim").hidden = true; });
   $("#fab").addEventListener("click", () => openRecordForm(null));
   state.meta = await api("/meta");
+  try { state.area = localStorage.getItem("maint-area") || ""; } catch { /* noop */ }
+  if (state.area && !state.meta.areas.includes(state.area)) state.area = "";
+  const areaSel = $("#area");
+  areaSel.innerHTML = `<option value="">全エリア</option>` + state.meta.areas.map(a => `<option ${a === state.area ? "selected" : ""}>${h(a)}</option>`).join("");
+  areaSel.addEventListener("change", () => {
+    state.area = areaSel.value;
+    try { localStorage.setItem("maint-area", state.area); } catch { /* noop */ }
+    state.recordQuery.equipment_id = "";
+    router();
+  });
   $("#author-list").innerHTML = state.meta.authors.map(a => `<option value="${h(a)}">`).join("");
   window.addEventListener("hashchange", router);
   router();

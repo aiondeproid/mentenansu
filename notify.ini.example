@@ -1,0 +1,20 @@
+; 交換アラート通知の設定。このファイルを notify.ini という名前でコピーして値を入れる。
+; notify.ini にはパスワードが入ることがあるので、git には登録しない（.gitignore 済み）。
+
+[smtp]
+; Notes（Domino）の場合: Domino サーバーのホスト名。ポートは通常 25、認証なし（社内からのリレーが許可されている場合）
+; ※ どのサーバーから・どの差出人で送ってよいかは情報システム部門に確認すること
+host =
+port = 25
+starttls = no
+; 認証が必要な場合だけ設定する
+user =
+password =
+; 差出人（例: setsubi-alert@example.co.jp）
+from =
+
+[app]
+; メール本文に載せるアプリの URL（社内サーバーのアドレス）
+url = http://localhost:5000/
+; 期限超過のまま残っている項目をまとめて送る曜日（0=月曜 … 4=金曜）
+reminder_weekday = 0

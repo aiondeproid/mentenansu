@@ -92,6 +92,7 @@ button, input, select, textarea { font: inherit; color: inherit; }
 #topbar h1 { font-size: 22px; margin: 0; font-weight: 700; }
 .top-right { margin-left: auto; display: flex; align-items: center; gap: 12px; }
 .who { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-2); }
+.who select { padding: 6px 8px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); max-width: 130px; }
 .who input { width: 120px; padding: 6px 10px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); }
 .icon-btn { background: none; border: 0; font-size: 20px; cursor: pointer; padding: 4px 8px; border-radius: var(--radius); }
 .icon-btn:hover { background: var(--surface-2); }
@@ -191,6 +192,41 @@ td.st-cell .status { display: flex; min-height: 44px; border-radius: 0; height: 
 .eq-card .eq-name { font-weight: 700; font-size: 16px; }
 .eq-card .eq-meta { font-size: 13px; color: var(--text-2); }
 .eq-card .eq-badges { display: flex; gap: 6px; flex-wrap: wrap; margin-top: auto; padding-top: 4px; }
+.eq-card .eq-formal { font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: -4px; }
+.eq-grid { grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 10px; }
+.eq-card { padding: 12px 14px; gap: 4px; }
+.eq-card .eq-name { font-size: 15px; }
+table.list tr.retired td { opacity: .55; }
+
+/* 設備台帳のグループ表示 */
+.eq-controls { gap: 10px 12px; }
+.eq-controls .ctl-label { font-size: 13px; color: var(--text-2); font-weight: 700; }
+.eq-controls .spacer { flex: 1; }
+.seg.small label { padding: 5px 12px; font-size: 13px; }
+.cat-chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0 14px; }
+.chip { border: 1px solid #cfcec9; background: var(--surface); border-radius: 999px; padding: 4px 12px; font-size: 13px; cursor: pointer; color: var(--text-2); }
+.chip b { color: var(--text); margin-left: 2px; font-variant-numeric: tabular-nums; }
+.chip:hover { border-color: #9a9993; }
+.chip.on { background: var(--brand); border-color: var(--brand); color: #fff; }
+.chip.on b { color: #fff; }
+.eq-area { margin-bottom: 22px; }
+.area-title { display: flex; align-items: center; gap: 10px; font-size: 19px; margin: 0 0 8px; padding: 6px 2px 8px; border-bottom: 3px solid var(--brand); }
+.g-count { font-size: 13px; font-weight: 700; color: var(--text-2); background: var(--surface-2); border: 1px solid var(--line); border-radius: 999px; padding: 0 10px; }
+details.eq-group { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; margin-bottom: 8px; }
+details.eq-group > summary {
+  list-style: none; cursor: pointer; display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 10px 14px; font-weight: 700; user-select: none;
+}
+details.eq-group > summary::-webkit-details-marker { display: none; }
+details.eq-group > summary::before { content: "▸"; color: var(--muted); width: 12px; transition: transform .15s; }
+details.eq-group[open] > summary::before { transform: rotate(90deg); }
+details.eq-group[open] > summary { border-bottom: 1px solid var(--line); }
+details.eq-group > .eq-grid { padding: 12px; background: var(--surface-2); border-radius: 0 0 8px 8px; }
+details.eq-group > .table-wrap { border: 0; border-radius: 0 0 8px 8px; }
+.g-title { font-size: 15px; }
+.crumb { font-size: 13px; margin-left: 8px; }
+.eq-card .eq-meta { display: flex; flex-wrap: wrap; gap: 0 10px; }
+.eq-card .eq-meta > span { white-space: nowrap; }
 
 dl.info { display: grid; grid-template-columns: 110px 1fr; gap: 6px 12px; margin: 0; font-size: 14px; }
 dl.info dt { color: var(--text-2); }
@@ -306,4 +342,123 @@ details.table-view table { margin-top: 8px; }
   table.list.responsive td.st-cell .status { display: inline-flex; min-height: 0; border-radius: 4px; }
   table.list.responsive td.clip { white-space: normal; }
   dl.info { grid-template-columns: 90px 1fr; }
+}
+
+/* 通知設定 */
+.mail-preview { margin-bottom: 12px; }
+.mail-head { display: flex; flex-direction: column; gap: 2px; font-size: 14px; padding-bottom: 8px; border-bottom: 1px solid var(--line); margin-bottom: 8px; }
+.mail-preview pre { margin: 0; white-space: pre-wrap; font-family: inherit; font-size: 14px; line-height: 1.6; }
+.btn[disabled] { opacity: .5; cursor: not-allowed; }
+
+/* ------------------------------------------------ 点検計画（カレンダー） */
+.cal-toolbar .spacer { flex: 1; }
+.cal-nav { display: flex; align-items: center; gap: 8px; }
+.cal-nav strong { font-size: 18px; min-width: 120px; text-align: center; font-variant-numeric: tabular-nums; }
+.cal-legend { gap: 6px 14px; }
+.cal-legend label { gap: 4px; font-variant-numeric: tabular-nums; }
+.cal-hint { font-size: 12px; margin-left: auto; }
+.cal-layout { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 14px; align-items: start; margin-bottom: 10px; }
+.cal-grid {
+  display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); background: var(--line); gap: 1px;
+  border: 1px solid var(--line); border-radius: 8px; overflow: hidden;
+}
+.cal-wd { background: #e9e9e7; text-align: center; font-size: 13px; font-weight: 700; color: var(--text-2); padding: 6px 0; }
+.cal-wd.wd0, .cal-day.wd0 .cal-dnum { color: #c62828; }
+.cal-wd.wd6, .cal-day.wd6 .cal-dnum { color: #1f5fa8; }
+.cal-day { background: var(--surface); min-height: 112px; padding: 4px 5px 6px; cursor: pointer; display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.cal-day:hover { background: #fafaf8; }
+.cal-day.out { background: var(--surface-2); }
+.cal-day.out .cal-dnum { opacity: .45; }
+.cal-day.sel { box-shadow: inset 0 0 0 2px var(--primary); }
+.cal-day.drop { background: #e6f0fb; }
+.cal-day:focus-visible { outline: 2px solid var(--primary); outline-offset: -2px; }
+.cal-dnum { font-size: 13px; font-weight: 700; display: flex; align-items: center; gap: 6px; font-variant-numeric: tabular-nums; }
+.cal-day.today .cal-dnum::after {
+  content: "今日"; font-size: 10px; background: var(--brand); color: #fff; border-radius: 3px; padding: 0 4px;
+}
+.cal-dots { display: none; margin-left: auto; font-size: 11px; background: var(--primary); color: #fff; border-radius: 999px; min-width: 18px; text-align: center; padding: 0 5px; order: 3; }
+.cal-evs { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.ev-more { font-size: 11px; color: var(--text-2); padding-left: 4px; }
+
+.ev {
+  display: block; font-size: 12px; line-height: 1.45; padding: 1px 5px; border-radius: 4px; border-left: 3px solid;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text);
+}
+.ev[draggable="true"] { cursor: grab; }
+.ev-tag { font-size: 10px; font-weight: 800; margin-right: 4px; }
+.ev-title { color: var(--text-2); }
+.ev-planned { background: #e6f0fb; border-color: var(--primary); }
+.ev-planned .ev-tag { color: #14508f; }
+.ev-due.soon { background: var(--lv-soon-bg); border-color: #d89200; }
+.ev-due.soon .ev-tag { color: var(--lv-soon); }
+.ev-due.ok { background: var(--lv-ok-bg); border-color: var(--lv-ok); }
+.ev-due.ok .ev-tag { color: var(--lv-ok); }
+.ev-projected { background: transparent; border: 1px dashed #b9b8b3; border-left: 3px dashed #9a9993; }
+.ev-projected .ev-tag { color: var(--text-2); }
+.ev-done { background: #eeeeec; border-color: #9a9993; color: var(--text-2); }
+.ev-done .ev-tag { color: var(--text-2); }
+.ev-failure { background: #fff2eb; border-color: var(--series-2); }
+.ev-failure .ev-tag { color: #b24714; }
+.ev.late { background: var(--lv-over-bg); border-color: var(--lv-over); }
+.ev.late .ev-tag { color: var(--lv-over); }
+.legend-chip { display: inline-block; padding: 0 6px; }
+.legend-chip .ev-tag { margin: 0; }
+
+.cal-side { position: sticky; top: 72px; max-height: calc(100vh - 90px); overflow-y: auto; }
+.day-list { list-style: none; padding: 0; margin: 0 0 12px; display: flex; flex-direction: column; gap: 8px; }
+.day-item { border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; display: flex; flex-direction: column; gap: 3px; }
+.day-head { display: flex; align-items: center; gap: 6px; }
+.day-head .status { min-width: 0; font-size: 11px; padding: 1px 8px; }
+.day-eq { font-size: 13px; color: var(--text-2); }
+.day-title { font-weight: 700; }
+.day-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 4px; }
+
+details.overdue-panel { margin-bottom: 12px; padding: 0; }
+details.overdue-panel > summary { cursor: pointer; padding: 12px 16px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; font-size: 13px; }
+details.overdue-panel[open] > summary { border-bottom: 1px solid var(--line); }
+details.overdue-panel .table-wrap { border: 0; border-radius: 0 0 8px 8px; max-height: 320px; overflow-y: auto; }
+.od-date { padding: 4px 6px; border: 1px solid var(--line); border-radius: var(--radius); }
+.ev-grip { cursor: grab; color: var(--muted); padding: 0 4px; user-select: none; }
+
+/* 年間計画表 */
+.ym-legend { gap: 6px 16px; font-size: 13px; }
+table.year-plan th, table.year-plan td { padding: 7px 8px; }
+table.year-plan td { vertical-align: middle; }
+table.year-plan th.ym-head { text-align: center; cursor: pointer; min-width: 44px; }
+table.year-plan th.ym-head:hover { color: var(--primary); }
+table.year-plan .cur { background: #f1f6fd; }
+table.year-plan td.eqcol { background: var(--surface-2); font-weight: 700; }
+.ym-cell { text-align: center; white-space: nowrap; border-left: 1px solid var(--line); }
+.ym { font-size: 16px; line-height: 1; font-weight: 700; }
+.ym-done { color: #55544f; }
+.ym-planned { color: var(--primary); }
+.ym-late, .ym-over { color: var(--lv-over); }
+.ym-due { color: var(--lv-soon); }
+.ym-projected { color: #9a9993; }
+
+@media (max-width: 1100px) {
+  .cal-layout { grid-template-columns: 1fr; }
+  .cal-side { position: static; max-height: none; }
+}
+@media (max-width: 700px) {
+  .cal-day { min-height: 54px; padding: 3px; }
+  .cal-evs { display: none; }
+  .cal-dots { display: inline-block; }
+  .cal-day.today .cal-dnum::after { display: none; }
+  .cal-day.today .cal-dnum { color: var(--brand); text-decoration: underline; }
+  .cal-hint { display: none; }
+  .cal-nav strong { min-width: 0; font-size: 16px; }
+}
+
+@media print {
+  #sidebar, #topbar, #fab, .cal-toolbar, .cal-side, .cal-hint, .overdue-panel, .ym-legend .muted { display: none !important; }
+  #main { margin: 0; }
+  #view { padding: 0; max-width: none; }
+  body { background: #fff; }
+  .table-wrap { overflow: visible; border: 0; }
+  table.year-plan { font-size: 11px; }
+  table.year-plan th { position: static; }
+  .cal-layout { display: block; }
+  .cal-day { min-height: 90px; }
+  * { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
 }
