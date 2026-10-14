@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>前処理 設備保全</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <aside id="sidebar">
+    <div class="brand"><span class="brand-mark">前</span>前処理 設備保全</div>
+    <nav>
+      <a href="#/dashboard" data-nav="dashboard"><span class="ico">⌂</span>ダッシュボード</a>
+      <a href="#/records" data-nav="records"><span class="ico">≡</span>作業計画/履歴</a>
+      <a href="#/plans" data-nav="plans"><span class="ico">⏱</span>交換アラート<span class="nav-badge" id="badge-plans" hidden></span></a>
+      <a href="#/equipment" data-nav="equipment"><span class="ico">⚙</span>設備台帳</a>
+      <a href="#/parts" data-nav="parts"><span class="ico">◎</span>部品・研磨管理<span class="nav-badge" id="badge-parts" hidden></span></a>
+      <a href="#/analytics" data-nav="analytics"><span class="ico">▤</span>分析</a>
+      <a href="#/vendors" data-nav="vendors"><span class="ico">☎</span>取引業者</a>
+    </nav>
+    <div class="side-foot">プロトタイプ版</div>
+  </aside>
+  <div id="scrim" hidden></div>
+
+  <div id="main">
+    <header id="topbar">
+      <button id="menu-btn" class="icon-btn" aria-label="メニュー">☰</button>
+      <h1 id="page-title">ダッシュボード</h1>
+      <div class="top-right">
+        <label class="who">記入者
+          <input id="current-user" list="author-list" placeholder="名前" autocomplete="off">
+        </label>
+      </div>
+    </header>
+    <main id="view"></main>
+  </div>
+
+  <button id="fab" class="fab" title="作業を記録">＋</button>
+
+  <dialog id="modal">
+    <form method="dialog" id="modal-form" novalidate>
+      <header class="modal-head"><h2 id="modal-title"></h2><button type="button" class="icon-btn" data-close aria-label="閉じる">✕</button></header>
+      <div id="modal-body" class="modal-body"></div>
+      <footer id="modal-foot" class="modal-foot"></footer>
+    </form>
+  </dialog>
+  <div id="toast" role="status" hidden></div>
+  <div id="tip" hidden></div>
+  <datalist id="author-list"></datalist>
+
+  <script src="app.js"></script>
+</body>
+</html>
