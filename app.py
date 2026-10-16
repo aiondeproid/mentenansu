@@ -9,11 +9,15 @@ import io
 import os
 
 import re
+from urllib.parse import quote
 
 from flask import Flask, Response, abort, g, has_request_context, jsonify, request, send_from_directory
 
 from db import CATEGORIES, connect, init_db
 from import_xls import norm
+import equipment_xlsx
+import pla
+import parts_catalog
 
 app = Flask(__name__, static_folder="static", static_url_path="")
 
@@ -145,6 +149,9 @@ def meta():
         authors=authors,
         areas=[r[0] for r in conn.execute(
             "SELECT area FROM equipment WHERE area IS NOT NULL GROUP BY area ORDER BY COUNT(*) DESC")],
+        locations=[r[0] for r in conn.execute(
+            """SELECT location FROM (SELECT location FROM parts UNION ALL SELECT location FROM part_catalog)
+               WHERE location IS NOT NULL GROUP BY location ORDER BY COUNT(*) DESC, location""")],
         today=today().isoformat(),
     )
 
@@ -185,6 +192,8 @@ def equipment_detail(eq_id):
     eq["parts"] = rows(conn.execute("SELECT * FROM parts WHERE equipment_id = ? ORDER BY serial", (eq_id,)))
     for p in eq["parts"]:
         p["level"] = part_state(p)
+    eq["catalog"] = rows(conn.execute(
+        "SELECT * FROM part_catalog WHERE equipment_id = ? ORDER BY sort_order, id", (eq_id,)))
     return jsonify(eq)
 
 
@@ -216,6 +225,30 @@ def equipment_update(eq_id):
                  [blank_to_none(d[f]) for f in fields] + [eq_id])
     conn.commit()
     return jsonify(ok=True)
+
+
+@app.get("/api/equipment/export.xlsx")
+def equipment_export():
+    name = f"設備台帳_{today().strftime('%Y%m%d')}.xlsx"
+    return Response(equipment_xlsx.export_workbook(db()),
+                    mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    headers={"Content-Disposition": f"attachment; filename=equipment.xlsx; filename*=UTF-8''{quote(name)}"})
+
+
+@app.post("/api/equipment/import")
+def equipment_import():
+    """?apply=1 のときだけ DB を変える。それ以外は変更内容の確認だけ。"""
+    f = request.files.get("file")
+    if not f:
+        abort(400, "ファイルを選んでください")
+    conn = db()
+    try:
+        plan = equipment_xlsx.plan_import(conn, f.read())
+        if request.args.get("apply") == "1":
+            return jsonify(applied=equipment_xlsx.apply_import(conn, plan))
+    except ValueError as e:
+        abort(400, str(e))
+    return jsonify(plan)
 
 
 @app.put("/api/equipment/<int:eq_id>/hours")
@@ -546,7 +579,7 @@ def part_detail(part_id):
     return jsonify(p)
 
 
-PART_FIELDS = ["part_type", "serial", "equipment_id", "grind_count", "grind_limit", "status", "note"]
+PART_FIELDS = ["part_type", "serial", "equipment_id", "grind_count", "grind_limit", "status", "location", "note"]
 
 
 @app.post("/api/parts")
@@ -602,6 +635,285 @@ def part_event(part_id):
     conn.execute("UPDATE parts SET grind_count=?, status=COALESCE(?, status) WHERE id=?", (grind, status, part_id))
     conn.commit()
     return jsonify(ok=True, message=message)
+
+
+# ---------------------------------------------------------------- 部品一覧（価格表）・Excel 入出力
+CATALOG_FIELDS = ["group_name", "machine", "name", "unit_price", "qty", "note", "memo", "location", "equipment_id", "area"]
+
+
+@app.get("/api/catalog")
+def catalog_list():
+    area = request.args.get("area")
+    sql = """SELECT c.*, e.name AS equipment_name, e.nickname AS equipment_nickname, e.code AS equipment_code
+             FROM part_catalog c LEFT JOIN equipment e ON e.id = c.equipment_id"""
+    args = []
+    if area:
+        sql += " WHERE COALESCE(e.area, c.area) = ?"
+        args.append(area)
+    return jsonify(rows(db().execute(sql + " ORDER BY c.sort_order, c.id", args)))
+
+
+def catalog_values(d):
+    v = {f: blank_to_none(d.get(f)) for f in CATALOG_FIELDS if f in d}
+    if "name" in v and not (v["name"] or "").strip():
+        abort(400, "部品名は必須です")
+    v["updated_at"] = dt.datetime.now().isoformat(timespec="seconds")
+    return v
+
+
+@app.post("/api/catalog")
+def catalog_create():
+    v = catalog_values(body())
+    if not v.get("name"):
+        abort(400, "部品名は必須です")
+    conn = db()
+    v["sort_order"] = conn.execute("SELECT COALESCE(MAX(sort_order), 0) + 1 FROM part_catalog").fetchone()[0]
+    v["source"] = "app"
+    cur = conn.execute(f"INSERT INTO part_catalog({','.join(v)}) VALUES ({','.join('?' * len(v))})", list(v.values()))
+    conn.commit()
+    return jsonify(id=cur.lastrowid), 201
+
+
+@app.put("/api/catalog/<int:item_id>")
+def catalog_update(item_id):
+    v = catalog_values(body())
+    conn = db()
+    conn.execute(f"UPDATE part_catalog SET {', '.join(k + '=?' for k in v)} WHERE id=?", list(v.values()) + [item_id])
+    conn.commit()
+    return jsonify(ok=True)
+
+
+@app.delete("/api/catalog/<int:item_id>")
+def catalog_delete(item_id):
+    conn = db()
+    conn.execute("DELETE FROM part_catalog WHERE id=?", (item_id,))
+    conn.commit()
+    return jsonify(ok=True)
+
+
+@app.get("/api/parts/export.xlsx")
+def parts_export():
+    data = parts_catalog.export_workbook(db())
+    name = f"部品一覧_{today().strftime('%Y%m%d')}.xlsx"
+    return Response(data, mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    headers={"Content-Disposition": f"attachment; filename=parts.xlsx; filename*=UTF-8''{quote(name)}"})
+
+
+@app.post("/api/parts/import")
+def parts_import():
+    """?apply=1 のときだけ DB を変える。それ以外は変更内容の確認だけ。"""
+    f = request.files.get("file")
+    if not f:
+        abort(400, "ファイルを選んでください")
+    conn = db()
+    try:
+        plan = parts_catalog.plan_import(conn, f.read())
+        if request.args.get("apply") == "1":
+            return jsonify(applied=parts_catalog.apply_import(conn, plan))
+    except ValueError as e:
+        abort(400, str(e))
+    return jsonify(plan)
+
+
+# ---------------------------------------------------------------- プラ点検
+PLA_FIELDS = ["process", "equipment", "item", "color", "material", "material_pct", "material_maker", "hazard",
+              "methods", "is_new", "frequency", "severity", "possibility", "evaluation", "note", "active"]
+
+
+def pla_process():
+    p = request.args.get("process") or "前工程"
+    if p not in pla.PROCESS_AREA:
+        abort(400, "工程が不正です")
+    return p
+
+
+def pla_items(conn, process, daily_only=False):
+    items = rows(conn.execute(
+        """SELECT i.*, (SELECT COUNT(*) FROM pla_results r WHERE r.item_id = i.id) AS result_count
+           FROM pla_items i WHERE process = ? ORDER BY sort_order, id""", (process,)))
+    for i in items:
+        i["daily"] = pla.is_daily(i)
+    return [i for i in items if i["daily"]] if daily_only else items
+
+
+@app.get("/api/pla/meta")
+def pla_meta():
+    return jsonify(processes=list(pla.PROCESS_AREA), process_area=pla.PROCESS_AREA, timings=pla.TIMINGS,
+                   hazards=pla.HAZARDS, methods=[n for _, n in pla.METHOD_PATTERNS])
+
+
+@app.get("/api/pla/items")
+def pla_items_list():
+    return jsonify(pla_items(db(), pla_process()))
+
+
+def pla_values(d):
+    v = {f: blank_to_none(d.get(f)) for f in PLA_FIELDS if f in d}
+    for f in ("is_new", "active"):
+        if f in v:
+            v[f] = 1 if v[f] in (1, "1", True, "on", "true") else 0
+    if "item" in v and not (v["item"] or "").strip():
+        abort(400, "点検箇所（機械・器具）は必須です")
+    if "process" in v and v["process"] not in pla.PROCESS_AREA:
+        abort(400, "工程が不正です")
+    v["updated_at"] = dt.datetime.now().isoformat(timespec="seconds")
+    return v
+
+
+@app.post("/api/pla/items")
+def pla_item_create():
+    v = pla_values(body())
+    if not v.get("item") or not v.get("equipment") or not v.get("process"):
+        abort(400, "工程・設備名・点検箇所は必須です")
+    v.setdefault("active", 1)
+    conn = db()
+    # 同じ設備の最後に並べる
+    last = conn.execute("SELECT MAX(sort_order) FROM pla_items WHERE process=? AND equipment=?",
+                        (v["process"], v["equipment"])).fetchone()[0]
+    if last is None:
+        last = conn.execute("SELECT COALESCE(MAX(sort_order), 0) FROM pla_items WHERE process=?", (v["process"],)).fetchone()[0]
+    conn.execute("UPDATE pla_items SET sort_order = sort_order + 1 WHERE process=? AND sort_order > ?", (v["process"], last))
+    v["sort_order"], v["source"] = last + 1, "app"
+    cur = conn.execute(f"INSERT INTO pla_items({','.join(v)}) VALUES ({','.join('?' * len(v))})", list(v.values()))
+    conn.commit()
+    return jsonify(id=cur.lastrowid), 201
+
+
+@app.put("/api/pla/items/<int:item_id>")
+def pla_item_update(item_id):
+    v = pla_values(body())
+    conn = db()
+    conn.execute(f"UPDATE pla_items SET {', '.join(k + '=?' for k in v)} WHERE id=?", list(v.values()) + [item_id])
+    conn.commit()
+    return jsonify(ok=True)
+
+
+@app.delete("/api/pla/items/<int:item_id>")
+def pla_item_delete(item_id):
+    conn = db()
+    if conn.execute("SELECT 1 FROM pla_results WHERE item_id=?", (item_id,)).fetchone():
+        abort(409, "点検記録がある箇所は削除できません。「点検しない（停止中）」にしてください")
+    conn.execute("DELETE FROM pla_items WHERE id=?", (item_id,))
+    conn.commit()
+    return jsonify(ok=True)
+
+
+def pla_date_timing(d):
+    date, timing = d.get("date"), d.get("timing")
+    try:
+        dt.date.fromisoformat(date or "")
+    except ValueError:
+        abort(400, "日付が不正です")
+    if timing not in pla.TIMINGS:
+        abort(400, "始業時・終業時のどちらかを選んでください")
+    return date, timing
+
+
+@app.get("/api/pla/sheet")
+def pla_sheet():
+    """点検する画面のデータ。日々の点検箇所と、その日・その時間の結果。"""
+    process = pla_process()
+    date, timing = pla_date_timing(request.args)
+    conn = db()
+    items = pla_items(conn, process, daily_only=True)
+    results = {r["item_id"]: r for r in rows(conn.execute(
+        """SELECT r.* FROM pla_results r JOIN pla_items i ON i.id = r.item_id
+           WHERE i.process = ? AND r.check_date = ? AND r.timing = ?""", (process, date, timing)))}
+    review = conn.execute("SELECT * FROM pla_reviews WHERE process=? AND check_date=? AND timing=?",
+                          (process, date, timing)).fetchone()
+    return jsonify(items=items, results=results, review=dict(review) if review else None)
+
+
+@app.put("/api/pla/results")
+def pla_results_save():
+    """結果をまとめて保存する。result が空なら取り消し。"""
+    d = body()
+    date, timing = pla_date_timing(d)
+    who = (d.get("checked_by") or "").strip()
+    if not who:
+        abort(400, "右上の「記入者」に名前を入れてください")
+    now = dt.datetime.now().isoformat(timespec="seconds")
+    conn = db()
+    for r in d.get("results") or []:
+        result = r.get("result")
+        if result not in ("ok", "ng", "na", None, ""):
+            abort(400, "結果が不正です")
+        if result == "ng" and not (r.get("note") or "").strip():
+            abort(400, "異常のときは内容を書いてください")
+        if not result:
+            conn.execute("DELETE FROM pla_results WHERE item_id=? AND check_date=? AND timing=?", (r["item_id"], date, timing))
+            continue
+        conn.execute(
+            """INSERT INTO pla_results(item_id, check_date, timing, result, note, checked_by, checked_at)
+               VALUES (?,?,?,?,?,?,?)
+               ON CONFLICT(item_id, check_date, timing) DO UPDATE SET
+                 result=excluded.result, note=excluded.note, checked_by=excluded.checked_by, checked_at=excluded.checked_at""",
+            (r["item_id"], date, timing, result, blank_to_none(r.get("note")) if result == "ng" else None, who, now))
+    conn.commit()
+    return jsonify(ok=True)
+
+
+@app.get("/api/pla/summary")
+def pla_summary():
+    """確認画面のデータ。月の日ごと・時間ごとの点検数、異常、確認者。"""
+    process = pla_process()
+    ym = request.args.get("month") or today().strftime("%Y-%m")
+    try:
+        first = dt.date.fromisoformat(ym + "-01")
+    except ValueError:
+        abort(400, "月が不正です")
+    last = (first.replace(day=28) + dt.timedelta(days=4)).replace(day=1) - dt.timedelta(days=1)
+    conn = db()
+    total = len(pla_items(conn, process, daily_only=True))
+    days = {}
+    for r in conn.execute(
+            """SELECT r.check_date, r.timing, COUNT(*) AS done, SUM(r.result = 'ng') AS ng,
+                      GROUP_CONCAT(DISTINCT r.checked_by) AS checkers
+               FROM pla_results r JOIN pla_items i ON i.id = r.item_id
+               WHERE i.process = ? AND r.check_date BETWEEN ? AND ? GROUP BY r.check_date, r.timing""",
+            (process, first.isoformat(), last.isoformat())):
+        days.setdefault(r["check_date"], {})[r["timing"]] = {"done": r["done"], "ng": r["ng"], "checkers": r["checkers"]}
+    for r in conn.execute("SELECT * FROM pla_reviews WHERE process=? AND check_date BETWEEN ? AND ?",
+                          (process, first.isoformat(), last.isoformat())):
+        days.setdefault(r["check_date"], {}).setdefault(r["timing"], {"done": 0, "ng": 0, "checkers": None})["review"] = dict(r)
+    ng = rows(conn.execute(
+        """SELECT r.*, i.equipment, i.item, i.hazard FROM pla_results r JOIN pla_items i ON i.id = r.item_id
+           WHERE i.process = ? AND r.result = 'ng' AND r.check_date BETWEEN ? AND ?
+           ORDER BY r.check_date DESC, r.timing DESC, i.sort_order""", (process, first.isoformat(), last.isoformat())))
+    return jsonify(total=total, days=days, ng=ng, month=ym)
+
+
+@app.put("/api/pla/reviews")
+def pla_review_save():
+    d = body()
+    date, timing = pla_date_timing(d)
+    process = d.get("process")
+    if process not in pla.PROCESS_AREA:
+        abort(400, "工程が不正です")
+    reviewer = (d.get("reviewer") or "").strip()
+    conn = db()
+    if d.get("cancel"):
+        conn.execute("DELETE FROM pla_reviews WHERE process=? AND check_date=? AND timing=?", (process, date, timing))
+    else:
+        if not reviewer:
+            abort(400, "右上の「記入者」に確認者の名前を入れてください")
+        conn.execute(
+            """INSERT INTO pla_reviews(process, check_date, timing, reviewer, reviewed_at, comment) VALUES (?,?,?,?,?,?)
+               ON CONFLICT(process, check_date, timing) DO UPDATE SET
+                 reviewer=excluded.reviewer, reviewed_at=excluded.reviewed_at, comment=excluded.comment""",
+            (process, date, timing, reviewer, dt.datetime.now().isoformat(timespec="seconds"), blank_to_none(d.get("comment"))))
+    conn.commit()
+    return jsonify(ok=True)
+
+
+@app.get("/api/pla/export.xlsx")
+def pla_export():
+    process = pla_process()
+    ym = request.args.get("month") or today().strftime("%Y-%m")
+    name = f"プラ点検記録_{process}_{ym}.xlsx"
+    return Response(pla.export_month(db(), process, ym),
+                    mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    headers={"Content-Disposition": f"attachment; filename=pla.xlsx; filename*=UTF-8''{quote(name)}"})
 
 
 # ---------------------------------------------------------------- 取引業者

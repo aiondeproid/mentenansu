@@ -82,6 +82,7 @@ CREATE TABLE IF NOT EXISTS parts (
     grind_count INTEGER DEFAULT 0,
     grind_limit INTEGER DEFAULT 10,
     status TEXT DEFAULT '予備', -- 使用中 / 予備 / 研磨中 / 使用禁止 / 廃棄
+    location TEXT,             -- 保管場所
     note TEXT
 );
 
@@ -109,6 +110,68 @@ CREATE TABLE IF NOT EXISTS notify_log (
     area TEXT,
     sent_at TEXT DEFAULT (datetime('now','localtime'))
 );
+
+-- 部品一覧（価格表）。シリアルを持たない交換部品・消耗品
+CREATE TABLE IF NOT EXISTS part_catalog (
+    id INTEGER PRIMARY KEY,
+    group_name TEXT,           -- 区分（Aライン・コンベアネット など。価格表のシート名）
+    machine TEXT,              -- 機械・場所（DeJong成型機 など。価格表の見出し）
+    name TEXT NOT NULL,
+    unit_price INTEGER,        -- 単価（円）
+    qty REAL,                  -- 数量（一度に使う数）
+    note TEXT,                 -- 備考
+    memo TEXT,                 -- 補足（価格表の E 列）
+    location TEXT,             -- 保管場所
+    equipment_id INTEGER REFERENCES equipment(id),
+    area TEXT,
+    sort_order INTEGER,
+    source TEXT,               -- 取り込み元ファイル名 / 'app' / 'excel'
+    updated_at TEXT
+);
+
+-- プラ・樹脂箇所の点検（プラ点検）
+CREATE TABLE IF NOT EXISTS pla_items (        -- 点検箇所（プラ樹脂点検リストの 1 行）
+    id INTEGER PRIMARY KEY,
+    process TEXT NOT NULL,     -- 前工程 / 後工程 / タレ工程
+    equipment TEXT NOT NULL,   -- 設備名（点検表の表記のまま）
+    item TEXT NOT NULL,        -- 機械・器具
+    color TEXT,
+    material TEXT,             -- 材質大括り（ぷらしる）
+    material_pct TEXT,         -- ％（ぷらしる）
+    material_maker TEXT,       -- 材質（メーカー提示）
+    hazard TEXT,               -- 危害度 A〜D
+    methods TEXT,              -- 点検方法（始業前点検表,プラリスク点検表 などをカンマ区切り）
+    is_new INTEGER DEFAULT 0,
+    frequency TEXT,            -- ２回／日 など
+    severity TEXT, possibility TEXT, evaluation TEXT,
+    note TEXT,
+    active INTEGER DEFAULT 1,  -- 0 = 撤去・項目から外した（記録のため残す）
+    sort_order INTEGER,
+    source TEXT,
+    updated_at TEXT
+);
+CREATE TABLE IF NOT EXISTS pla_results (      -- 点検結果（箇所 × 日 × 始業時/終業時）
+    id INTEGER PRIMARY KEY,
+    item_id INTEGER NOT NULL REFERENCES pla_items(id),
+    check_date TEXT NOT NULL,
+    timing TEXT NOT NULL,      -- 始業時 / 終業時
+    result TEXT NOT NULL,      -- ok / ng / na（稼働なし）
+    note TEXT,                 -- 異常の内容
+    checked_by TEXT,
+    checked_at TEXT,
+    UNIQUE(item_id, check_date, timing)
+);
+CREATE TABLE IF NOT EXISTS pla_reviews (      -- 確認（工程 × 日 × 始業時/終業時 ごとに確認者が見た記録）
+    id INTEGER PRIMARY KEY,
+    process TEXT NOT NULL,
+    check_date TEXT NOT NULL,
+    timing TEXT NOT NULL,
+    reviewer TEXT,
+    reviewed_at TEXT,
+    comment TEXT,
+    UNIQUE(process, check_date, timing)
+);
+CREATE INDEX IF NOT EXISTS idx_pla_results_date ON pla_results(check_date);
 
 CREATE INDEX IF NOT EXISTS idx_records_eq ON records(equipment_id);
 CREATE INDEX IF NOT EXISTS idx_records_date ON records(done_date);
@@ -182,6 +245,9 @@ def init_db(conn):
     for col in ("source_file", "nickname", "category"):
         if col not in cols:
             conn.execute(f"ALTER TABLE equipment ADD COLUMN {col} TEXT")
+    for table in ("parts", "part_catalog"):
+        if "location" not in {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN location TEXT")  # 保管場所
     for e in conn.execute("SELECT id, name, sheet_name FROM equipment WHERE category IS NULL").fetchall():
         conn.execute("UPDATE equipment SET category=?, nickname=COALESCE(nickname, ?) WHERE id=?",
                      (guess_category(e["sheet_name"], e["name"]), make_nickname(e["sheet_name"], e["name"]), e["id"]))

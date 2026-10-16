@@ -18,7 +18,7 @@ const yen = n => (n ? "¥" + fmtNum(n) : "");
 
 async function api(path, opts = {}) {
   const init = { headers: {}, ...opts };
-  if (opts.body && typeof opts.body !== "string") {
+  if (opts.body && typeof opts.body !== "string" && !(opts.body instanceof FormData)) {
     init.body = JSON.stringify(opts.body);
     init.headers["Content-Type"] = "application/json";
   }
@@ -84,6 +84,7 @@ const routes = {
   analytics: ["分析", renderAnalytics],
   vendors: ["取引業者", renderVendors],
   notify: ["通知設定", renderNotify],
+  pla: ["プラ点検", renderPla],
 };
 
 async function router() {
@@ -825,6 +826,8 @@ async function renderEquipment(id) {
   view.innerHTML = `
     <div class="toolbar">
       <div class="search"><span>🔍</span><input id="eq-q" type="search" placeholder="通称・正式名・設備No・メーカーで絞り込み"></div>
+      <a class="btn" href="/api/equipment/export.xlsx" download>Excel出力</a>
+      <button class="btn" id="eq-import">Excel取込</button>
       <button class="btn primary lg" id="new-eq">設備を追加</button>
     </div>
     <div class="filters eq-controls">
@@ -894,6 +897,7 @@ async function renderEquipment(id) {
   $("#eq-open").addEventListener("click", () => { $$("#eq-body details").forEach(d => (d.open = true)); });
   $("#eq-close").addEventListener("click", () => { $$("#eq-body details").forEach(d => (d.open = false)); });
   $("#new-eq").addEventListener("click", () => openEquipmentForm(null));
+  $("#eq-import").addEventListener("click", () => openXlsxImport(EQUIPMENT_IMPORT));
   draw();
 }
 
@@ -953,8 +957,13 @@ async function renderEquipmentDetail(id) {
     </tbody></table></div>` : `<p class="muted">登録なし</p>`}
 
     ${eq.parts.length ? `<div class="section-title"><h2>専用部品</h2></div>
-    <div class="table-wrap"><table class="list responsive"><thead><tr><th>シリアル</th><th>種別</th><th>状態</th><th>研磨回数</th></tr></thead><tbody>
-      ${eq.parts.map(p => `<tr data-part="${p.id}"><td class="code">${h(p.serial)}</td><td>${h(p.part_type)}</td><td>${h(p.status)}</td><td>${grindMeter(p)}</td></tr>`).join("")}
+    <div class="table-wrap"><table class="list responsive"><thead><tr><th>シリアル</th><th>種別</th><th>状態</th><th>研磨回数</th><th>保管場所</th></tr></thead><tbody>
+      ${eq.parts.map(p => `<tr data-part="${p.id}"><td class="code">${h(p.serial)}</td><td>${h(p.part_type)}</td><td>${h(p.status)}</td><td>${grindMeter(p)}</td><td>${h(p.location || "")}</td></tr>`).join("")}
+    </tbody></table></div>` : ""}
+
+    ${eq.catalog.length ? `<div class="section-title"><h2>交換部品・単価（${eq.catalog.length}件）</h2><a class="btn small" href="#/parts/catalog">部品一覧へ</a></div>
+    <div class="table-wrap"><table class="list responsive"><thead><tr><th>部品名</th><th class="num">単価</th><th class="num">数量</th><th>保管場所</th><th>備考</th></tr></thead><tbody>
+      ${eq.catalog.map(c => `<tr style="cursor:default"><td data-label="部品名"><strong>${h(c.name)}</strong></td><td class="num nowrap" data-label="単価">${c.unit_price != null ? yen(c.unit_price) : '<span class="muted">未登録</span>'}</td><td class="num" data-label="数量">${c.qty != null ? fmtNum(c.qty) : ""}</td><td data-label="保管場所">${h(c.location || "")}</td><td class="clip" data-label="備考">${h([c.note, c.memo].filter(Boolean).join(" ／ "))}</td></tr>`).join("")}
     </tbody></table></div>` : ""}
 
     <div class="section-title"><h2>作業履歴（${recs.length}件）</h2><button class="btn primary" id="add-rec">作業を記録</button></div>
@@ -1007,6 +1016,9 @@ async function openEquipmentForm(eq) {
 }
 
 /* ================================================================ 部品・研磨管理 */
+/* 保管場所の入力候補（今までに入れた場所） */
+const locList = () => `<datalist id="loc-list">${(state.meta.locations || []).map(l => `<option value="${h(l)}">`).join("")}</datalist>`;
+
 function grindMeter(p) {
   if (p.grind_count == null) return `<span class="muted">研磨回数不明</span>`;
   const limit = p.grind_limit || 10;
@@ -1017,9 +1029,25 @@ function grindMeter(p) {
     <span class="meter-text">${p.grind_count}/${limit}回</span></div>`;
 }
 
-async function renderParts() {
+/* 部品・研磨管理の上のタブと Excel ボタン（両タブ共通。1つの Excel に両方のシートが入る） */
+function partsHeader(tab) {
+  return `<div class="tabs-row">
+    <nav class="tabs">
+      <a href="#/parts" class="${tab === "serial" ? "on" : ""}">研磨管理（シリアル）</a>
+      <a href="#/parts/catalog" class="${tab === "catalog" ? "on" : ""}">部品一覧（価格表）</a>
+    </nav>
+    <div class="tabs-actions">
+      <a class="btn" href="/api/parts/export.xlsx" download>Excel出力</a>
+      <button class="btn" id="xlsx-import">Excel取込</button>
+    </div>
+  </div>`;
+}
+
+async function renderParts(tab) {
+  if (tab === "catalog") return renderCatalog();
   const parts = await api("/parts");
   view.innerHTML = `
+    ${partsHeader("serial")}
     <div class="toolbar">
       <div class="filters" style="margin:0;flex:1">
         <label>状態 <select id="p-status"><option value="">使用可能のみ（使用中・予備・研磨中）</option><option value="all">すべて</option>${state.meta.part_statuses.map(s => `<option>${s}</option>`).join("")}</select></label>
@@ -1028,7 +1056,7 @@ async function renderParts() {
     </div>
     <p class="muted" style="font-size:13px;margin:0 0 10px">肉盛り研磨は一般に10回まで（フィルターは内径φ110が限界、メーカーで現物判断）。「研磨出し」を記録すると回数が増えます。</p>
     <div class="table-wrap"><table class="list responsive"><thead><tr>
-      <th>シリアル</th><th>種別</th><th>専用機</th><th>状態</th><th>研磨回数</th><th>最終記録</th><th>メモ</th>
+      <th>シリアル</th><th>種別</th><th>専用機</th><th>状態</th><th>研磨回数</th><th>保管場所</th><th>最終記録</th><th>メモ</th>
     </tr></thead><tbody id="parts-body"></tbody></table></div>`;
   const draw = () => {
     const f = $("#p-status").value;
@@ -1040,15 +1068,196 @@ async function renderParts() {
         <td data-label="専用機">${p.equipment_name ? eqLabel(p) : '<span class="muted">共通/不明</span>'}</td>
         <td data-label="状態">${h(p.status)}</td>
         <td>${grindMeter(p)}</td>
+        <td data-label="保管場所">${h(p.location || "")}</td>
         <td class="nowrap" data-label="最終記録">${fmtDate(p.last_event_date)}</td>
         <td class="clip" data-label="メモ">${h(p.note)}</td>
-      </tr>`).join("") || `<tr><td colspan="7" class="empty">該当なし</td></tr>`;
+      </tr>`).join("") || `<tr><td colspan="8" class="empty">該当なし</td></tr>`;
     bindRowClicks($("#parts-body"));
   };
   $("#p-status").addEventListener("change", draw);
   $("#new-part").addEventListener("click", () => openPartForm(null));
+  $("#xlsx-import").addEventListener("click", () => openXlsxImport(PARTS_IMPORT));
   draw();
 }
+
+/* ---------------------------------------------------------------- 部品一覧（価格表） */
+const catState = { q: "", group: "" };
+
+async function renderCatalog() {
+  const [items] = await Promise.all([api("/catalog" + areaQS()), loadEquipment()]);
+  view.innerHTML = `
+    ${partsHeader("catalog")}
+    <div class="toolbar">
+      <div class="search"><span>🔍</span><input id="c-q" type="search" placeholder="部品名・型番・機械・保管場所・備考で絞り込み" value="${h(catState.q)}"></div>
+      <button class="btn primary lg" id="new-cat">部品を追加</button>
+    </div>
+    <div class="cat-chips" id="c-groups"></div>
+    <p class="muted" style="font-size:13px;margin:0 0 10px">交換部品・消耗品の単価の一覧です。まとめて直すときは「Excel出力」で書き出し、直したファイルを「Excel取込」で読み込みます。</p>
+    <div id="c-body"></div>`;
+
+  const draw = () => {
+    const q = norm(catState.q).toLowerCase();
+    const hit = items.filter(c => !q || norm([c.group_name, c.machine, c.name, c.note, c.memo, c.location, c.equipment_nickname, c.equipment_name].join(" ")).toLowerCase().includes(q));
+    const groups = groupBy(hit, c => c.group_name || "未分類");
+    if (catState.group && !groups.some(([g]) => g === catState.group)) catState.group = "";
+    $("#c-groups").innerHTML = `<button class="chip ${catState.group ? "" : "on"}" data-g="">すべて <b>${hit.length}</b></button>` +
+      groups.map(([g, l]) => `<button class="chip ${catState.group === g ? "on" : ""}" data-g="${h(g)}">${h(g)} <b>${l.length}</b></button>`).join("");
+    $$("#c-groups .chip").forEach(b => b.addEventListener("click", () => { catState.group = b.dataset.g; draw(); }));
+    const shown = groups.filter(([g]) => !catState.group || g === catState.group);
+    $("#c-body").innerHTML = shown.length ? shown.map(([g, list]) => `
+      <section class="cat-group">
+        <h2 class="area-title">${h(g)} <span class="g-count">${list.length}件</span></h2>
+        <div class="table-wrap"><table class="list responsive cat-table"><thead><tr>
+          <th>機械・場所</th><th>部品名</th><th class="num">単価</th><th class="num">数量</th><th>保管場所</th><th>備考</th><th>設備</th>
+        </tr></thead><tbody>${list.map(c => `
+          <tr data-cat="${c.id}">
+            <td data-label="機械・場所">${h(c.machine || "")}</td>
+            <td data-label="部品名"><strong>${h(c.name)}</strong></td>
+            <td class="num nowrap" data-label="単価">${c.unit_price != null ? yen(c.unit_price) : '<span class="muted">未登録</span>'}</td>
+            <td class="num" data-label="数量">${c.qty != null ? fmtNum(c.qty) : ""}</td>
+            <td data-label="保管場所">${c.location ? h(c.location) : '<span class="muted">—</span>'}</td>
+            <td class="clip" data-label="備考">${h(c.note || "")}${c.memo ? `<div class="muted" style="font-size:12px">${h(c.memo)}</div>` : ""}</td>
+            <td data-label="設備">${c.equipment_id ? `<a href="#/equipment/${c.equipment_id}" class="eq-link">${eqLabel({ equipment_code: c.equipment_code, equipment_name: c.equipment_nickname || c.equipment_name })}</a>` : '<span class="muted">—</span>'}</td>
+          </tr>`).join("")}</tbody></table></div>
+      </section>`).join("") : `<p class="empty">該当する部品はありません</p>`;
+    $$("#c-body [data-cat]").forEach(tr => tr.addEventListener("click", e => {
+      if (e.target.closest(".eq-link")) return;
+      openCatalogForm(items.find(c => c.id == tr.dataset.cat));
+    }));
+  };
+  let timer;
+  $("#c-q").addEventListener("input", e => { clearTimeout(timer); timer = setTimeout(() => { catState.q = e.target.value; draw(); }, 200); });
+  $("#new-cat").addEventListener("click", () => openCatalogForm(null, { group_name: catState.group || "" }));
+  $("#xlsx-import").addEventListener("click", () => openXlsxImport(PARTS_IMPORT));
+  draw();
+}
+
+async function openCatalogForm(c, preset = {}) {
+  await loadEquipment();
+  const v = c || { area: state.area || "前処理", ...preset };
+  const groups = [...new Set((await api("/catalog")).map(x => x.group_name).filter(Boolean))];
+  openModal(c ? "部品の編集" : "部品を追加", `
+    <div class="form-grid">
+      <label class="field"><span>区分</span><input name="group_name" list="cat-groups" value="${h(v.group_name || "")}" placeholder="例: Aライン"><datalist id="cat-groups">${groups.map(g => `<option value="${h(g)}">`).join("")}</datalist></label>
+      <label class="field"><span>機械・場所</span><input name="machine" value="${h(v.machine || "")}" placeholder="例: DeJong成型機"></label>
+      <label class="field full"><span>部品名<em class="req">*</em></span><input name="name" value="${h(v.name || "")}" placeholder="例: 打ち出しベルト"></label>
+      <label class="field"><span>単価（円）</span><input type="number" min="0" name="unit_price" value="${h(v.unit_price ?? "")}" inputmode="numeric"></label>
+      <label class="field"><span>数量</span><input type="number" min="0" step="any" name="qty" value="${h(v.qty ?? "")}" inputmode="decimal"><span class="hint">一度の交換で使う数</span></label>
+      <label class="field full"><span>保管場所</span><input name="location" list="loc-list" value="${h(v.location || "")}" placeholder="例: 部品庫 棚A-2">${locList()}</label>
+      <label class="field full"><span>備考</span><textarea name="note" rows="2">${h(v.note || "")}</textarea></label>
+      <label class="field full"><span>補足</span><textarea name="memo" rows="2">${h(v.memo || "")}</textarea></label>
+      <label class="field"><span>紐づける設備</span><select name="equipment_id"><option value="">なし</option>${equipmentOptions(e => e.status !== "廃止" || e.id == v.equipment_id, v.equipment_id)}</select><span class="hint">設備台帳の詳しい画面にも表示されます</span></label>
+      <label class="field"><span>エリア</span><select name="area">${state.meta.areas.map(a => `<option ${a === v.area ? "selected" : ""}>${h(a)}</option>`).join("")}</select></label>
+    </div><p class="err" id="form-err" hidden></p>`, `
+    ${c ? `<button type="button" class="btn danger left" id="del">削除</button>` : ""}
+    <button type="button" class="btn" data-close>キャンセル</button><button type="submit" class="btn primary">保存</button>`);
+  const form = $("#modal-form");
+  form.onsubmit = async ev => {
+    ev.preventDefault();
+    const data = Object.fromEntries(new FormData(form));
+    if (!data.name.trim()) { $("#form-err").textContent = "部品名は必須です"; $("#form-err").hidden = false; return; }
+    try {
+      if (c) await api(`/catalog/${c.id}`, { method: "PUT", body: data });
+      else await api("/catalog", { method: "POST", body: data });
+      state.meta.locations = (await api("/meta")).locations;  // 保管場所の候補を最新にする
+      closeModal(); toast("保存しました"); router();
+    } catch (ex) { $("#form-err").textContent = ex.message; $("#form-err").hidden = false; }
+  };
+  if (c) $("#del").addEventListener("click", async () => {
+    if (!confirm(`「${c.name}」を部品一覧から削除しますか？`)) return;
+    await api(`/catalog/${c.id}`, { method: "DELETE" });
+    closeModal(); toast("削除しました"); router();
+  });
+}
+
+/* ---------------------------------------------------------------- Excel 取込（確認してから反映） */
+const IMPORT_LABELS = {
+  group_name: "区分", machine: "機械・場所", name: "部品名", unit_price: "単価", qty: "数量", note: "備考", memo: "補足",
+  location: "保管場所", equipment_id: "紐づけ設備", area: "エリア",
+  category: "種類", code: "設備No", nickname: "通称", model: "型式", maker: "メーカー", supplier: "納入業者", vendor_id: "取引業者",
+  asset_no: "資産No", serial_no: "製造番号", manufactured: "製造年", delivered: "納入年月日", part_type: "種別", status: "状態", grind_count: "研磨回数", grind_limit: "研磨上限",
+};
+
+/* Excel 取込の画面（部品・設備台帳で共通）。cfg で送り先と確認内容の出し方を変える */
+async function openXlsxImport(cfg) {
+  await loadEquipment();
+  openModal(cfg.title, `
+    <p style="margin-top:0">「Excel出力」で書き出して直したファイル（.xlsx）を選んでください。<br>取り込む前に、${cfg.what}される内容を表示します。</p>
+    <input type="file" id="imp-file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet">
+    <div id="imp-result" style="margin-top:14px"></div>`, `
+    <button type="button" class="btn" data-close>閉じる</button>
+    <button type="submit" class="btn primary" id="imp-apply" disabled>この内容で取り込む</button>`);
+  let file = null;
+  const send = async apply => {
+    const fd = new FormData();
+    fd.append("file", file);
+    return api(`${cfg.endpoint}${apply ? "?apply=1" : ""}`, { method: "POST", body: fd });
+  };
+  $("#imp-file").addEventListener("change", async e => {
+    file = e.target.files[0];
+    $("#imp-apply").disabled = true;
+    if (!file) return;
+    $("#imp-result").innerHTML = `<p class="muted">読み込み中…</p>`;
+    try {
+      const plan = await send(false);
+      const n = cfg.count(plan);
+      $("#imp-result").innerHTML = `
+        ${plan.errors.length ? `<div class="imp-errors"><strong>直してから取り込んでください（${plan.errors.length}件）</strong><ul>${plan.errors.map(e => `<li>${h(e)}</li>`).join("")}</ul></div>` : ""}
+        ${!plan.errors.length && !n ? `<p class="empty">変更はありません（Excel の内容は今のデータと同じです）</p>` : ""}
+        ${cfg.preview(plan)}`;
+      $("#imp-apply").disabled = !!plan.errors.length || !n;
+    } catch (ex) {
+      $("#imp-result").innerHTML = `<p class="err">${h(ex.message)}</p>`;
+    }
+  });
+  $("#modal-form").onsubmit = async ev => {
+    ev.preventDefault();
+    if (!file) return;
+    try {
+      const r = (await send(true)).applied;
+      closeModal();
+      toast(cfg.done(r), 6000);
+      if (cfg.after) await cfg.after();
+      router();
+    } catch (ex) {
+      $("#imp-result").insertAdjacentHTML("afterbegin", `<p class="err">${h(ex.message)}</p>`);
+    }
+  };
+}
+const impSection = (title, list, fmt) => list.length
+  ? `<details class="imp-sec" ${list.length <= 15 ? "open" : ""}><summary>${title} <b>${list.length}件</b></summary><ul>${list.map(fmt).join("")}</ul></details>` : "";
+const impChanges = (ch, val, labels = IMPORT_LABELS) => Object.entries(ch).map(([k, [a, b]]) =>
+  `<div class="chg"><b>${h(labels[k] || k)}</b> ${h(val(k, a))} → <strong>${h(val(k, b))}</strong></div>`).join("");
+
+const PARTS_IMPORT = {
+  title: "部品の Excel取込", what: "追加・変更・削除", endpoint: "/parts/import",
+  count: p => ["add", "update", "delete"].reduce((s, k) => s + p.catalog[k].length, 0) + p.serial.add.length + p.serial.update.length,
+  preview: p => {
+    const c = p.catalog, s = p.serial;
+    const eqName = id => { const e = state.equipment.find(x => x.id == id); return e ? (e.code ? e.code + " " : "") + eqTitle(e) : "なし"; };
+    const val = (k, v) => (v == null || v === "" ? "（空欄）" : k === "equipment_id" ? eqName(v) : k === "unit_price" ? yen(v) : String(v));
+    return `
+      ${impSection("部品一覧：追加", c.add, a => `<li><span class="muted">${h(a.row)}行目</span> ${h([a.group_name, a.machine].filter(Boolean).join(" / "))} ／ <strong>${h(a.name)}</strong> ${a.unit_price != null ? yen(a.unit_price) : ""}</li>`)}
+      ${impSection("部品一覧：変更", c.update, u => `<li><span class="muted">${h(u.row)}行目</span> <strong>${h(u.name)}</strong>${impChanges(u.changes, val)}</li>`)}
+      ${impSection("部品一覧：削除", c.delete, d => `<li><span class="muted">${h(d.row)}行目</span> <strong>${h(d.name)}</strong></li>`)}
+      ${impSection("研磨管理部品：追加", s.add, a => `<li><span class="muted">${h(a.row)}行目</span> <strong>${h(a.serial)}</strong> ${h(a.part_type || "")} ${h(a.status || "")}</li>`)}
+      ${impSection("研磨管理部品：変更", s.update, u => `<li><span class="muted">${h(u.row)}行目</span> <strong>${h(u.serial)}</strong>${impChanges(u.changes, val)}</li>`)}`;
+  },
+  done: r => `取り込みました（部品一覧 追加${r.catalog.add}・変更${r.catalog.update}・削除${r.catalog.delete}／研磨管理 追加${r.serial.add}・変更${r.serial.update}）`,
+};
+
+const EQUIPMENT_IMPORT = {
+  title: "設備台帳の Excel取込", what: "追加・変更", endpoint: "/equipment/import",
+  count: p => p.add.length + p.update.length,
+  preview: p => {
+    const val = (k, v) => (v == null || v === "" ? "（空欄）" : k === "vendor_id" ? p.vendors[v] || v : String(v));
+    return `
+      ${impSection("設備：追加", p.add, a => `<li><span class="muted">${h(a.row)}行目</span> ${a.code ? `<span class="code">${h(a.code)}</span> ` : ""}<strong>${h(a.label)}</strong> <span class="muted">${h(a.area)} ／ ${h(a.category)}</span></li>`)}
+      ${impSection("設備：変更", p.update, u => `<li><span class="muted">${h(u.row)}行目</span> <strong>${h(u.label)}</strong>${impChanges(u.changes, val, { ...IMPORT_LABELS, name: "正式名", note: "メモ" })}</li>`)}`;
+  },
+  done: r => `取り込みました（設備 追加${r.add}・変更${r.update}）`,
+  after: async () => { state.equipment = []; state.meta = await api("/meta"); },  // 設備・エリアの一覧を読み直す
+};
 
 async function openPartDetail(id) {
   const p = await api(`/parts/${id}`);
@@ -1060,6 +1269,7 @@ async function openPartDetail(id) {
       <dt>専用機</dt><dd>${eq ? h(eq.name) : "共通/不明"}</dd>
       <dt>状態</dt><dd>${h(p.status)}</dd>
       <dt>研磨回数</dt><dd>${grindMeter(p)}</dd>
+      <dt>保管場所</dt><dd>${h(p.location || "")}</dd>
       <dt>メモ</dt><dd>${h(p.note)}</dd>
     </dl>
     <h3 style="margin:18px 0 8px;font-size:15px">記録を追加</h3>
@@ -1098,6 +1308,7 @@ async function openPartForm(p) {
       <label class="field"><span>状態</span><select name="status">${state.meta.part_statuses.map(s => `<option ${v.status === s ? "selected" : ""}>${s}</option>`).join("")}</select></label>
       <label class="field"><span>研磨回数</span><input type="number" min="0" name="grind_count" value="${h(v.grind_count ?? "")}"></label>
       <label class="field"><span>研磨上限</span><input type="number" min="1" name="grind_limit" value="${h(v.grind_limit ?? 10)}"></label>
+      <label class="field full"><span>保管場所</span><input name="location" list="loc-list" value="${h(v.location || "")}" placeholder="例: 部品庫 棚A-2">${locList()}</label>
       <label class="field full"><span>メモ</span><textarea name="note">${h(v.note || "")}</textarea></label>
     </div><p class="err" id="form-err" hidden></p>`, `
     <button type="button" class="btn" data-close>キャンセル</button><button type="submit" class="btn primary">保存</button>`);
@@ -1108,9 +1319,378 @@ async function openPartForm(p) {
     try {
       if (p) await api(`/parts/${p.id}`, { method: "PUT", body: data });
       else await api("/parts", { method: "POST", body: data });
+      state.meta.locations = (await api("/meta")).locations;  // 保管場所の候補を最新にする
       closeModal(); toast("保存しました"); router();
     } catch (ex) { $("#form-err").textContent = ex.message; $("#form-err").hidden = false; }
   };
+}
+
+/* ================================================================ プラ点検 */
+const PLA_DEFECTS = ["破損", "欠け", "割れ", "変形", "紛失", "ゆるみ", "摩耗"];
+const plaState = {
+  meta: null, process: null, date: null, timing: null, eq: null, onlyTodo: false,
+  month: null, q: "", showInactive: false,
+};
+
+async function plaInit() {
+  plaState.meta ||= await api("/pla/meta");
+  if (!plaState.process) {
+    // 右上のエリア（前処理・後処理・タレ工程）に合わせて工程を選んでおく
+    const byArea = Object.entries(plaState.meta.process_area).find(([, a]) => a === state.area);
+    plaState.process = byArea ? byArea[0] : plaState.meta.processes[0];
+  }
+  plaState.date ||= state.meta.today;
+  plaState.timing ||= new Date().getHours() < 12 ? "始業時" : "終業時";
+  plaState.month ||= state.meta.today.slice(0, 7);
+}
+
+function plaHeader(tab) {
+  const p = plaState.meta.processes;
+  return `<div class="tabs-row">
+    <nav class="tabs">
+      <a href="#/pla" class="${tab === "check" ? "on" : ""}">点検する</a>
+      <a href="#/pla/review" class="${tab === "review" ? "on" : ""}">確認・記録</a>
+      <a href="#/pla/items" class="${tab === "items" ? "on" : ""}">点検箇所</a>
+    </nav>
+    <div class="seg small" id="pla-proc">${p.map(x => `<label><input type="radio" name="pla-proc" value="${h(x)}" ${x === plaState.process ? "checked" : ""}>${h(x)}</label>`).join("")}</div>
+  </div>`;
+}
+function bindPlaHeader() {
+  $$("#pla-proc input").forEach(r => r.addEventListener("change", () => { plaState.process = r.value; plaState.eq = null; router(); }));
+}
+const plaStamp = () => `${state.meta.today}T${new Date().toTimeString().slice(0, 5)}`;  // 画面に出す記入時刻
+const hazardBadge = hz => (hz ? `<span class="hz hz-${h(hz)}" title="危害度 ${h(hz)}">${h(hz)}</span>` : "");
+
+async function renderPla(tab) {
+  await plaInit();
+  if (tab === "review") return renderPlaReview();
+  if (tab === "items") return renderPlaItems();
+  return renderPlaCheck();
+}
+
+/* ---------------------------------------------------------------- 点検する */
+async function renderPlaCheck() {
+  const qs = `process=${encodeURIComponent(plaState.process)}&date=${plaState.date}&timing=${encodeURIComponent(plaState.timing)}`;
+  const d = await api(`/pla/sheet?${qs}`);
+  const res = d.results;  // item_id → 結果
+  const groups = groupBy(d.items, i => i.equipment);
+  if (!plaState.eq || !groups.some(([g]) => g === plaState.eq)) {
+    plaState.eq = (groups.find(([, l]) => l.some(i => !res[i.id])) || groups[0] || [null])[0];
+  }
+  view.innerHTML = `
+    ${plaHeader("check")}
+    <div class="pla-bar">
+      <label class="pla-date">日付 <input type="date" id="pla-date" value="${h(plaState.date)}"></label>
+      <div class="seg" id="pla-timing">${plaState.meta.timings.map(t => `<label><input type="radio" name="pla-timing" value="${t}" ${t === plaState.timing ? "checked" : ""}>${t}</label>`).join("")}</div>
+      <div class="pla-progress" id="pla-progress"></div>
+    </div>
+    ${d.review ? `<p class="pla-reviewed">✓ ${h(d.review.reviewer)} さんが確認済みです（${h(fmtDate(d.review.reviewed_at.slice(0, 10)))}）。直すと確認をやり直してもらう必要があります。</p>` : ""}
+    ${!currentUser() ? `<p class="err" style="font-size:15px">右上の「記入者」に名前を入れてから点検してください。</p>` : ""}
+    <div class="pla-layout">
+      <aside class="pla-eqs card">
+        <select id="pla-eq-select" class="pla-eq-select">${groups.map(([g]) => `<option ${g === plaState.eq ? "selected" : ""}>${h(g)}</option>`).join("")}</select>
+        <ul id="pla-eq-list"></ul>
+      </aside>
+      <section class="pla-main" id="pla-main"></section>
+    </div>`;
+  if (!d.items.length) { $("#pla-main").innerHTML = `<p class="empty">日々の点検箇所がありません。「点検箇所」タブで登録してください。</p>`; return; }
+
+  const stat = list => {
+    const done = list.filter(i => res[i.id]).length, ng = list.filter(i => res[i.id]?.result === "ng").length;
+    return { done, ng, total: list.length };
+  };
+  const drawProgress = () => {
+    const s = stat(d.items);
+    const pct = Math.round((s.done / s.total) * 100);
+    $("#pla-progress").innerHTML = `
+      <div class="meter-bar"><div class="meter-fill ${s.done === s.total ? "ok" : ""}" style="width:${pct}%"></div></div>
+      <span><b>${s.done}</b> / ${s.total} 箇所</span>${s.ng ? `<span class="lv over">× 異常 ${s.ng}</span>` : ""}`;
+  };
+  const drawList = () => {
+    $("#pla-eq-list").innerHTML = groups.map(([g, l]) => {
+      const s = stat(l);
+      const cls = s.ng ? "ng" : s.done === s.total ? "done" : s.done ? "part" : "";
+      return `<li class="${cls} ${g === plaState.eq ? "on" : ""}" data-g="${h(g)}"><span class="pla-eq-name">${h(g)}</span><span class="pla-eq-count">${s.ng ? "× " : s.done === s.total ? "✓ " : ""}${s.done}/${s.total}</span></li>`;
+    }).join("");
+    $$("#pla-eq-list li").forEach(li => li.addEventListener("click", () => select(li.dataset.g)));
+  };
+  const save = async list => {
+    try {
+      await api("/pla/results", { method: "PUT", body: { date: plaState.date, timing: plaState.timing, checked_by: currentUser(), results: list } });
+      return true;
+    } catch (ex) { toast(ex.message, 4000); return false; }
+  };
+  const drawMain = () => {
+    const entry = groups.find(([g]) => g === plaState.eq);
+    if (!entry) return;
+    const [g, list] = entry;
+    const shown = plaState.onlyTodo ? list.filter(i => !res[i.id]) : list;
+    const idx = groups.findIndex(([x]) => x === g);
+    const next = groups.slice(idx + 1).find(([, l]) => l.some(i => !res[i.id])) || groups[idx + 1];
+    $("#pla-main").innerHTML = `
+      <div class="pla-eq-head">
+        <h2>${h(g)}</h2>
+        <div class="pla-eq-actions">
+          <label class="muted" style="font-size:13px"><input type="checkbox" id="pla-todo" ${plaState.onlyTodo ? "checked" : ""}> 未点検だけ表示</label>
+          <button class="btn" id="pla-all-ok">残りをすべて ○</button>
+        </div>
+      </div>
+      <ul class="pla-items">${shown.map(i => {
+        const r = res[i.id];
+        return `<li class="pla-item ${r ? "r-" + r.result : ""}" data-id="${i.id}">
+          <div class="pla-item-info">
+            <div class="pla-item-name">${hazardBadge(i.hazard)}${h(i.item)}</div>
+            <div class="pla-item-sub">${h([i.color, i.material_maker || i.material, i.frequency].filter(Boolean).join(" ・ "))}</div>
+            ${r?.result === "ng" ? `<div class="pla-ng-note">× ${h(r.note || "")}</div>` : ""}
+            ${r ? `<div class="pla-who">${h(r.checked_by || "")} ${h((r.checked_at || "").slice(11, 16))}</div>` : ""}
+          </div>
+          <div class="pla-btns">
+            <button class="pla-btn ok ${r?.result === "ok" ? "on" : ""}" data-r="ok" title="異常なし">○</button>
+            <button class="pla-btn ng ${r?.result === "ng" ? "on" : ""}" data-r="ng" title="異常あり">×</button>
+            <button class="pla-btn na ${r?.result === "na" ? "on" : ""}" data-r="na" title="稼働なし・使っていない">－</button>
+          </div>
+        </li>`;
+      }).join("") || `<li class="empty">この設備はすべて点検済みです</li>`}</ul>
+      ${next && next[0] !== g ? `<div class="pla-next"><button class="btn primary lg" id="pla-next">次の設備へ：${h(next[0])} →</button></div>` : ""}`;
+
+    $("#pla-todo").addEventListener("change", e => { plaState.onlyTodo = e.target.checked; drawMain(); });
+    $("#pla-all-ok").addEventListener("click", async () => {
+      const todo = list.filter(i => !res[i.id]);
+      if (!todo.length) return toast("この設備はすべて点検済みです");
+      if (!(await save(todo.map(i => ({ item_id: i.id, result: "ok" }))))) return;
+      todo.forEach(i => (res[i.id] = { result: "ok", checked_by: currentUser(), checked_at: plaStamp() }));
+      toast(`${todo.length} 箇所を ○ にしました`);
+      redraw();
+    });
+    $("#pla-next")?.addEventListener("click", () => { select(next[0]); window.scrollTo({ top: 0, behavior: "smooth" }); });
+    $$("#pla-main .pla-item").forEach(li => {
+      const id = +li.dataset.id;
+      li.querySelectorAll(".pla-btn").forEach(b => b.addEventListener("click", async () => {
+        const cur = res[id];
+        const r = b.dataset.r;
+        if (r === "ng") return openPlaNg(d.items.find(i => i.id === id), cur, async note => {
+          if (!(await save([{ item_id: id, result: "ng", note }]))) return false;
+          res[id] = { result: "ng", note, checked_by: currentUser(), checked_at: plaStamp() };
+          redraw();
+          return true;
+        });
+        const clear = cur?.result === r;  // 同じボタンをもう一度押したら取り消し
+        if (!(await save([{ item_id: id, result: clear ? "" : r }]))) return;
+        if (clear) delete res[id];
+        else res[id] = { result: r, checked_by: currentUser(), checked_at: plaStamp() };
+        redraw();
+      }));
+    });
+  };
+  const redraw = () => { drawProgress(); drawList(); drawMain(); };
+  const select = g => { plaState.eq = g; $("#pla-eq-select").value = g; drawList(); drawMain(); };
+
+  $("#pla-eq-select").addEventListener("change", e => select(e.target.value));
+  $("#pla-date").addEventListener("change", e => { if (e.target.value) { plaState.date = e.target.value; router(); } });
+  $$("#pla-timing input").forEach(r => r.addEventListener("change", () => { plaState.timing = r.value; router(); }));
+  bindPlaHeader();
+  redraw();
+}
+
+function openPlaNg(item, cur, onSave) {
+  openModal("異常あり", `
+    <p style="margin-top:0"><b>${h(item.equipment)}</b><br>${hazardBadge(item.hazard)}${h(item.item)}</p>
+    <div class="pla-defects">${PLA_DEFECTS.map(x => `<button type="button" class="chip" data-x="${x}">${x}</button>`).join("")}</div>
+    <label class="field full" style="margin-top:12px"><span>異常の内容<em class="req">*</em></span>
+      <textarea name="ng_note" rows="3" placeholder="例: 角が欠けている。欠片は見つからず">${h(cur?.result === "ng" ? cur.note || "" : "")}</textarea></label>
+    <p class="muted" style="font-size:13px">欠片が見つからないときは、製品への混入がないか責任者にすぐ報告してください。</p>
+    <p class="err" id="form-err" hidden></p>`, `
+    <button type="button" class="btn" data-close>キャンセル</button>
+    <button type="submit" class="btn danger-fill">× 異常ありで記録</button>`);
+  const ta = $("#modal-form [name=ng_note]");
+  $$(".pla-defects .chip").forEach(c => c.addEventListener("click", () => {
+    ta.value = ta.value.includes(c.dataset.x) ? ta.value : (ta.value ? ta.value + "、" : "") + c.dataset.x;
+    ta.focus();
+  }));
+  $("#modal-form").onsubmit = async e => {
+    e.preventDefault();
+    if (!ta.value.trim()) { $("#form-err").textContent = "異常の内容を書いてください"; $("#form-err").hidden = false; return; }
+    if (await onSave(ta.value.trim())) { closeModal(); toast("異常ありで記録しました"); }
+  };
+  setTimeout(() => ta.focus(), 50);
+}
+
+/* ---------------------------------------------------------------- 確認・記録 */
+async function renderPlaReview() {
+  const d = await api(`/pla/summary?process=${encodeURIComponent(plaState.process)}&month=${plaState.month}`);
+  const [y, m] = plaState.month.split("-").map(Number);
+  const last = new Date(y, m, 0).getDate();
+  const today = state.meta.today;
+  const dates = [];
+  for (let i = last; i >= 1; i--) {
+    const iso = `${plaState.month}-${String(i).padStart(2, "0")}`;
+    if (iso <= today) dates.push(iso);
+  }
+  const cell = (iso, t) => {
+    const c = d.days[iso]?.[t];
+    if (!c || (!c.done && !c.review)) return `<td class="pla-cell empty-cell" data-d="${iso}" data-t="${t}"><span class="muted">未実施</span></td>`;
+    const full = c.done >= d.total;
+    return `<td class="pla-cell ${c.ng ? "has-ng" : ""}" data-d="${iso}" data-t="${t}">
+      <div class="pla-cell-top"><b>${c.done}</b>/${d.total}${full ? ' <span class="lv ok">完了</span>' : ' <span class="lv soon">途中</span>'}${c.ng ? ` <span class="lv over">× ${c.ng}</span>` : ""}</div>
+      <div class="pla-cell-sub">${c.checkers ? "点検 " + h(c.checkers.replaceAll(",", "、")) : ""}</div>
+      <div class="pla-cell-sub">${c.review ? `<span class="pla-ok">✓ 確認 ${h(c.review.reviewer)}</span>` : '<span class="muted">未確認</span>'}</div>
+    </td>`;
+  };
+  const wd = iso => "日月火水木金土"[new Date(iso + "T00:00").getDay()];
+  view.innerHTML = `
+    ${plaHeader("review")}
+    <div class="toolbar">
+      <div class="cal-nav">
+        <button class="btn small" id="pm-prev" aria-label="前の月">‹</button>
+        <strong>${y}年${m}月</strong>
+        <button class="btn small" id="pm-next" aria-label="次の月">›</button>
+      </div>
+      <span class="spacer" style="flex:1"></span>
+      <a class="btn" href="/api/pla/export.xlsx?process=${encodeURIComponent(plaState.process)}&month=${plaState.month}" download>この月の点検記録をExcel出力</a>
+    </div>
+    ${d.ng.length ? `<div class="card pla-ng-card"><h3>この月の異常 <span class="sub">${d.ng.length}件</span></h3>
+      <div class="table-wrap"><table class="list responsive"><thead><tr><th>日付</th><th>設備・箇所</th><th>内容</th><th>点検者</th><th></th></tr></thead><tbody>
+      ${d.ng.map(r => `<tr><td class="nowrap" data-label="日付">${fmtDate(r.check_date)} ${h(r.timing)}</td>
+        <td data-label="設備・箇所"><b>${h(r.equipment)}</b><br>${hazardBadge(r.hazard)}${h(r.item)}</td>
+        <td data-label="内容">${h(r.note || "")}</td><td class="nowrap" data-label="点検者">${h(r.checked_by || "")}</td>
+        <td class="nowrap"><button class="btn small pla-fix" data-i="${r.id}">修理を記録</button></td></tr>`).join("")}
+      </tbody></table></div></div>` : ""}
+    <p class="muted" style="font-size:13px;margin:8px 0">日々の点検箇所は ${d.total} 箇所です。マスを押すと中身を見て「確認」できます。</p>
+    <div class="table-wrap"><table class="list pla-month"><thead><tr><th>日付</th>${plaState.meta.timings.map(t => `<th>${t}</th>`).join("")}</tr></thead><tbody>
+      ${dates.map(iso => `<tr class="${wd(iso) === "日" ? "sun" : wd(iso) === "土" ? "sat" : ""}"><td class="nowrap"><b>${Number(iso.slice(8))}日</b>（${wd(iso)}）</td>${plaState.meta.timings.map(t => cell(iso, t)).join("")}</tr>`).join("") || `<tr><td colspan="3" class="empty">まだ日付がありません</td></tr>`}
+    </tbody></table></div>`;
+
+  const move = step => { const dd = new Date(y, m - 1 + step, 1); plaState.month = `${dd.getFullYear()}-${String(dd.getMonth() + 1).padStart(2, "0")}`; router(); };
+  $("#pm-prev").addEventListener("click", () => move(-1));
+  $("#pm-next").addEventListener("click", () => move(1));
+  $$(".pla-cell").forEach(td => td.addEventListener("click", () => openPlaDay(td.dataset.d, td.dataset.t)));
+  $$(".pla-fix").forEach(b => b.addEventListener("click", () => {
+    const r = d.ng.find(x => x.id == b.dataset.i);
+    openRecordForm(null, { kind: "不定期", status: "未着手", content: `プラ点検で異常：${r.item}`, reason: `${fmtDate(r.check_date)} ${r.timing}　${r.equipment}／${r.item}：${r.note || ""}（点検者 ${r.checked_by || ""}）` });
+  }));
+  bindPlaHeader();
+}
+
+async function openPlaDay(date, timing) {
+  const d = await api(`/pla/sheet?process=${encodeURIComponent(plaState.process)}&date=${date}&timing=${encodeURIComponent(timing)}`);
+  const res = d.results;
+  const ng = d.items.filter(i => res[i.id]?.result === "ng");
+  const todo = groupBy(d.items.filter(i => !res[i.id]), i => i.equipment);
+  const done = d.items.filter(i => res[i.id]).length;
+  const rv = d.review;
+  openModal(`${fmtDate(date)} ${timing}　${plaState.process}`, `
+    <p style="margin-top:0">点検 <b>${done}</b> / ${d.items.length} 箇所${ng.length ? `　<span class="lv over">× 異常 ${ng.length}</span>` : ""}</p>
+    ${ng.length ? `<h3 class="pla-h">異常</h3><ul class="pla-ng-list">${ng.map(i => `<li><b>${h(i.equipment)}</b> ／ ${hazardBadge(i.hazard)}${h(i.item)}<div class="pla-ng-note">× ${h(res[i.id].note || "")}（${h(res[i.id].checked_by || "")}）</div></li>`).join("")}</ul>` : ""}
+    ${todo.length ? `<h3 class="pla-h">未点検の設備（${todo.length}）</h3><p class="pla-todo-list">${todo.map(([g, l]) => `${h(g)} <span class="muted">${l.length}</span>`).join("　/　")}</p>` : ""}
+    ${!done ? `<p class="empty">まだ点検されていません</p>` : ""}
+    <h3 class="pla-h">確認</h3>
+    ${rv ? `<p class="pla-ok">✓ ${h(rv.reviewer)} さんが確認しました（${h(rv.reviewed_at.replace("T", " ").slice(0, 16))}）${rv.comment ? `<br>コメント: ${h(rv.comment)}` : ""}</p>` : ""}
+    <label class="field full"><span>コメント（任意）</span><input name="comment" value="${h(rv?.comment || "")}" placeholder="例: 異常箇所は交換済みを確認"></label>
+    <p class="muted" style="font-size:13px">確認者は右上の「記入者」（${h(currentUser() || "未入力")}）で記録されます。</p>
+    <p class="err" id="form-err" hidden></p>`, `
+    ${rv ? `<button type="button" class="btn left" id="rv-cancel">確認を取り消す</button>` : ""}
+    <a class="btn" href="#/pla" id="rv-open">点検画面を開く</a>
+    ${done ? `<button type="submit" class="btn primary">${rv ? "確認し直す" : "確認しました"}</button>` : ""}`);
+  $("#rv-open").addEventListener("click", () => { plaState.date = date; plaState.timing = timing; closeModal(); });
+  const send = async cancel => {
+    try {
+      await api("/pla/reviews", { method: "PUT", body: { process: plaState.process, date, timing, reviewer: currentUser(), comment: $("#modal-form [name=comment]").value, cancel } });
+      closeModal(); toast(cancel ? "確認を取り消しました" : "確認しました"); router();
+    } catch (ex) { $("#form-err").textContent = ex.message; $("#form-err").hidden = false; }
+  };
+  $("#modal-form").onsubmit = e => { e.preventDefault(); send(false); };
+  $("#rv-cancel")?.addEventListener("click", () => send(true));
+}
+
+/* ---------------------------------------------------------------- 点検箇所（マスタ） */
+async function renderPlaItems() {
+  const items = await api(`/pla/items?process=${encodeURIComponent(plaState.process)}`);
+  view.innerHTML = `
+    ${plaHeader("items")}
+    <div class="toolbar">
+      <div class="search"><span>🔍</span><input id="pi-q" type="search" placeholder="設備名・箇所・色・材質・備考で絞り込み" value="${h(plaState.q)}"></div>
+      <button class="btn primary lg" id="pi-new">箇所を追加</button>
+    </div>
+    <div class="filters">
+      <label><input type="checkbox" id="pi-inactive" ${plaState.showInactive ? "checked" : ""}> 点検しない箇所（撤去・項目から外した）も表示</label>
+      <span class="muted" id="pi-count"></span>
+    </div>
+    <div id="pi-body"></div>`;
+  const draw = () => {
+    const q = norm(plaState.q).toLowerCase();
+    const list = items.filter(i => (plaState.showInactive || i.active) &&
+      (!q || norm([i.equipment, i.item, i.color, i.material, i.material_maker, i.note].join(" ")).toLowerCase().includes(q)));
+    const daily = items.filter(i => i.daily).length;
+    $("#pi-count").textContent = `全 ${items.length} 箇所（日々の点検 ${daily}・点検しない ${items.filter(i => !i.active).length}）／ 表示 ${list.length}`;
+    const groups = groupBy(list, i => i.equipment);
+    $("#pi-body").innerHTML = groups.length ? groups.map(([g, l]) => `
+      <section class="cat-group">
+        <h2 class="area-title">${h(g)} <span class="g-count">${l.length}箇所</span><button class="btn small pi-add" data-g="${h(g)}" style="margin-left:auto">＋ 箇所</button></h2>
+        <div class="table-wrap"><table class="list responsive"><thead><tr>
+          <th>危害度</th><th>機械・器具</th><th>色</th><th>材質</th><th>点検方法</th><th>頻度</th><th>備考</th>
+        </tr></thead><tbody>${l.map(i => `
+          <tr data-pi="${i.id}" class="${i.active ? "" : "retired"}">
+            <td data-label="危害度">${hazardBadge(i.hazard) || '<span class="muted">—</span>'}</td>
+            <td data-label="機械・器具"><strong>${h(i.item)}</strong>${i.active ? "" : ' <span class="lv unknown">点検しない</span>'}${i.is_new ? ' <span class="lv soon">新規</span>' : ""}</td>
+            <td data-label="色">${h(i.color || "")}</td>
+            <td data-label="材質">${h([i.material, i.material_pct, i.material_maker].filter(Boolean).join(" ／ "))}</td>
+            <td data-label="点検方法" style="font-size:13px">${h((i.methods || "").replaceAll(",", "、"))}</td>
+            <td class="nowrap" data-label="頻度">${h(i.frequency || "")}</td>
+            <td class="clip" data-label="備考">${h(i.note || "")}</td>
+          </tr>`).join("")}</tbody></table></div>
+      </section>`).join("") : `<p class="empty">該当する箇所はありません</p>`;
+    $$("#pi-body [data-pi]").forEach(tr => tr.addEventListener("click", () => openPlaItemForm(items.find(i => i.id == tr.dataset.pi), items)));
+    $$("#pi-body .pi-add").forEach(b => b.addEventListener("click", e => { e.stopPropagation(); openPlaItemForm(null, items, { equipment: b.dataset.g }); }));
+  };
+  let timer;
+  $("#pi-q").addEventListener("input", e => { clearTimeout(timer); timer = setTimeout(() => { plaState.q = e.target.value; draw(); }, 200); });
+  $("#pi-inactive").addEventListener("change", e => { plaState.showInactive = e.target.checked; draw(); });
+  $("#pi-new").addEventListener("click", () => openPlaItemForm(null, items));
+  bindPlaHeader();
+  draw();
+}
+
+function openPlaItemForm(it, items, preset = {}) {
+  const v = it || { process: plaState.process, active: 1, frequency: "2回/日", methods: "プラリスク点検表", hazard: "C", ...preset };
+  const methods = (v.methods || "").split(",").filter(Boolean);
+  const eqs = [...new Set(items.map(i => i.equipment))];
+  openModal(it ? "点検箇所の編集" : "点検箇所を追加", `
+    <div class="form-grid">
+      <label class="field full"><span>設備名<em class="req">*</em></span><input name="equipment" list="pla-eqs" value="${h(v.equipment || "")}"><datalist id="pla-eqs">${eqs.map(e => `<option value="${h(e)}">`).join("")}</datalist></label>
+      <label class="field full"><span>機械・器具（点検箇所）<em class="req">*</em></span><input name="item" value="${h(v.item || "")}" placeholder="例: 非常停止ボタン(赤)×1"></label>
+      <label class="field"><span>色</span><input name="color" value="${h(v.color || "")}"></label>
+      <div class="field"><span>危害度</span><div class="seg">${["", ...plaState.meta.hazards].map(x => `<label><input type="radio" name="hazard" value="${x}" ${(v.hazard || "") === x ? "checked" : ""}>${x || "なし"}</label>`).join("")}</div></div>
+      <label class="field"><span>材質（ぷらしる）</span><input name="material" value="${h(v.material || "")}" placeholder="例: PA"></label>
+      <label class="field"><span>％（ぷらしる）</span><input name="material_pct" value="${h(v.material_pct || "")}"></label>
+      <label class="field full"><span>材質（メーカー提示）</span><input name="material_maker" value="${h(v.material_maker || "")}"></label>
+      <div class="field full"><span>点検方法</span><div class="pla-methods">${plaState.meta.methods.map(mt => `<label><input type="checkbox" name="m" value="${h(mt)}" ${methods.includes(mt) ? "checked" : ""}> ${h(mt)}</label>`).join("")}</div></div>
+      <label class="field"><span>頻度</span><input name="frequency" list="pla-freq" value="${h(v.frequency || "")}"><datalist id="pla-freq"><option value="2回/日"><option value="配合毎"><option value="1時間毎"></datalist><span class="hint">空欄で自主保全基準書だけなら日々の点検には出ません</span></label>
+      <label class="field"><span>状態</span><select name="active"><option value="1" ${v.active ? "selected" : ""}>点検する</option><option value="0" ${v.active ? "" : "selected"}>点検しない（撤去・項目から外した）</option></select></label>
+      <label class="field full"><span>備考（更新記録など）</span><textarea name="note" rows="2">${h(v.note || "")}</textarea></label>
+      <label class="field full"><input type="checkbox" name="is_new" ${v.is_new ? "checked" : ""}> 新規</label>
+    </div><p class="err" id="form-err" hidden></p>`, `
+    ${it ? `<button type="button" class="btn danger left" id="pi-del">削除</button>` : ""}
+    <button type="button" class="btn" data-close>キャンセル</button><button type="submit" class="btn primary">保存</button>`);
+  const form = $("#modal-form");
+  form.onsubmit = async e => {
+    e.preventDefault();
+    const fd = new FormData(form);
+    const data = Object.fromEntries([...fd].filter(([k]) => k !== "m"));
+    data.methods = fd.getAll("m").join(",");
+    data.is_new = fd.get("is_new") ? 1 : 0;
+    data.process = v.process;
+    if (!data.equipment.trim() || !data.item.trim()) { $("#form-err").textContent = "設備名と機械・器具は必須です"; $("#form-err").hidden = false; return; }
+    try {
+      if (it) await api(`/pla/items/${it.id}`, { method: "PUT", body: data });
+      else await api("/pla/items", { method: "POST", body: data });
+      closeModal(); toast("保存しました"); router();
+    } catch (ex) { $("#form-err").textContent = ex.message; $("#form-err").hidden = false; }
+  };
+  $("#pi-del")?.addEventListener("click", async () => {
+    if (!confirm(`「${it.item}」を削除しますか？`)) return;
+    try { await api(`/pla/items/${it.id}`, { method: "DELETE" }); closeModal(); toast("削除しました"); router(); }
+    catch (ex) { $("#form-err").textContent = ex.message; $("#form-err").hidden = false; }
+  });
 }
 
 /* ================================================================ 分析 */

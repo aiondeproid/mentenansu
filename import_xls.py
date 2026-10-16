@@ -400,6 +400,10 @@ def run(paths, reset):
     if conn.execute("SELECT COUNT(*) FROM equipment").fetchone()[0]:
         print("既にデータがあります。作り直す場合は --reset を付けてください。")
         return
+    # 部品の価格表（〇〇部品一覧.xls）は履歴ではないので別に取り込む
+    price_lists = [p for p in paths if "部品一覧" in os.path.basename(p)]
+    pla_lists = [p for p in paths if "プラ樹脂点検リスト" in os.path.basename(p)]  # プラ点検の点検箇所
+    paths = [p for p in paths if p not in price_lists and p not in pla_lists]
     vendor_cache, seed_eq = {}, {}
     total_eq = total_rec = 0
     for path in paths:
@@ -425,6 +429,14 @@ def run(paths, reset):
     conn.commit()
     uncertain = conn.execute("SELECT COUNT(*) FROM records WHERE date_uncertain=1").fetchone()[0]
     print(f"設備 {total_eq} 台 / 履歴 {total_rec} 件（日付要確認 {uncertain} 件）を {DB_PATH} に取り込みました")
+    from parts_catalog import import_price_list  # 設備を入れたあとでないと紐づけられない
+    for path in price_lists:
+        items, _ = import_price_list(conn, path)
+        print(f"■ {os.path.basename(path)}: 部品一覧に {len(items)} 件")
+    from pla import import_list
+    for path in pla_lists:
+        items, _ = import_list(conn, path)
+        print(f"■ {os.path.basename(path)}: プラ点検の点検箇所に {len(items)} 件")
 
 
 if __name__ == "__main__":
