@@ -29,7 +29,7 @@
   - **プラリスト**: 「プラ樹脂点検リスト 前工程／後工程／タレ工程.xls」（危害度分析の一覧）。チェック表の各行と紐づき、「チェック表にない行だけ」で点検漏れを探せる（`pla.py`）
   - **チェック表**タブ: 行・場所・写真（スマホで撮って追加できる。長い辺 1600px に縮めて保存）・プラリストとの紐づけを直す（`pla_sheets.py`）
   - 取り込み: `python pla.py`（プラリスト）→ `python pla_sheets.py`（チェック表。.xls の写真を読むため Excel で .xlsx に変換してから読む。Excel が入っている PC で実行）。どちらも `--replace` で入れ直し（点検記録のある分は残す）
-  - 写真は `data/pla_photos/` に保存（バックアップのときは `data` フォルダごとコピーする）
+  - 写真は `data/pla_photos/` に保存（バックアップは下の「バックアップ」を参照）
 - **分析**: 年別の定期・不定期件数、設備別の停止・修理時間、故障内容のキーワード、設備別の故障件数
 
 ## 起動方法
@@ -92,6 +92,24 @@ python app.py                   # http://<サーバーのIP>:5000/ で公開
 | `python notify.py --dry-run` | 送らずに内容を表示 |
 | `python notify.py --init` | 今あるアラートを通知済みにする |
 | `python notify.py --test 宛先` | テストメールを 1 通送る |
+
+## バックアップ
+
+`backup.py` で `data` フォルダ（DB と点検写真）をサーバーの共有フォルダへコピーする。アプリを動かしたままでも実行できる（DB は SQLite のバックアップ機能で写すので、書き込み中でも壊れない）。
+
+```bash
+python backup.py \\fileserver\share\setsubi_backup            # 保存先を指定
+python backup.py \\fileserver\share\setsubi_backup --keep 60  # DB を 60 世代残す（既定 30、0 で全部）
+```
+
+- 保存先に `db/maintenance_日時.db`（世代バックアップ。古いものから消す）と `pla_photos/`（追加・変更された写真だけコピー。アプリで消した写真も残す）ができる
+- 環境変数 `MAINT_BACKUP_DIR` を設定すれば保存先を省略できる
+- タスクスケジューラに登録する（例: 毎日 18:00）。共有フォルダに書き込める **ドメインユーザー** で「ログオンしているかどうかにかかわらず実行」にする（SYSTEM アカウントではネットワークの共有フォルダに書けない）
+  ```bat
+  schtasks /Create /TN "設備保全_バックアップ" /SC DAILY /ST 18:00 ^
+    /TR "\"C:\Python312\python.exe\" \"D:\setsubi\backup.py\" \\fileserver\share\setsubi_backup"
+  ```
+- **戻すとき**: アプリを止め、戻したい世代の `.db` を `data/maintenance.db` に、`pla_photos/` を `data/pla_photos/` にコピーしてから起動する
 
 ## Excel 取り込みのルール
 
