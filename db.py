@@ -208,6 +208,17 @@ CREATE TABLE IF NOT EXISTS pla_reviews (      -- 確認（工程 × 日 × 始�
 CREATE INDEX IF NOT EXISTS idx_pla_checks_date ON pla_checks(check_date);
 CREATE INDEX IF NOT EXISTS idx_pla_points_sheet ON pla_points(sheet_id);
 
+-- 作業記録の添付ファイル（PDF・写真）
+CREATE TABLE IF NOT EXISTS record_files (
+    id INTEGER PRIMARY KEY,
+    record_id INTEGER NOT NULL REFERENCES records(id),
+    file TEXT NOT NULL,        -- data/record_files/ の中のファイル名
+    name TEXT,                 -- 元のファイル名（表示・ダウンロード用）
+    size INTEGER,
+    created_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_record_files_rec ON record_files(record_id);
+
 CREATE INDEX IF NOT EXISTS idx_records_eq ON records(equipment_id);
 CREATE INDEX IF NOT EXISTS idx_records_date ON records(done_date);
 CREATE INDEX IF NOT EXISTS idx_part_events_part ON part_events(part_id);

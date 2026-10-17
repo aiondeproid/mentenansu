@@ -5,6 +5,7 @@
 """
 import csv
 import datetime as dt
+import hashlib
 import io
 import os
 
@@ -13,7 +14,7 @@ from urllib.parse import quote
 
 from flask import Flask, Response, abort, g, has_request_context, jsonify, request, send_from_directory
 
-from db import CATEGORIES, connect, init_db
+from db import CATEGORIES, DB_PATH, connect, init_db
 from import_xls import norm
 import equipment_xlsx
 import pla
@@ -31,6 +32,16 @@ PART_EVENT_STATUS = {
 }
 FAILURE_KEYWORDS = ["ベアリング", "モーター", "オイルシール", "ベルト", "端子台|配線|漏電|ショート",
                     "リミット|センサー|スイッチ", "シャフト|軸", "チェーン|キー", "グリス|オイル漏"]
+# 記入者の選択肢（この順で上に出す。過去の記録にある名前はこの後ろに並ぶ）
+STAFF = [
+    "矢代 顕久", "矢野 新悟", "塚本 雅行", "小森 吉貞", "髙橋 和也", "川東 忠司", "山本 浩善", "西村 憲弘",
+    "筒井 祐司", "米林 威作人", "中村 徳秀", "大家 輝彦", "中野 翔吾", "浅野 冬弥", "杉本 陸", "冨永 悠士",
+    "辻 隼正", "原田 翔太", "碇 大稀", "山嵜 悠", "北林 陸", "林 佑耶", "中野 倖多", "清原 憲",
+    "藤本 昌樹", "大南 正人", "山本 剛",
+    "秋葉 裕樹", "梶田 博幸", "山下 隆雄", "鈴川 剛史", "松本 憲二", "若井 春孝", "橋本 政幸", "中野 健志",
+    "今宿 伸吾", "橋本 慎吾", "木村 真人", "木場田 智武", "西中 寿", "脇坂 翼", "大籠 恭二", "宮川 明",
+    "長田 豊貴",
+]
 SOON_DAYS = 14
 SOON_HOURS_RATIO = 0.2
 
@@ -140,8 +151,11 @@ def index():
 @app.get("/api/meta")
 def meta():
     conn = db()
-    authors = [r[0] for r in conn.execute(
-        "SELECT author FROM records WHERE author IS NOT NULL GROUP BY author ORDER BY COUNT(*) DESC")]
+    # 名簿の人を先に。過去の記録の名前は、名簿と同じ名前・名簿の人の姓だけのもの（例: 中村）を除いて後ろに
+    staff_names = set(STAFF) | {s.split()[0] for s in STAFF}
+    authors = STAFF + [r[0] for r in conn.execute(
+        "SELECT author FROM records WHERE author IS NOT NULL GROUP BY author ORDER BY COUNT(*) DESC")
+        if r[0] not in staff_names]
     return jsonify(
         record_statuses=RECORD_STATUSES,
         part_statuses=PART_STATUSES,
@@ -268,7 +282,9 @@ def equipment_hours(eq_id):
 
 # ---------------------------------------------------------------- 作業履歴
 def query_records(conn, args):
-    sql = """SELECT r.*, e.name AS equipment_name, e.code AS equipment_code, ru.title AS rule_title
+    sql = """SELECT r.*, e.name AS equipment_name, e.code AS equipment_code, ru.title AS rule_title,
+                    (SELECT COUNT(*) FROM record_files f WHERE f.record_id = r.id) AS file_count,
+                    (SELECT GROUP_CONCAT(f.name, ' ') FROM record_files f WHERE f.record_id = r.id) AS file_names
              FROM records r JOIN equipment e ON e.id = r.equipment_id
              LEFT JOIN rules ru ON ru.id = r.rule_id WHERE 1=1"""
     params = []
@@ -329,10 +345,12 @@ def records_csv():
 
 @app.get("/api/records/<int:rec_id>")
 def record_get(rec_id):
-    r = db().execute("SELECT * FROM records WHERE id=?", (rec_id,)).fetchone()
+    conn = db()
+    r = conn.execute("SELECT * FROM records WHERE id=?", (rec_id,)).fetchone()
     if not r:
         abort(404)
-    return jsonify(dict(r))
+    files = rows(conn.execute("SELECT * FROM record_files WHERE record_id=? ORDER BY id", (rec_id,)))
+    return jsonify(dict(r) | {"files": files})
 
 
 REC_FIELDS = ["equipment_id", "kind", "status", "done_date", "downtime_min", "hour_meter", "content",
@@ -416,7 +434,62 @@ def record_update(rec_id):
 def record_delete(rec_id):
     conn = db()
     conn.execute("DELETE FROM part_events WHERE record_id=?", (rec_id,))
+    conn.execute("DELETE FROM record_files WHERE record_id=?", (rec_id,))  # ファイル本体はバックアップから戻せるよう残す
     conn.execute("DELETE FROM records WHERE id=?", (rec_id,))
+    conn.commit()
+    return jsonify(ok=True)
+
+
+# ---- 添付ファイル（PDF・写真）
+RECORD_FILE_DIR = os.path.join(os.path.dirname(DB_PATH), "record_files")
+RECORD_FILE_TYPES = {"application/pdf": "pdf", "image/jpeg": "jpg", "image/png": "png"}
+RECORD_FILE_MAX = 30 * 1024 * 1024
+
+
+@app.get("/record-files/<path:name>")
+def record_file(name):
+    """inline で返す（PDF・写真はブラウザでそのまま開く）。?dl=1 なら元のファイル名でダウンロード。"""
+    if request.args.get("dl"):
+        r = db().execute("SELECT name FROM record_files WHERE file=? LIMIT 1", (name,)).fetchone()
+        return send_from_directory(RECORD_FILE_DIR, name, as_attachment=True,
+                                   download_name=(r and r["name"]) or name)
+    return send_from_directory(RECORD_FILE_DIR, name, max_age=86400 * 30)
+
+
+@app.post("/api/records/<int:rec_id>/files")
+def record_file_upload(rec_id):
+    conn = db()
+    if not conn.execute("SELECT 1 FROM records WHERE id=?", (rec_id,)).fetchone():
+        abort(404)
+    files = request.files.getlist("file")
+    if not files:
+        abort(400, "ファイルを選んでください")
+    saved = []
+    for f in files:
+        ext = RECORD_FILE_TYPES.get(f.mimetype) or {"pdf": "pdf", "jpg": "jpg", "jpeg": "jpg", "png": "png"}.get(
+            os.path.splitext(f.filename or "")[1].lower().lstrip("."))
+        if not ext:
+            abort(400, f"PDF か JPEG・PNG のファイルを選んでください（{f.filename}）")
+        data = f.read()
+        if len(data) > RECORD_FILE_MAX:
+            abort(400, f"ファイルが大きすぎます（30MB まで）: {f.filename}")
+        os.makedirs(RECORD_FILE_DIR, exist_ok=True)
+        name = hashlib.sha1(data).hexdigest()[:20] + "." + ext  # 同じ中身は 1 つのファイルを使い回す
+        path = os.path.join(RECORD_FILE_DIR, name)
+        if not os.path.exists(path):
+            with open(path, "wb") as out:
+                out.write(data)
+        saved.append((rec_id, name, os.path.basename(f.filename or "") or name, len(data),
+                      dt.datetime.now().isoformat(timespec="seconds")))
+    conn.executemany("INSERT INTO record_files(record_id, file, name, size, created_at) VALUES (?,?,?,?,?)", saved)
+    conn.commit()
+    return jsonify(ok=True, count=len(saved)), 201
+
+
+@app.delete("/api/record-files/<int:file_id>")
+def record_file_delete(file_id):
+    conn = db()
+    conn.execute("DELETE FROM record_files WHERE id=?", (file_id,))  # 同じ中身をほかの記録でも使っていることがあるので本体は残す
     conn.commit()
     return jsonify(ok=True)
 

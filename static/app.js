@@ -170,9 +170,18 @@ async function renderDashboard() {
   bindRowClicks();
 }
 
+/* 添付ファイル 1 件の表示（url があればリンク、btnAttr のボタンで外す） */
+function fileChip(name, size, url, btnAttr, isNew = false) {
+  const icon = /\.pdf$/i.test(name) ? "PDF" : "写真";
+  const kb = size ? (size >= 1024 * 1024 ? `${(size / 1024 / 1024).toFixed(1)}MB` : `${Math.ceil(size / 1024)}KB`) : "";
+  const label = `<span class="rf-name"><span class="rf-type">${icon}</span>${h(name)} <span class="hint">${kb}${isNew ? "・未保存" : ""}</span></span>`;
+  return `<span class="rf-item">${url ? `<a href="${h(url)}" target="_blank" rel="noopener">${label}</a>` : label}
+    <button type="button" class="rf-del" ${btnAttr} aria-label="外す">✕</button></span>`;
+}
+
 function timelineItem(r) {
   return `<li class="${r.kind === "定期" ? "teiki" : r.kind === "不定期" ? "futeiki" : ""}" data-record="${r.id}">
-    <div class="tl-date">${dateCell(r)} ${kindBadge(r.kind)} ${r.equipment_name ? eqLabel(r) : ""}</div>
+    <div class="tl-date">${dateCell(r)} ${kindBadge(r.kind)} ${r.equipment_name ? eqLabel(r) : ""}${r.file_count ? ` <span class="rf-count" title="添付ファイル">📎${r.file_count}</span>` : ""}</div>
     <div class="tl-title">${h(r.content)}</div>
     ${r.reason ? `<div class="tl-body">${h(r.reason)}</div>` : ""}
   </li>`;
@@ -284,6 +293,10 @@ async function openRecordForm(id, preset = {}) {
       <label class="field"><span>関連する定期項目</span><select name="rule_id"><option value="">なし</option></select><span class="hint">完了で保存すると前回実施日が更新されます</span></label>
       <label class="field"><span>部品シリアル</span><input name="part_serial" list="serial-list" value="${h(rec.part_serial || "")}" placeholder="例: M1005.1"><datalist id="serial-list"></datalist></label>
       <label class="field"><span>費用（円）</span><input type="number" min="0" name="cost" value="${h(rec.cost ?? "")}" inputmode="numeric"></label>
+      <div class="field full"><span>添付ファイル<em class="hint" style="font-weight:400">（PDF・写真。報告書・見積書・現場写真など）</em></span>
+        <div class="rf-list" id="rf-list"></div>
+        <div><button type="button" class="btn small" id="rf-add">ファイルを追加</button> <span class="hint">1ファイル30MBまで。保存すると添付されます</span></div>
+      </div>
     </div>
     <p class="err" id="form-err" hidden></p>`;
   const foot = `
@@ -306,6 +319,38 @@ async function openRecordForm(id, preset = {}) {
   form.equipment_id.addEventListener("change", fillEqLinked);
   await fillEqLinked();
 
+  /* 添付ファイル: 登録済みはすぐ外せる。新しく選んだものは保存のときに送る */
+  const savedFiles = rec.files || [];
+  let pending = [];
+  const drawFiles = () => {
+    $("#rf-list").innerHTML = [
+      ...savedFiles.map(f => fileChip(f.name, f.size, `/record-files/${f.file}`, `data-rf="${f.id}"`)),
+      ...pending.map((f, i) => fileChip(f.name, f.size, "", `data-pend="${i}"`, true)),
+    ].join("") || `<span class="hint">なし</span>`;
+    $$("#rf-list [data-rf]").forEach(b => b.addEventListener("click", async () => {
+      if (!confirm("この添付ファイルを外しますか？")) return;
+      try {
+        await api(`/record-files/${b.dataset.rf}`, { method: "DELETE" });
+        savedFiles.splice(savedFiles.findIndex(f => f.id == b.dataset.rf), 1);
+        drawFiles();
+      } catch (ex) { toast(ex.message); }
+    }));
+    $$("#rf-list [data-pend]").forEach(b => b.addEventListener("click", () => { pending.splice(+b.dataset.pend, 1); drawFiles(); }));
+  };
+  $("#rf-add").addEventListener("click", () => {
+    const inp = document.createElement("input");
+    inp.type = "file"; inp.multiple = true;
+    inp.accept = "application/pdf,.pdf,image/jpeg,.jpg,.jpeg,image/png,.png";
+    inp.onchange = () => {
+      const big = [...inp.files].filter(f => f.size > 30 * 1024 * 1024);
+      if (big.length) toast(`30MB を超えるファイルは添付できません: ${big.map(f => f.name).join("、")}`, 4000);
+      pending.push(...[...inp.files].filter(f => f.size <= 30 * 1024 * 1024));
+      drawFiles();
+    };
+    inp.click();
+  });
+  drawFiles();
+
   form.onsubmit = async e => {
     e.preventDefault();
     const data = Object.fromEntries(new FormData(form));
@@ -316,12 +361,23 @@ async function openRecordForm(id, preset = {}) {
       err.hidden = false;
       return;
     }
+    let recId = id;
     try {
       if (id) await api(`/records/${id}`, { method: "PUT", body: data });
-      else await api("/records", { method: "POST", body: data });
+      else recId = (await api("/records", { method: "POST", body: data })).id;
       if (data.author) rememberUser(data.author);
+      if (pending.length) {
+        const fd = new FormData();
+        pending.forEach(f => fd.append("file", f));
+        try { await api(`/records/${recId}/files`, { method: "POST", body: fd }); }
+        catch (ex) {  // 記録は保存できているので、開き直してファイルだけ付け直してもらう
+          closeModal(); router();
+          toast(`記録は保存しましたが、ファイルを添付できませんでした: ${ex.message}`, 6000);
+          return;
+        }
+      }
       closeModal();
-      toast("保存しました");
+      toast(pending.length ? `保存しました（ファイル ${pending.length} 件を添付）` : "保存しました");
       router();
     } catch (ex) {
       err.textContent = ex.message;
@@ -966,9 +1022,21 @@ async function renderEquipmentDetail(id) {
       ${eq.catalog.map(c => `<tr style="cursor:default"><td data-label="部品名"><strong>${h(c.name)}</strong></td><td class="num nowrap" data-label="単価">${c.unit_price != null ? yen(c.unit_price) : '<span class="muted">未登録</span>'}</td><td class="num" data-label="数量">${c.qty != null ? fmtNum(c.qty) : ""}</td><td data-label="保管場所">${h(c.location || "")}</td><td class="clip" data-label="備考">${h([c.note, c.memo].filter(Boolean).join(" ／ "))}</td></tr>`).join("")}
     </tbody></table></div>` : ""}
 
-    <div class="section-title"><h2>作業履歴（${recs.length}件）</h2><button class="btn primary" id="add-rec">作業を記録</button></div>
-    <div class="card"><ul class="timeline">${recs.map(r => timelineItem({ ...r, equipment_name: "" })).join("") || '<li class="muted">履歴なし</li>'}</ul></div>`;
+    <div class="section-title"><h2 id="rec-count">作業履歴（${recs.length}件）</h2><button class="btn primary" id="add-rec">作業を記録</button></div>
+    ${recs.length ? `<div class="search" style="margin-bottom:8px"><span>🔍</span><input id="rec-q" type="search" placeholder="作業内容・原因・結果・対策・作業者・日付で絞り込み"></div>` : ""}
+    <div class="card"><ul class="timeline" id="rec-list"></ul></div>`;
 
+  /* 作業履歴の絞り込み（スペース区切りで AND 検索） */
+  const recText = r => norm([r.done_date, r.date_raw, r.kind, r.status, r.content, r.reason, r.result,
+    r.countermeasure, r.author, r.part_serial, r.rule_title, r.file_names].filter(Boolean).join(" ")).toLowerCase();
+  const drawRecs = () => {
+    const words = norm($("#rec-q")?.value).toLowerCase().split(/\s+/).filter(Boolean);
+    const hit = words.length ? recs.filter(r => { const t = recText(r); return words.every(w => t.includes(w)); }) : recs;
+    $("#rec-count").textContent = words.length ? `作業履歴（${hit.length} / ${recs.length}件）` : `作業履歴（${recs.length}件）`;
+    $("#rec-list").innerHTML = hit.map(r => timelineItem({ ...r, equipment_name: "" })).join("")
+      || `<li class="muted">${recs.length ? "該当する履歴なし" : "履歴なし"}</li>`;
+    bindRowClicks($("#rec-list"));
+  };
   $("#edit-eq").addEventListener("click", () => openEquipmentForm(eq));
   $("#add-rule").addEventListener("click", () => openRuleForm(null, { equipment_id: id }));
   $("#add-rec").addEventListener("click", () => openRecordForm(null, { equipment_id: id }));
@@ -981,6 +1049,8 @@ async function renderEquipmentDetail(id) {
     } catch (ex) { toast(ex.message); }
   });
   bindRowClicks();
+  drawRecs();  // 履歴のクリックは drawRecs 側で付ける（上の bindRowClicks と二重にしない）
+  $("#rec-q")?.addEventListener("input", drawRecs);
 }
 
 async function openEquipmentForm(eq) {

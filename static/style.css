@@ -239,6 +239,13 @@ dl.info dd { margin: 0; white-space: pre-wrap; word-break: break-word; }
 .timeline li.teiki::before { border-color: var(--series-1); }
 .timeline .tl-date { font-size: 13px; color: var(--text-2); }
 .timeline .tl-title { font-weight: 700; }
+.timeline .rf-count { font-size: 12px; color: var(--text-2); white-space: nowrap; }
+.rf-list { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
+.rf-item { display: inline-flex; align-items: center; gap: 4px; max-width: 100%; border: 1px solid var(--line); border-radius: 6px; padding: 3px 4px 3px 8px; background: var(--surface); font-size: 13px; }
+.rf-item a, .rf-item > .rf-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: inherit; }
+.rf-type { display: inline-block; font-size: 11px; font-weight: 700; color: #fff; background: var(--brand); border-radius: 3px; padding: 0 4px; margin-right: 4px; }
+.rf-del { border: 0; background: none; color: var(--muted); cursor: pointer; font-size: 12px; padding: 2px 6px; }
+.rf-del:hover { color: var(--text); }
 .timeline .tl-body { font-size: 13px; color: var(--text-2); white-space: pre-wrap; }
 
 .back { display: inline-block; margin-bottom: 10px; }
