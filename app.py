@@ -17,6 +17,7 @@ from db import CATEGORIES, connect, init_db
 from import_xls import norm
 import equipment_xlsx
 import pla
+import pla_sheets
 import parts_catalog
 
 app = Flask(__name__, static_folder="static", static_url_path="")
@@ -716,8 +717,11 @@ def parts_import():
 
 
 # ---------------------------------------------------------------- プラ点検
+# プラリスト（pla_items）= 危害度分析の一覧。チェック表（pla_sheets / pla_points）= 現場で毎日つける紙の表。
+# 点検はチェック表の 1 行ごとに記録し（pla_checks）、行はプラリストの行と紐づける（pla_point_items）。
 PLA_FIELDS = ["process", "equipment", "item", "color", "material", "material_pct", "material_maker", "hazard",
               "methods", "is_new", "frequency", "severity", "possibility", "evaluation", "note", "active"]
+PHOTO_TYPES = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "image/gif": "gif"}
 
 
 def pla_process():
@@ -727,24 +731,32 @@ def pla_process():
     return p
 
 
-def pla_items(conn, process, daily_only=False):
-    items = rows(conn.execute(
-        """SELECT i.*, (SELECT COUNT(*) FROM pla_results r WHERE r.item_id = i.id) AS result_count
-           FROM pla_items i WHERE process = ? ORDER BY sort_order, id""", (process,)))
-    for i in items:
-        i["daily"] = pla.is_daily(i)
-    return [i for i in items if i["daily"]] if daily_only else items
-
-
 @app.get("/api/pla/meta")
 def pla_meta():
-    return jsonify(processes=list(pla.PROCESS_AREA), process_area=pla.PROCESS_AREA, timings=pla.TIMINGS,
+    return jsonify(processes=list(pla.PROCESS_AREA), process_area=pla.PROCESS_AREA, timings=pla_sheets.TIMINGS,
                    hazards=pla.HAZARDS, methods=[n for _, n in pla.METHOD_PATTERNS])
 
 
+@app.get("/pla-photos/<path:name>")
+def pla_photo(name):
+    return send_from_directory(pla_sheets.PHOTO_DIR, name, max_age=86400 * 30)
+
+
+# ---- プラリスト
 @app.get("/api/pla/items")
 def pla_items_list():
-    return jsonify(pla_items(db(), pla_process()))
+    conn = db()
+    items = rows(conn.execute("SELECT * FROM pla_items WHERE process = ? ORDER BY sort_order, id", (pla_process(),)))
+    links = {}
+    for r in conn.execute(
+            """SELECT x.item_id, s.id AS sheet_id, s.title, p.id AS point_id FROM pla_point_items x
+               JOIN pla_points p ON p.id = x.point_id JOIN pla_sheets s ON s.id = p.sheet_id
+               WHERE s.active = 1 AND p.active = 1 ORDER BY s.sort_order"""):
+        links.setdefault(r["item_id"], []).append({"sheet_id": r["sheet_id"], "title": r["title"], "point_id": r["point_id"]})
+    for i in items:
+        i["daily"] = pla.is_daily(i)
+        i["sheets"] = links.get(i["id"], [])
+    return jsonify(items)
 
 
 def pla_values(d):
@@ -767,7 +779,6 @@ def pla_item_create():
         abort(400, "工程・設備名・点検箇所は必須です")
     v.setdefault("active", 1)
     conn = db()
-    # 同じ設備の最後に並べる
     last = conn.execute("SELECT MAX(sort_order) FROM pla_items WHERE process=? AND equipment=?",
                         (v["process"], v["equipment"])).fetchone()[0]
     if last is None:
@@ -791,37 +802,186 @@ def pla_item_update(item_id):
 @app.delete("/api/pla/items/<int:item_id>")
 def pla_item_delete(item_id):
     conn = db()
-    if conn.execute("SELECT 1 FROM pla_results WHERE item_id=?", (item_id,)).fetchone():
-        abort(409, "点検記録がある箇所は削除できません。「点検しない（停止中）」にしてください")
+    conn.execute("DELETE FROM pla_point_items WHERE item_id=?", (item_id,))
     conn.execute("DELETE FROM pla_items WHERE id=?", (item_id,))
     conn.commit()
     return jsonify(ok=True)
 
 
+# ---- チェック表
+def pla_sheet_rows(conn, process, active_only=True):
+    """チェック表と行・写真・紐づくプラリストの行をまとめて返す。"""
+    cond = " AND active = 1" if active_only else ""
+    sheets = rows(conn.execute(f"SELECT * FROM pla_sheets WHERE process = ?{cond} ORDER BY sort_order, id", (process,)))
+    if not sheets:
+        return []
+    ids = ",".join(str(s["id"]) for s in sheets)
+    points = rows(conn.execute(f"SELECT * FROM pla_points WHERE sheet_id IN ({ids}){cond} ORDER BY sort_order, id"))
+    photos = rows(conn.execute(f"SELECT * FROM pla_photos WHERE sheet_id IN ({ids}) ORDER BY sort_order, id"))
+    links = rows(conn.execute(
+        f"""SELECT x.point_id, i.id, i.equipment, i.item, i.hazard, i.material, i.material_maker, i.color, i.active
+            FROM pla_point_items x JOIN pla_items i ON i.id = x.item_id
+            WHERE x.point_id IN (SELECT id FROM pla_points WHERE sheet_id IN ({ids})) ORDER BY i.sort_order"""))
+    by_sheet = {s["id"]: s for s in sheets}
+    for s in sheets:
+        s["points"], s["photos"] = [], []
+    by_point = {}
+    for p in points:
+        p["photos"], p["items"] = [], []
+        by_point[p["id"]] = p
+        by_sheet[p["sheet_id"]]["points"].append(p)
+    for ph in photos:
+        (by_point[ph["point_id"]]["photos"] if ph["point_id"] in by_point else by_sheet[ph["sheet_id"]]["photos"]).append(ph)
+    for l in links:
+        if l["point_id"] in by_point:
+            by_point[l["point_id"]]["items"].append(l)
+    return [s for s in sheets if s["points"] or not active_only]
+
+
+@app.get("/api/pla/sheets")
+def pla_sheets_list():
+    return jsonify(pla_sheet_rows(db(), pla_process(), active_only=request.args.get("all") != "1"))
+
+
+@app.put("/api/pla/sheets/<int:sheet_id>")
+def pla_sheet_update(sheet_id):
+    d = body()
+    v = {k: blank_to_none(d.get(k)) for k in ("title", "note") if k in d}
+    if "active" in d:
+        v["active"] = 1 if d["active"] in (1, "1", True) else 0
+    if "title" in v and not v["title"]:
+        abort(400, "チェック表の名前は必須です")
+    v["updated_at"] = dt.datetime.now().isoformat(timespec="seconds")
+    conn = db()
+    conn.execute(f"UPDATE pla_sheets SET {', '.join(k + '=?' for k in v)} WHERE id=?", list(v.values()) + [sheet_id])
+    conn.commit()
+    return jsonify(ok=True)
+
+
+@app.post("/api/pla/sheets")
+def pla_sheet_create():
+    d = body()
+    if not (d.get("title") or "").strip():
+        abort(400, "チェック表の名前は必須です")
+    process = d.get("process")
+    if process not in pla.PROCESS_AREA:
+        abort(400, "工程が不正です")
+    conn = db()
+    order = conn.execute("SELECT COALESCE(MAX(sort_order), 0) + 1 FROM pla_sheets").fetchone()[0]
+    cur = conn.execute("INSERT INTO pla_sheets(process, title, active, sort_order, source, updated_at) VALUES (?,?,1,?,?,?)",
+                       (process, d["title"].strip(), order, "app", dt.datetime.now().isoformat(timespec="seconds")))
+    conn.commit()
+    return jsonify(id=cur.lastrowid), 201
+
+
+@app.post("/api/pla/points")
+def pla_point_create():
+    d = body()
+    if not (d.get("item_text") or "").strip() or not d.get("sheet_id"):
+        abort(400, "項目は必須です")
+    conn = db()
+    order = conn.execute("SELECT COALESCE(MAX(sort_order), 0) + 1 FROM pla_points WHERE sheet_id=?", (d["sheet_id"],)).fetchone()[0]
+    cur = conn.execute("INSERT INTO pla_points(sheet_id, location, item_text, sort_order) VALUES (?,?,?,?)",
+                       (d["sheet_id"], blank_to_none(d.get("location")), d["item_text"].strip(), order))
+    conn.commit()
+    return jsonify(id=cur.lastrowid), 201
+
+
+@app.put("/api/pla/points/<int:point_id>")
+def pla_point_update(point_id):
+    d = body()
+    conn = db()
+    v = {k: blank_to_none(d.get(k)) for k in ("location", "item_text") if k in d}
+    if "active" in d:
+        v["active"] = 1 if d["active"] in (1, "1", True) else 0
+    if "item_text" in v and not v["item_text"]:
+        abort(400, "項目は必須です")
+    if v:
+        conn.execute(f"UPDATE pla_points SET {', '.join(k + '=?' for k in v)} WHERE id=?", list(v.values()) + [point_id])
+    if "item_ids" in d:  # プラリストとの紐づけをこの内容に置き換える
+        conn.execute("DELETE FROM pla_point_items WHERE point_id=?", (point_id,))
+        for iid in d["item_ids"] or []:
+            conn.execute("INSERT OR IGNORE INTO pla_point_items(point_id, item_id) VALUES (?,?)", (point_id, int(iid)))
+    if "move" in d:  # 1 つ上 / 下へ
+        p = conn.execute("SELECT * FROM pla_points WHERE id=?", (point_id,)).fetchone()
+        op, order = ("<", "DESC") if d["move"] == "up" else (">", "ASC")
+        other = conn.execute(f"SELECT * FROM pla_points WHERE sheet_id=? AND sort_order {op} ? ORDER BY sort_order {order} LIMIT 1",
+                             (p["sheet_id"], p["sort_order"])).fetchone()
+        if other:
+            conn.execute("UPDATE pla_points SET sort_order=? WHERE id=?", (other["sort_order"], p["id"]))
+            conn.execute("UPDATE pla_points SET sort_order=? WHERE id=?", (p["sort_order"], other["id"]))
+    conn.commit()
+    return jsonify(ok=True)
+
+
+@app.delete("/api/pla/points/<int:point_id>")
+def pla_point_delete(point_id):
+    conn = db()
+    if conn.execute("SELECT 1 FROM pla_checks WHERE point_id=?", (point_id,)).fetchone():
+        abort(409, "点検記録がある行は削除できません。「使わない」にしてください")
+    conn.execute("DELETE FROM pla_point_items WHERE point_id=?", (point_id,))
+    conn.execute("UPDATE pla_photos SET point_id=NULL WHERE point_id=?", (point_id,))
+    conn.execute("DELETE FROM pla_points WHERE id=?", (point_id,))
+    conn.commit()
+    return jsonify(ok=True)
+
+
+@app.post("/api/pla/photos")
+def pla_photo_upload():
+    """写真を足す（point_id があればその行、なければチェック表の「場所の写真」）。"""
+    f = request.files.get("file")
+    sheet_id = request.form.get("sheet_id", type=int)
+    point_id = request.form.get("point_id", type=int) or None
+    if not f or not sheet_id:
+        abort(400, "写真を選んでください")
+    ext = PHOTO_TYPES.get(f.mimetype)
+    if not ext:
+        abort(400, "JPEG か PNG の写真を選んでください")
+    data = f.read()
+    if len(data) > 15 * 1024 * 1024:
+        abort(400, "写真が大きすぎます（15MB まで）")
+    name = pla_sheets._save_photo(data, ext)
+    conn = db()
+    order = conn.execute("SELECT COALESCE(MAX(sort_order), 0) + 1 FROM pla_photos WHERE sheet_id=?", (sheet_id,)).fetchone()[0]
+    conn.execute("INSERT INTO pla_photos(sheet_id, point_id, file, sort_order, caption, source, created_at) VALUES (?,?,?,?,?,?,?)",
+                 (sheet_id, point_id, name, order, blank_to_none(request.form.get("caption")), "app",
+                  dt.datetime.now().isoformat(timespec="seconds")))
+    conn.commit()
+    return jsonify(ok=True, file=name), 201
+
+
+@app.delete("/api/pla/photos/<int:photo_id>")
+def pla_photo_delete(photo_id):
+    conn = db()
+    conn.execute("DELETE FROM pla_photos WHERE id=?", (photo_id,))  # 写真ファイルはほかの行でも使っていることがあるので残す
+    conn.commit()
+    return jsonify(ok=True)
+
+
+# ---- 点検の記録と確認
 def pla_date_timing(d):
     date, timing = d.get("date"), d.get("timing")
     try:
         dt.date.fromisoformat(date or "")
     except ValueError:
         abort(400, "日付が不正です")
-    if timing not in pla.TIMINGS:
+    if timing not in pla_sheets.TIMINGS:
         abort(400, "始業時・終業時のどちらかを選んでください")
     return date, timing
 
 
-@app.get("/api/pla/sheet")
-def pla_sheet():
-    """点検する画面のデータ。日々の点検箇所と、その日・その時間の結果。"""
+@app.get("/api/pla/check")
+def pla_check_sheet():
+    """点検する画面のデータ。使っているチェック表と、その日・その時間の結果。"""
     process = pla_process()
     date, timing = pla_date_timing(request.args)
     conn = db()
-    items = pla_items(conn, process, daily_only=True)
-    results = {r["item_id"]: r for r in rows(conn.execute(
-        """SELECT r.* FROM pla_results r JOIN pla_items i ON i.id = r.item_id
-           WHERE i.process = ? AND r.check_date = ? AND r.timing = ?""", (process, date, timing)))}
+    results = {r["point_id"]: r for r in rows(conn.execute(
+        """SELECT c.* FROM pla_checks c JOIN pla_points p ON p.id = c.point_id JOIN pla_sheets s ON s.id = p.sheet_id
+           WHERE s.process = ? AND c.check_date = ? AND c.timing = ?""", (process, date, timing)))}
     review = conn.execute("SELECT * FROM pla_reviews WHERE process=? AND check_date=? AND timing=?",
                           (process, date, timing)).fetchone()
-    return jsonify(items=items, results=results, review=dict(review) if review else None)
+    return jsonify(sheets=pla_sheet_rows(conn, process), results=results, review=dict(review) if review else None)
 
 
 @app.put("/api/pla/results")
@@ -841,14 +1001,14 @@ def pla_results_save():
         if result == "ng" and not (r.get("note") or "").strip():
             abort(400, "異常のときは内容を書いてください")
         if not result:
-            conn.execute("DELETE FROM pla_results WHERE item_id=? AND check_date=? AND timing=?", (r["item_id"], date, timing))
+            conn.execute("DELETE FROM pla_checks WHERE point_id=? AND check_date=? AND timing=?", (r["point_id"], date, timing))
             continue
         conn.execute(
-            """INSERT INTO pla_results(item_id, check_date, timing, result, note, checked_by, checked_at)
+            """INSERT INTO pla_checks(point_id, check_date, timing, result, note, checked_by, checked_at)
                VALUES (?,?,?,?,?,?,?)
-               ON CONFLICT(item_id, check_date, timing) DO UPDATE SET
+               ON CONFLICT(point_id, check_date, timing) DO UPDATE SET
                  result=excluded.result, note=excluded.note, checked_by=excluded.checked_by, checked_at=excluded.checked_at""",
-            (r["item_id"], date, timing, result, blank_to_none(r.get("note")) if result == "ng" else None, who, now))
+            (r["point_id"], date, timing, result, blank_to_none(r.get("note")) if result == "ng" else None, who, now))
     conn.commit()
     return jsonify(ok=True)
 
@@ -864,22 +1024,25 @@ def pla_summary():
         abort(400, "月が不正です")
     last = (first.replace(day=28) + dt.timedelta(days=4)).replace(day=1) - dt.timedelta(days=1)
     conn = db()
-    total = len(pla_items(conn, process, daily_only=True))
+    total = conn.execute("""SELECT COUNT(*) FROM pla_points p JOIN pla_sheets s ON s.id = p.sheet_id
+                            WHERE s.process = ? AND s.active = 1 AND p.active = 1""", (process,)).fetchone()[0]
     days = {}
     for r in conn.execute(
-            """SELECT r.check_date, r.timing, COUNT(*) AS done, SUM(r.result = 'ng') AS ng,
-                      GROUP_CONCAT(DISTINCT r.checked_by) AS checkers
-               FROM pla_results r JOIN pla_items i ON i.id = r.item_id
-               WHERE i.process = ? AND r.check_date BETWEEN ? AND ? GROUP BY r.check_date, r.timing""",
+            """SELECT c.check_date, c.timing, COUNT(*) AS done, SUM(c.result = 'ng') AS ng,
+                      GROUP_CONCAT(DISTINCT c.checked_by) AS checkers
+               FROM pla_checks c JOIN pla_points p ON p.id = c.point_id JOIN pla_sheets s ON s.id = p.sheet_id
+               WHERE s.process = ? AND c.check_date BETWEEN ? AND ? GROUP BY c.check_date, c.timing""",
             (process, first.isoformat(), last.isoformat())):
         days.setdefault(r["check_date"], {})[r["timing"]] = {"done": r["done"], "ng": r["ng"], "checkers": r["checkers"]}
     for r in conn.execute("SELECT * FROM pla_reviews WHERE process=? AND check_date BETWEEN ? AND ?",
                           (process, first.isoformat(), last.isoformat())):
         days.setdefault(r["check_date"], {}).setdefault(r["timing"], {"done": 0, "ng": 0, "checkers": None})["review"] = dict(r)
     ng = rows(conn.execute(
-        """SELECT r.*, i.equipment, i.item, i.hazard FROM pla_results r JOIN pla_items i ON i.id = r.item_id
-           WHERE i.process = ? AND r.result = 'ng' AND r.check_date BETWEEN ? AND ?
-           ORDER BY r.check_date DESC, r.timing DESC, i.sort_order""", (process, first.isoformat(), last.isoformat())))
+        """SELECT c.*, s.title AS sheet_title, s.id AS sheet_id, p.location, p.item_text FROM pla_checks c
+           JOIN pla_points p ON p.id = c.point_id JOIN pla_sheets s ON s.id = p.sheet_id
+           WHERE s.process = ? AND c.result = 'ng' AND c.check_date BETWEEN ? AND ?
+           ORDER BY c.check_date DESC, c.timing DESC, s.sort_order, p.sort_order""",
+        (process, first.isoformat(), last.isoformat())))
     return jsonify(total=total, days=days, ng=ng, month=ym)
 
 
@@ -911,7 +1074,7 @@ def pla_export():
     process = pla_process()
     ym = request.args.get("month") or today().strftime("%Y-%m")
     name = f"プラ点検記録_{process}_{ym}.xlsx"
-    return Response(pla.export_month(db(), process, ym),
+    return Response(pla_sheets.export_month(db(), process, ym),
                     mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     headers={"Content-Disposition": f"attachment; filename=pla.xlsx; filename*=UTF-8''{quote(name)}"})
 

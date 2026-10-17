@@ -1326,11 +1326,15 @@ async function openPartForm(p) {
 }
 
 /* ================================================================ プラ点検 */
+/* チェック表（紙の「プラスチック部品チェック表」）の 1 行ごとに ○×－ をつける。行はプラリストの行と紐づく */
 const PLA_DEFECTS = ["破損", "欠け", "割れ", "変形", "紛失", "ゆるみ", "摩耗"];
 const plaState = {
-  meta: null, process: null, date: null, timing: null, eq: null, onlyTodo: false,
-  month: null, q: "", showInactive: false,
+  meta: null, process: null, date: null, timing: null, sheet: null, onlyTodo: false,
+  month: null, q: "", showInactive: false, onlyUnlinked: false, editSheet: null, showOldSheets: false,
 };
+const plaStamp = () => `${state.meta.today}T${new Date().toTimeString().slice(0, 5)}`;
+const hazardBadge = hz => (hz ? `<span class="hz hz-${h(hz)}" title="危害度 ${h(hz)}">${h(hz)}</span>` : "");
+const photoUrl = f => `/pla-photos/${encodeURIComponent(f)}`;
 
 async function plaInit() {
   plaState.meta ||= await api("/pla/meta");
@@ -1346,36 +1350,69 @@ async function plaInit() {
 
 function plaHeader(tab) {
   const p = plaState.meta.processes;
+  const t = (key, label) => `<a href="#/pla${key ? "/" + key : ""}" class="${tab === (key || "check") ? "on" : ""}">${label}</a>`;
   return `<div class="tabs-row">
-    <nav class="tabs">
-      <a href="#/pla" class="${tab === "check" ? "on" : ""}">点検する</a>
-      <a href="#/pla/review" class="${tab === "review" ? "on" : ""}">確認・記録</a>
-      <a href="#/pla/items" class="${tab === "items" ? "on" : ""}">点検箇所</a>
-    </nav>
+    <nav class="tabs">${t("", "点検する")}${t("review", "確認・記録")}${t("sheets", "チェック表")}${t("items", "プラリスト")}</nav>
     <div class="seg small" id="pla-proc">${p.map(x => `<label><input type="radio" name="pla-proc" value="${h(x)}" ${x === plaState.process ? "checked" : ""}>${h(x)}</label>`).join("")}</div>
   </div>`;
 }
 function bindPlaHeader() {
-  $$("#pla-proc input").forEach(r => r.addEventListener("change", () => { plaState.process = r.value; plaState.eq = null; router(); }));
+  $$("#pla-proc input").forEach(r => r.addEventListener("change", () => {
+    plaState.process = r.value; plaState.sheet = null; plaState.editSheet = null; router();
+  }));
 }
-const plaStamp = () => `${state.meta.today}T${new Date().toTimeString().slice(0, 5)}`;  // 画面に出す記入時刻
-const hazardBadge = hz => (hz ? `<span class="hz hz-${h(hz)}" title="危害度 ${h(hz)}">${h(hz)}</span>` : "");
 
 async function renderPla(tab) {
   await plaInit();
   if (tab === "review") return renderPlaReview();
   if (tab === "items") return renderPlaItems();
+  if (tab === "sheets") return renderPlaSheets();
   return renderPlaCheck();
 }
+
+/* 写真を大きく見る（← → で切り替え） */
+function openLightbox(photos, start = 0, caption = "") {
+  let i = start;
+  const box = document.createElement("div");
+  box.className = "lightbox";
+  const draw = () => {
+    box.innerHTML = `<button class="lb-close" aria-label="閉じる">✕</button>
+      ${photos.length > 1 ? `<button class="lb-prev" aria-label="前の写真">‹</button><button class="lb-next" aria-label="次の写真">›</button>` : ""}
+      <img src="${photoUrl(photos[i].file)}" alt="">
+      <div class="lb-cap">${h(caption)}${photos.length > 1 ? `　${i + 1} / ${photos.length}` : ""}</div>`;
+    box.querySelector(".lb-close").onclick = close;
+    box.querySelector(".lb-prev")?.addEventListener("click", e => { e.stopPropagation(); i = (i + photos.length - 1) % photos.length; draw(); });
+    box.querySelector(".lb-next")?.addEventListener("click", e => { e.stopPropagation(); i = (i + 1) % photos.length; draw(); });
+  };
+  const key = e => {
+    if (e.key === "Escape") close();
+    if (e.key === "ArrowLeft" && photos.length > 1) { i = (i + photos.length - 1) % photos.length; draw(); }
+    if (e.key === "ArrowRight" && photos.length > 1) { i = (i + 1) % photos.length; draw(); }
+  };
+  const close = () => { box.remove(); document.removeEventListener("keydown", key); };
+  box.addEventListener("click", e => { if (e.target === box) close(); });
+  document.addEventListener("keydown", key);
+  draw();
+  document.body.append(box);
+}
+
+const pointPhotos = p => (p.photos.length
+  ? `<button type="button" class="pla-thumb" data-lb="${p.id}"><img src="${photoUrl(p.photos[0].file)}" alt="写真" loading="lazy">${p.photos.length > 1 ? `<span>${p.photos.length}</span>` : ""}</button>`
+  : `<div class="pla-thumb none">写真なし</div>`);
+const pointLinks = p => (p.items.length
+  ? `<details class="pla-links"><summary>プラリスト ${p.items.length}件 ${[...new Set(p.items.map(i => i.hazard).filter(Boolean))].sort().map(hazardBadge).join("")}</summary>
+      <ul>${p.items.map(i => `<li>${hazardBadge(i.hazard)}${h(i.item)} <span class="muted">${h([i.color, i.material_maker || i.material].filter(Boolean).join(" ・ "))}</span></li>`).join("")}</ul></details>`
+  : "");
 
 /* ---------------------------------------------------------------- 点検する */
 async function renderPlaCheck() {
   const qs = `process=${encodeURIComponent(plaState.process)}&date=${plaState.date}&timing=${encodeURIComponent(plaState.timing)}`;
-  const d = await api(`/pla/sheet?${qs}`);
-  const res = d.results;  // item_id → 結果
-  const groups = groupBy(d.items, i => i.equipment);
-  if (!plaState.eq || !groups.some(([g]) => g === plaState.eq)) {
-    plaState.eq = (groups.find(([, l]) => l.some(i => !res[i.id])) || groups[0] || [null])[0];
+  const d = await api(`/pla/check?${qs}`);
+  const res = d.results;  // point_id → 結果
+  const sheets = d.sheets;
+  const allPoints = sheets.flatMap(s => s.points);
+  if (!plaState.sheet || !sheets.some(s => s.id === plaState.sheet)) {
+    plaState.sheet = (sheets.find(s => s.points.some(p => !res[p.id])) || sheets[0] || {}).id;
   }
   view.innerHTML = `
     ${plaHeader("check")}
@@ -1384,35 +1421,39 @@ async function renderPlaCheck() {
       <div class="seg" id="pla-timing">${plaState.meta.timings.map(t => `<label><input type="radio" name="pla-timing" value="${t}" ${t === plaState.timing ? "checked" : ""}>${t}</label>`).join("")}</div>
       <div class="pla-progress" id="pla-progress"></div>
     </div>
-    ${d.review ? `<p class="pla-reviewed">✓ ${h(d.review.reviewer)} さんが確認済みです（${h(fmtDate(d.review.reviewed_at.slice(0, 10)))}）。直すと確認をやり直してもらう必要があります。</p>` : ""}
+    ${d.review ? `<p class="pla-reviewed">✓ ${h(d.review.reviewer)} さんが確認済みです（${h(fmtDate(d.review.reviewed_at.slice(0, 10)))}）。直したときは確認をやり直してもらってください。</p>` : ""}
     ${!currentUser() ? `<p class="err" style="font-size:15px">右上の「記入者」に名前を入れてから点検してください。</p>` : ""}
     <div class="pla-layout">
       <aside class="pla-eqs card">
-        <select id="pla-eq-select" class="pla-eq-select">${groups.map(([g]) => `<option ${g === plaState.eq ? "selected" : ""}>${h(g)}</option>`).join("")}</select>
+        <select id="pla-eq-select" class="pla-eq-select">${sheets.map(s => `<option value="${s.id}" ${s.id === plaState.sheet ? "selected" : ""}>${h(s.title)}</option>`).join("")}</select>
         <ul id="pla-eq-list"></ul>
       </aside>
       <section class="pla-main" id="pla-main"></section>
     </div>`;
-  if (!d.items.length) { $("#pla-main").innerHTML = `<p class="empty">日々の点検箇所がありません。「点検箇所」タブで登録してください。</p>`; return; }
+  bindPlaHeader();
+  $("#pla-date").addEventListener("change", e => { if (e.target.value) { plaState.date = e.target.value; router(); } });
+  $$("#pla-timing input").forEach(r => r.addEventListener("change", () => { plaState.timing = r.value; router(); }));
+  if (!sheets.length) { $("#pla-main").innerHTML = `<p class="empty">チェック表がありません。「チェック表」タブで作ってください。</p>`; return; }
 
-  const stat = list => {
-    const done = list.filter(i => res[i.id]).length, ng = list.filter(i => res[i.id]?.result === "ng").length;
-    return { done, ng, total: list.length };
-  };
+  const stat = pts => ({ done: pts.filter(p => res[p.id]).length, ng: pts.filter(p => res[p.id]?.result === "ng").length, total: pts.length });
   const drawProgress = () => {
-    const s = stat(d.items);
-    const pct = Math.round((s.done / s.total) * 100);
+    const s = stat(allPoints);
+    const sh = sheets.filter(x => stat(x.points).done === x.points.length).length;
     $("#pla-progress").innerHTML = `
-      <div class="meter-bar"><div class="meter-fill ${s.done === s.total ? "ok" : ""}" style="width:${pct}%"></div></div>
-      <span><b>${s.done}</b> / ${s.total} 箇所</span>${s.ng ? `<span class="lv over">× 異常 ${s.ng}</span>` : ""}`;
+      <div class="meter-bar"><div class="meter-fill ${s.done === s.total ? "ok" : ""}" style="width:${Math.round((s.done / s.total) * 100)}%"></div></div>
+      <span>表 <b>${sh}</b>/${sheets.length}・箇所 <b>${s.done}</b>/${s.total}</span>${s.ng ? `<span class="lv over">× 異常 ${s.ng}</span>` : ""}`;
   };
   const drawList = () => {
-    $("#pla-eq-list").innerHTML = groups.map(([g, l]) => {
-      const s = stat(l);
-      const cls = s.ng ? "ng" : s.done === s.total ? "done" : s.done ? "part" : "";
-      return `<li class="${cls} ${g === plaState.eq ? "on" : ""}" data-g="${h(g)}"><span class="pla-eq-name">${h(g)}</span><span class="pla-eq-count">${s.ng ? "× " : s.done === s.total ? "✓ " : ""}${s.done}/${s.total}</span></li>`;
+    $("#pla-eq-list").innerHTML = sheets.map(s => {
+      const st = stat(s.points);
+      const cls = st.ng ? "ng" : st.done === st.total ? "done" : st.done ? "part" : "";
+      return `<li class="${cls} ${s.id === plaState.sheet ? "on" : ""}" data-s="${s.id}"><span class="pla-eq-name">${h(s.title)}</span><span class="pla-eq-count">${st.ng ? "× " : st.done === st.total ? "✓ " : ""}${st.done}/${st.total}</span></li>`;
     }).join("");
-    $$("#pla-eq-list li").forEach(li => li.addEventListener("click", () => select(li.dataset.g)));
+    $$("#pla-eq-list li").forEach(li => li.addEventListener("click", () => select(+li.dataset.s)));
+    $$("#pla-eq-select option").forEach(o => {
+      const st = stat(sheets.find(s => s.id == o.value).points);
+      o.textContent = `${st.ng ? "× " : st.done === st.total ? "✓ " : ""}${sheets.find(s => s.id == o.value).title}（${st.done}/${st.total}）`;
+    });
   };
   const save = async list => {
     try {
@@ -1421,26 +1462,27 @@ async function renderPlaCheck() {
     } catch (ex) { toast(ex.message, 4000); return false; }
   };
   const drawMain = () => {
-    const entry = groups.find(([g]) => g === plaState.eq);
-    if (!entry) return;
-    const [g, list] = entry;
-    const shown = plaState.onlyTodo ? list.filter(i => !res[i.id]) : list;
-    const idx = groups.findIndex(([x]) => x === g);
-    const next = groups.slice(idx + 1).find(([, l]) => l.some(i => !res[i.id])) || groups[idx + 1];
+    const sheet = sheets.find(s => s.id === plaState.sheet);
+    const shown = plaState.onlyTodo ? sheet.points.filter(p => !res[p.id]) : sheet.points;
+    const idx = sheets.indexOf(sheet);
+    const next = sheets.slice(idx + 1).find(s => s.points.some(p => !res[p.id])) || sheets[idx + 1];
     $("#pla-main").innerHTML = `
       <div class="pla-eq-head">
-        <h2>${h(g)}</h2>
+        <h2>${h(sheet.title)}</h2>
         <div class="pla-eq-actions">
           <label class="muted" style="font-size:13px"><input type="checkbox" id="pla-todo" ${plaState.onlyTodo ? "checked" : ""}> 未点検だけ表示</label>
           <button class="btn" id="pla-all-ok">残りをすべて ○</button>
         </div>
       </div>
-      <ul class="pla-items">${shown.map(i => {
-        const r = res[i.id];
-        return `<li class="pla-item ${r ? "r-" + r.result : ""}" data-id="${i.id}">
+      ${sheet.photos.length ? `<div class="pla-place"><span class="muted">場所の写真</span>${sheet.photos.map((ph, i) => `<button type="button" class="pla-place-ph" data-i="${i}"><img src="${photoUrl(ph.file)}" alt="場所の写真" loading="lazy"></button>`).join("")}</div>` : ""}
+      <ul class="pla-items">${shown.map((p, n) => {
+        const r = res[p.id];
+        return `<li class="pla-item ${r ? "r-" + r.result : ""}" data-id="${p.id}">
+          ${pointPhotos(p)}
           <div class="pla-item-info">
-            <div class="pla-item-name">${hazardBadge(i.hazard)}${h(i.item)}</div>
-            <div class="pla-item-sub">${h([i.color, i.material_maker || i.material, i.frequency].filter(Boolean).join(" ・ "))}</div>
+            ${p.location ? `<div class="pla-loc">📍 ${h(p.location)}</div>` : ""}
+            <div class="pla-item-name">${h(p.item_text)}</div>
+            ${pointLinks(p)}
             ${r?.result === "ng" ? `<div class="pla-ng-note">× ${h(r.note || "")}</div>` : ""}
             ${r ? `<div class="pla-who">${h(r.checked_by || "")} ${h((r.checked_at || "").slice(11, 16))}</div>` : ""}
           </div>
@@ -1450,32 +1492,37 @@ async function renderPlaCheck() {
             <button class="pla-btn na ${r?.result === "na" ? "on" : ""}" data-r="na" title="稼働なし・使っていない">－</button>
           </div>
         </li>`;
-      }).join("") || `<li class="empty">この設備はすべて点検済みです</li>`}</ul>
-      ${next && next[0] !== g ? `<div class="pla-next"><button class="btn primary lg" id="pla-next">次の設備へ：${h(next[0])} →</button></div>` : ""}`;
+      }).join("") || `<li class="empty">このチェック表はすべて点検済みです</li>`}</ul>
+      ${next && next !== sheet ? `<div class="pla-next"><button class="btn primary lg" id="pla-next">次のチェック表へ：${h(next.title)} →</button></div>` : ""}`;
 
     $("#pla-todo").addEventListener("change", e => { plaState.onlyTodo = e.target.checked; drawMain(); });
+    $$(".pla-place-ph").forEach(b => b.addEventListener("click", () => openLightbox(sheet.photos, +b.dataset.i, `${sheet.title}　場所の写真`)));
+    $$("#pla-main [data-lb]").forEach(b => b.addEventListener("click", () => {
+      const p = sheet.points.find(x => x.id == b.dataset.lb);
+      openLightbox(p.photos, 0, [p.location, p.item_text.replace(/\n/g, " ")].filter(Boolean).join("　"));
+    }));
     $("#pla-all-ok").addEventListener("click", async () => {
-      const todo = list.filter(i => !res[i.id]);
-      if (!todo.length) return toast("この設備はすべて点検済みです");
-      if (!(await save(todo.map(i => ({ item_id: i.id, result: "ok" }))))) return;
-      todo.forEach(i => (res[i.id] = { result: "ok", checked_by: currentUser(), checked_at: plaStamp() }));
+      const todo = sheet.points.filter(p => !res[p.id]);
+      if (!todo.length) return toast("このチェック表はすべて点検済みです");
+      if (!(await save(todo.map(p => ({ point_id: p.id, result: "ok" }))))) return;
+      todo.forEach(p => (res[p.id] = { result: "ok", checked_by: currentUser(), checked_at: plaStamp() }));
       toast(`${todo.length} 箇所を ○ にしました`);
       redraw();
     });
-    $("#pla-next")?.addEventListener("click", () => { select(next[0]); window.scrollTo({ top: 0, behavior: "smooth" }); });
+    $("#pla-next")?.addEventListener("click", () => { select(next.id); window.scrollTo({ top: 0, behavior: "smooth" }); });
     $$("#pla-main .pla-item").forEach(li => {
       const id = +li.dataset.id;
       li.querySelectorAll(".pla-btn").forEach(b => b.addEventListener("click", async () => {
         const cur = res[id];
         const r = b.dataset.r;
-        if (r === "ng") return openPlaNg(d.items.find(i => i.id === id), cur, async note => {
-          if (!(await save([{ item_id: id, result: "ng", note }]))) return false;
+        if (r === "ng") return openPlaNg(sheet, sheet.points.find(p => p.id === id), cur, async note => {
+          if (!(await save([{ point_id: id, result: "ng", note }]))) return false;
           res[id] = { result: "ng", note, checked_by: currentUser(), checked_at: plaStamp() };
           redraw();
           return true;
         });
         const clear = cur?.result === r;  // 同じボタンをもう一度押したら取り消し
-        if (!(await save([{ item_id: id, result: clear ? "" : r }]))) return;
+        if (!(await save([{ point_id: id, result: clear ? "" : r }]))) return;
         if (clear) delete res[id];
         else res[id] = { result: r, checked_by: currentUser(), checked_at: plaStamp() };
         redraw();
@@ -1483,18 +1530,17 @@ async function renderPlaCheck() {
     });
   };
   const redraw = () => { drawProgress(); drawList(); drawMain(); };
-  const select = g => { plaState.eq = g; $("#pla-eq-select").value = g; drawList(); drawMain(); };
-
-  $("#pla-eq-select").addEventListener("change", e => select(e.target.value));
-  $("#pla-date").addEventListener("change", e => { if (e.target.value) { plaState.date = e.target.value; router(); } });
-  $$("#pla-timing input").forEach(r => r.addEventListener("change", () => { plaState.timing = r.value; router(); }));
-  bindPlaHeader();
+  const select = id => { plaState.sheet = id; $("#pla-eq-select").value = id; drawList(); drawMain(); };
+  $("#pla-eq-select").addEventListener("change", e => select(+e.target.value));
   redraw();
 }
 
-function openPlaNg(item, cur, onSave) {
+function openPlaNg(sheet, p, cur, onSave) {
   openModal("異常あり", `
-    <p style="margin-top:0"><b>${h(item.equipment)}</b><br>${hazardBadge(item.hazard)}${h(item.item)}</p>
+    <div class="pla-ng-head">
+      ${p.photos.length ? `<img src="${photoUrl(p.photos[0].file)}" alt="">` : ""}
+      <p><b>${h(sheet.title)}</b><br>${p.location ? h(p.location) + "／" : ""}${h(p.item_text.replace(/\n/g, " "))}</p>
+    </div>
     <div class="pla-defects">${PLA_DEFECTS.map(x => `<button type="button" class="chip" data-x="${x}">${x}</button>`).join("")}</div>
     <label class="field full" style="margin-top:12px"><span>異常の内容<em class="req">*</em></span>
       <textarea name="ng_note" rows="3" placeholder="例: 角が欠けている。欠片は見つからず">${h(cur?.result === "ng" ? cur.note || "" : "")}</textarea></label>
@@ -1520,18 +1566,16 @@ async function renderPlaReview() {
   const d = await api(`/pla/summary?process=${encodeURIComponent(plaState.process)}&month=${plaState.month}`);
   const [y, m] = plaState.month.split("-").map(Number);
   const last = new Date(y, m, 0).getDate();
-  const today = state.meta.today;
   const dates = [];
   for (let i = last; i >= 1; i--) {
     const iso = `${plaState.month}-${String(i).padStart(2, "0")}`;
-    if (iso <= today) dates.push(iso);
+    if (iso <= state.meta.today) dates.push(iso);
   }
   const cell = (iso, t) => {
     const c = d.days[iso]?.[t];
-    if (!c || (!c.done && !c.review)) return `<td class="pla-cell empty-cell" data-d="${iso}" data-t="${t}"><span class="muted">未実施</span></td>`;
-    const full = c.done >= d.total;
+    if (!c || (!c.done && !c.review)) return `<td class="pla-cell" data-d="${iso}" data-t="${t}"><span class="muted">未実施</span></td>`;
     return `<td class="pla-cell ${c.ng ? "has-ng" : ""}" data-d="${iso}" data-t="${t}">
-      <div class="pla-cell-top"><b>${c.done}</b>/${d.total}${full ? ' <span class="lv ok">完了</span>' : ' <span class="lv soon">途中</span>'}${c.ng ? ` <span class="lv over">× ${c.ng}</span>` : ""}</div>
+      <div class="pla-cell-top"><b>${c.done}</b>/${d.total}${c.done >= d.total ? ' <span class="lv ok">完了</span>' : ' <span class="lv soon">途中</span>'}${c.ng ? ` <span class="lv over">× ${c.ng}</span>` : ""}</div>
       <div class="pla-cell-sub">${c.checkers ? "点検 " + h(c.checkers.replaceAll(",", "、")) : ""}</div>
       <div class="pla-cell-sub">${c.review ? `<span class="pla-ok">✓ 確認 ${h(c.review.reviewer)}</span>` : '<span class="muted">未確認</span>'}</div>
     </td>`;
@@ -1545,43 +1589,43 @@ async function renderPlaReview() {
         <strong>${y}年${m}月</strong>
         <button class="btn small" id="pm-next" aria-label="次の月">›</button>
       </div>
-      <span class="spacer" style="flex:1"></span>
+      <span style="flex:1"></span>
       <a class="btn" href="/api/pla/export.xlsx?process=${encodeURIComponent(plaState.process)}&month=${plaState.month}" download>この月の点検記録をExcel出力</a>
     </div>
     ${d.ng.length ? `<div class="card pla-ng-card"><h3>この月の異常 <span class="sub">${d.ng.length}件</span></h3>
-      <div class="table-wrap"><table class="list responsive"><thead><tr><th>日付</th><th>設備・箇所</th><th>内容</th><th>点検者</th><th></th></tr></thead><tbody>
+      <div class="table-wrap"><table class="list responsive"><thead><tr><th>日付</th><th>チェック表・箇所</th><th>内容</th><th>点検者</th><th></th></tr></thead><tbody>
       ${d.ng.map(r => `<tr><td class="nowrap" data-label="日付">${fmtDate(r.check_date)} ${h(r.timing)}</td>
-        <td data-label="設備・箇所"><b>${h(r.equipment)}</b><br>${hazardBadge(r.hazard)}${h(r.item)}</td>
+        <td data-label="チェック表・箇所"><b>${h(r.sheet_title)}</b><br>${h([r.location, r.item_text.replace(/\n/g, " ")].filter(Boolean).join("／"))}</td>
         <td data-label="内容">${h(r.note || "")}</td><td class="nowrap" data-label="点検者">${h(r.checked_by || "")}</td>
         <td class="nowrap"><button class="btn small pla-fix" data-i="${r.id}">修理を記録</button></td></tr>`).join("")}
       </tbody></table></div></div>` : ""}
-    <p class="muted" style="font-size:13px;margin:8px 0">日々の点検箇所は ${d.total} 箇所です。マスを押すと中身を見て「確認」できます。</p>
+    <p class="muted" style="font-size:13px;margin:8px 0">使っているチェック表の箇所は ${d.total} 箇所です。マスを押すと中身を見て「確認」できます。</p>
     <div class="table-wrap"><table class="list pla-month"><thead><tr><th>日付</th>${plaState.meta.timings.map(t => `<th>${t}</th>`).join("")}</tr></thead><tbody>
       ${dates.map(iso => `<tr class="${wd(iso) === "日" ? "sun" : wd(iso) === "土" ? "sat" : ""}"><td class="nowrap"><b>${Number(iso.slice(8))}日</b>（${wd(iso)}）</td>${plaState.meta.timings.map(t => cell(iso, t)).join("")}</tr>`).join("") || `<tr><td colspan="3" class="empty">まだ日付がありません</td></tr>`}
     </tbody></table></div>`;
-
   const move = step => { const dd = new Date(y, m - 1 + step, 1); plaState.month = `${dd.getFullYear()}-${String(dd.getMonth() + 1).padStart(2, "0")}`; router(); };
   $("#pm-prev").addEventListener("click", () => move(-1));
   $("#pm-next").addEventListener("click", () => move(1));
   $$(".pla-cell").forEach(td => td.addEventListener("click", () => openPlaDay(td.dataset.d, td.dataset.t)));
   $$(".pla-fix").forEach(b => b.addEventListener("click", () => {
     const r = d.ng.find(x => x.id == b.dataset.i);
-    openRecordForm(null, { kind: "不定期", status: "未着手", content: `プラ点検で異常：${r.item}`, reason: `${fmtDate(r.check_date)} ${r.timing}　${r.equipment}／${r.item}：${r.note || ""}（点検者 ${r.checked_by || ""}）` });
+    openRecordForm(null, { kind: "不定期", status: "未着手", content: `プラ点検で異常：${r.sheet_title}`, reason: `${fmtDate(r.check_date)} ${r.timing}　${r.sheet_title}／${[r.location, r.item_text.replace(/\n/g, " ")].filter(Boolean).join(" ")}：${r.note || ""}（点検者 ${r.checked_by || ""}）` });
   }));
   bindPlaHeader();
 }
 
 async function openPlaDay(date, timing) {
-  const d = await api(`/pla/sheet?process=${encodeURIComponent(plaState.process)}&date=${date}&timing=${encodeURIComponent(timing)}`);
+  const d = await api(`/pla/check?process=${encodeURIComponent(plaState.process)}&date=${date}&timing=${encodeURIComponent(timing)}`);
   const res = d.results;
-  const ng = d.items.filter(i => res[i.id]?.result === "ng");
-  const todo = groupBy(d.items.filter(i => !res[i.id]), i => i.equipment);
-  const done = d.items.filter(i => res[i.id]).length;
+  const pts = d.sheets.flatMap(s => s.points.map(p => ({ ...p, sheet: s.title })));
+  const ng = pts.filter(p => res[p.id]?.result === "ng");
+  const todo = d.sheets.map(s => [s.title, s.points.filter(p => !res[p.id]).length]).filter(([, n]) => n);
+  const done = pts.filter(p => res[p.id]).length;
   const rv = d.review;
   openModal(`${fmtDate(date)} ${timing}　${plaState.process}`, `
-    <p style="margin-top:0">点検 <b>${done}</b> / ${d.items.length} 箇所${ng.length ? `　<span class="lv over">× 異常 ${ng.length}</span>` : ""}</p>
-    ${ng.length ? `<h3 class="pla-h">異常</h3><ul class="pla-ng-list">${ng.map(i => `<li><b>${h(i.equipment)}</b> ／ ${hazardBadge(i.hazard)}${h(i.item)}<div class="pla-ng-note">× ${h(res[i.id].note || "")}（${h(res[i.id].checked_by || "")}）</div></li>`).join("")}</ul>` : ""}
-    ${todo.length ? `<h3 class="pla-h">未点検の設備（${todo.length}）</h3><p class="pla-todo-list">${todo.map(([g, l]) => `${h(g)} <span class="muted">${l.length}</span>`).join("　/　")}</p>` : ""}
+    <p style="margin-top:0">点検 <b>${done}</b> / ${pts.length} 箇所${ng.length ? `　<span class="lv over">× 異常 ${ng.length}</span>` : ""}</p>
+    ${ng.length ? `<h3 class="pla-h">異常</h3><ul class="pla-ng-list">${ng.map(p => `<li><b>${h(p.sheet)}</b> ／ ${h([p.location, p.item_text.replace(/\n/g, " ")].filter(Boolean).join(" "))}<div class="pla-ng-note">× ${h(res[p.id].note || "")}（${h(res[p.id].checked_by || "")}）</div></li>`).join("")}</ul>` : ""}
+    ${todo.length && done ? `<h3 class="pla-h">終わっていないチェック表（${todo.length}）</h3><p class="pla-todo-list">${todo.map(([t, n]) => `${h(t)} <span class="muted">残り${n}</span>`).join("　/　")}</p>` : ""}
     ${!done ? `<p class="empty">まだ点検されていません</p>` : ""}
     <h3 class="pla-h">確認</h3>
     ${rv ? `<p class="pla-ok">✓ ${h(rv.reviewer)} さんが確認しました（${h(rv.reviewed_at.replace("T", " ").slice(0, 16))}）${rv.comment ? `<br>コメント: ${h(rv.comment)}` : ""}</p>` : ""}
@@ -1602,49 +1646,222 @@ async function openPlaDay(date, timing) {
   $("#rv-cancel")?.addEventListener("click", () => send(true));
 }
 
-/* ---------------------------------------------------------------- 点検箇所（マスタ） */
+/* ---------------------------------------------------------------- チェック表（行・写真・プラリストとの紐づけを直す） */
+/* スマホの写真は大きいので、長い辺 1600px の JPEG にしてから送る */
+async function shrinkPhoto(file) {
+  if (!file.type.startsWith("image/") || file.type === "image/gif") return file;
+  try {
+    const img = await createImageBitmap(file);
+    const scale = Math.min(1, 1600 / Math.max(img.width, img.height));
+    const c = document.createElement("canvas");
+    c.width = Math.round(img.width * scale); c.height = Math.round(img.height * scale);
+    c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
+    const blob = await new Promise(r => c.toBlob(r, "image/jpeg", 0.85));
+    return blob ? new File([blob], "photo.jpg", { type: "image/jpeg" }) : file;
+  } catch { return file; }
+}
+function pickPhotos(onFiles) {
+  const inp = document.createElement("input");
+  inp.type = "file"; inp.accept = "image/*"; inp.multiple = true;
+  inp.onchange = () => onFiles([...inp.files]);
+  inp.click();
+}
+async function uploadPhotos(files, sheetId, pointId) {
+  for (const f of files) {
+    const fd = new FormData();
+    fd.append("file", await shrinkPhoto(f));
+    fd.append("sheet_id", sheetId);
+    if (pointId) fd.append("point_id", pointId);
+    await api("/pla/photos", { method: "POST", body: fd });
+  }
+}
+
+async function renderPlaSheets() {
+  const [sheets, items] = await Promise.all([
+    api(`/pla/sheets?process=${encodeURIComponent(plaState.process)}&all=1`),
+    api(`/pla/items?process=${encodeURIComponent(plaState.process)}`),
+  ]);
+  const shown = sheets.filter(s => plaState.showOldSheets || s.active || s.id === plaState.editSheet);
+  if (!plaState.editSheet || !sheets.some(s => s.id === plaState.editSheet)) plaState.editSheet = (shown[0] || {}).id;
+  const sheet = sheets.find(s => s.id === plaState.editSheet);
+  view.innerHTML = `
+    ${plaHeader("sheets")}
+    <div class="pla-layout">
+      <aside class="pla-eqs card">
+        <select id="ps-select" class="pla-eq-select">${shown.map(s => `<option value="${s.id}" ${s.id === plaState.editSheet ? "selected" : ""}>${h(s.title)}${s.active ? "" : "（使わない）"}</option>`).join("")}</select>
+        <label class="muted ps-old"><input type="checkbox" id="ps-old" ${plaState.showOldSheets ? "checked" : ""}> 使わない表（旧版・撤去）も表示</label>
+        <ul id="pla-eq-list">${shown.map(s => {
+          const unl = s.points.filter(p => !p.items.length).length;
+          return `<li class="${s.id === plaState.editSheet ? "on" : ""} ${s.active ? "" : "old"}" data-s="${s.id}"><span class="pla-eq-name">${h(s.title)}</span><span class="pla-eq-count">${s.points.length}行</span></li>`;
+        }).join("")}</ul>
+        <button class="btn small" id="ps-new" style="margin:8px">＋ チェック表を追加</button>
+      </aside>
+      <section class="pla-main" id="ps-main"></section>
+    </div>`;
+  bindPlaHeader();
+  $("#ps-old").addEventListener("change", e => { plaState.showOldSheets = e.target.checked; router(); });
+  $$("#pla-eq-list li").forEach(li => li.addEventListener("click", () => { plaState.editSheet = +li.dataset.s; router(); }));
+  $("#ps-select").addEventListener("change", e => { plaState.editSheet = +e.target.value; router(); });
+  $("#ps-new").addEventListener("click", async () => {
+    const title = prompt("新しいチェック表の名前");
+    if (!title) return;
+    const r = await api("/pla/sheets", { method: "POST", body: { process: plaState.process, title } });
+    plaState.editSheet = r.id; router();
+  });
+  if (!sheet) { $("#ps-main").innerHTML = `<p class="empty">チェック表がありません</p>`; return; }
+
+  $("#ps-main").innerHTML = `
+    <div class="card ps-head">
+      <div class="form-grid">
+        <label class="field full"><span>チェック表の名前</span><input id="ps-title" value="${h(sheet.title)}"></label>
+        <label class="field"><span>状態</span><select id="ps-active"><option value="1" ${sheet.active ? "selected" : ""}>使う（毎日点検する）</option><option value="0" ${sheet.active ? "" : "selected"}>使わない（旧版・撤去）</option></select></label>
+        <div class="field"><span>元のファイル</span><div class="muted" style="font-size:13px;padding-top:6px">${h(sheet.file || "アプリで作成")}${sheet.sheet_name ? "／" + h(sheet.sheet_name) : ""}</div></div>
+        <label class="field full"><span>改定履歴・メモ</span><textarea id="ps-note" rows="3">${h(sheet.note || "")}</textarea></label>
+      </div>
+      <div style="text-align:right"><button class="btn primary" id="ps-save">保存</button></div>
+    </div>
+    <div class="section-title"><h2>場所の写真</h2><button class="btn small" id="ps-add-place">📷 写真を追加</button></div>
+    <div class="ps-photos">${sheet.photos.map((ph, i) => `<div class="ps-ph"><img src="${photoUrl(ph.file)}" data-i="${i}" alt=""><button class="ps-del" data-ph="${ph.id}" title="この写真を外す">✕</button></div>`).join("") || '<p class="muted">なし（設備全体や場所が分かる写真があると、初めての人でも探しやすくなります）</p>'}</div>
+    <div class="section-title"><h2>点検する行（${sheet.points.length}）</h2></div>
+    <ul class="ps-points">${sheet.points.map((p, n) => `
+      <li class="ps-point ${p.active ? "" : "old"}" data-p="${p.id}">
+        <div class="ps-point-photos">${p.photos.map((ph, i) => `<div class="ps-ph small"><img src="${photoUrl(ph.file)}" data-i="${i}" alt=""><button class="ps-del" data-ph="${ph.id}" title="この写真を外す">✕</button></div>`).join("")}
+          <button class="ps-add-ph" title="写真を追加">📷<br>追加</button></div>
+        <div class="ps-point-body">
+          <div class="form-grid">
+            <label class="field"><span>場所</span><input class="ps-loc" value="${h(p.location || "")}" placeholder="例: 操作BOX"></label>
+            <label class="field"><span>項目<em class="req">*</em></span><textarea class="ps-text" rows="${Math.min(6, (p.item_text.match(/\n/g) || []).length + 1)}">${h(p.item_text)}</textarea></label>
+          </div>
+          <div class="ps-links">${p.items.map(i => `<span class="ps-link">${hazardBadge(i.hazard)}${h(i.item)}</span>`).join("") || '<span class="lv soon">プラリストと未紐づけ</span>'}
+            <button class="btn small ps-link-btn">紐づけを変更</button></div>
+          <div class="ps-actions">
+            <button class="btn small ps-up" ${n === 0 ? "disabled" : ""}>↑</button><button class="btn small ps-down" ${n === sheet.points.length - 1 ? "disabled" : ""}>↓</button>
+            <label class="muted"><input type="checkbox" class="ps-act" ${p.active ? "checked" : ""}> 点検する</label>
+            <button class="btn small danger ps-del-point">行を削除</button>
+          </div>
+        </div>
+      </li>`).join("")}</ul>
+    <div class="card ps-add">
+      <h3>行を追加</h3>
+      <div class="form-grid">
+        <label class="field"><span>場所</span><input id="ps-new-loc"></label>
+        <label class="field"><span>項目<em class="req">*</em></span><textarea id="ps-new-text" rows="2" placeholder="例: 非常停止ボタン(赤)×1"></textarea></label>
+      </div>
+      <div style="text-align:right"><button class="btn primary" id="ps-new-point">追加</button></div>
+    </div>`;
+
+  const reload = () => router();
+  const put = async (url, body, msg) => { try { await api(url, { method: "PUT", body }); if (msg) toast(msg); return true; } catch (ex) { toast(ex.message, 4000); return false; } };
+  $("#ps-save").addEventListener("click", async () => {
+    if (await put(`/pla/sheets/${sheet.id}`, { title: $("#ps-title").value, active: $("#ps-active").value, note: $("#ps-note").value }, "保存しました")) reload();
+  });
+  $("#ps-add-place").addEventListener("click", () => pickPhotos(async fs => { await uploadPhotos(fs, sheet.id, null); toast("写真を追加しました"); reload(); }));
+  $$(".ps-photos img").forEach(img => img.addEventListener("click", () => openLightbox(sheet.photos, +img.dataset.i, sheet.title)));
+  $$("#ps-main .ps-del").forEach(b => b.addEventListener("click", async () => {
+    if (!confirm("この写真を外しますか？")) return;
+    await api(`/pla/photos/${b.dataset.ph}`, { method: "DELETE" }); reload();
+  }));
+  $$(".ps-point").forEach(li => {
+    const p = sheet.points.find(x => x.id == li.dataset.p);
+    li.querySelectorAll(".ps-point-photos img").forEach(img => img.addEventListener("click", () => openLightbox(p.photos, +img.dataset.i, p.item_text)));
+    li.querySelector(".ps-add-ph").addEventListener("click", () => pickPhotos(async fs => { await uploadPhotos(fs, sheet.id, p.id); toast("写真を追加しました"); reload(); }));
+    li.querySelector(".ps-loc").addEventListener("change", e => put(`/pla/points/${p.id}`, { location: e.target.value }, "保存しました"));
+    li.querySelector(".ps-text").addEventListener("change", e => put(`/pla/points/${p.id}`, { item_text: e.target.value }, "保存しました"));
+    li.querySelector(".ps-act").addEventListener("change", async e => { if (await put(`/pla/points/${p.id}`, { active: e.target.checked ? 1 : 0 }, "保存しました")) li.classList.toggle("old", !e.target.checked); });
+    li.querySelector(".ps-up").addEventListener("click", async () => { if (await put(`/pla/points/${p.id}`, { move: "up" })) reload(); });
+    li.querySelector(".ps-down").addEventListener("click", async () => { if (await put(`/pla/points/${p.id}`, { move: "down" })) reload(); });
+    li.querySelector(".ps-del-point").addEventListener("click", async () => {
+      if (!confirm("この行を削除しますか？")) return;
+      try { await api(`/pla/points/${p.id}`, { method: "DELETE" }); reload(); } catch (ex) { toast(ex.message, 4000); }
+    });
+    li.querySelector(".ps-link-btn").addEventListener("click", () => openPlaLink(p, items, reload));
+  });
+  $("#ps-new-point").addEventListener("click", async () => {
+    const text = $("#ps-new-text").value.trim();
+    if (!text) return toast("項目を入れてください");
+    await api("/pla/points", { method: "POST", body: { sheet_id: sheet.id, location: $("#ps-new-loc").value, item_text: text } });
+    toast("行を追加しました"); reload();
+  });
+}
+
+/* チェック表の 1 行に、プラリストのどの行が入っているかを選ぶ */
+function openPlaLink(p, items, done) {
+  const chosen = new Set(p.items.map(i => i.id));
+  // 最初は、すでに紐づいている行の設備（なければ全部）を出す
+  const eqs = [...new Set(p.items.map(i => i.equipment))];
+  openModal("プラリストと紐づけ", `
+    <p style="margin-top:0"><b>${h(p.location || "")}</b> ${h(p.item_text.replace(/\n/g, " "))}</p>
+    <div class="search" style="margin-bottom:8px"><span>🔍</span><input id="lk-q" type="search" placeholder="設備名・箇所で探す" value="${h(eqs[0] || "")}"></div>
+    <div id="lk-list" class="lk-list"></div>
+    <p class="muted" style="font-size:13px" id="lk-count"></p>`, `
+    <button type="button" class="btn" data-close>キャンセル</button><button type="submit" class="btn primary">保存</button>`);
+  const draw = () => {
+    const q = norm($("#lk-q").value).toLowerCase();
+    const list = items.filter(i => i.active && (chosen.has(i.id) || !q || norm(i.equipment + " " + i.item).toLowerCase().includes(q))).slice(0, 300);
+    $("#lk-list").innerHTML = groupBy(list, i => i.equipment).map(([g, l]) => `
+      <div class="lk-group"><b>${h(g)}</b>${l.map(i => `<label><input type="checkbox" value="${i.id}" ${chosen.has(i.id) ? "checked" : ""}> ${hazardBadge(i.hazard)}${h(i.item)}</label>`).join("")}</div>`).join("") || `<p class="empty">見つかりません</p>`;
+    $("#lk-count").textContent = `選んでいる行: ${chosen.size}`;
+    $$("#lk-list input").forEach(c => c.addEventListener("change", () => { c.checked ? chosen.add(+c.value) : chosen.delete(+c.value); $("#lk-count").textContent = `選んでいる行: ${chosen.size}`; }));
+  };
+  let timer;
+  $("#lk-q").addEventListener("input", () => { clearTimeout(timer); timer = setTimeout(draw, 200); });
+  $("#modal-form").onsubmit = async e => {
+    e.preventDefault();
+    await api(`/pla/points/${p.id}`, { method: "PUT", body: { item_ids: [...chosen] } });
+    closeModal(); toast("紐づけを保存しました"); done();
+  };
+  draw();
+}
+
+/* ---------------------------------------------------------------- プラリスト（危害度分析の一覧） */
 async function renderPlaItems() {
   const items = await api(`/pla/items?process=${encodeURIComponent(plaState.process)}`);
   view.innerHTML = `
     ${plaHeader("items")}
     <div class="toolbar">
       <div class="search"><span>🔍</span><input id="pi-q" type="search" placeholder="設備名・箇所・色・材質・備考で絞り込み" value="${h(plaState.q)}"></div>
-      <button class="btn primary lg" id="pi-new">箇所を追加</button>
+      <button class="btn primary lg" id="pi-new">行を追加</button>
     </div>
     <div class="filters">
-      <label><input type="checkbox" id="pi-inactive" ${plaState.showInactive ? "checked" : ""}> 点検しない箇所（撤去・項目から外した）も表示</label>
+      <label><input type="checkbox" id="pi-unlinked" ${plaState.onlyUnlinked ? "checked" : ""}> チェック表にない行だけ（日々の点検なのに、どのチェック表にも入っていない）</label>
+      <label><input type="checkbox" id="pi-inactive" ${plaState.showInactive ? "checked" : ""}> 点検しない行（撤去・項目から外した）も表示</label>
       <span class="muted" id="pi-count"></span>
     </div>
     <div id="pi-body"></div>`;
   const draw = () => {
     const q = norm(plaState.q).toLowerCase();
-    const list = items.filter(i => (plaState.showInactive || i.active) &&
+    const list = items.filter(i => (plaState.showInactive || i.active) && (!plaState.onlyUnlinked || (i.daily && !i.sheets.length)) &&
       (!q || norm([i.equipment, i.item, i.color, i.material, i.material_maker, i.note].join(" ")).toLowerCase().includes(q)));
-    const daily = items.filter(i => i.daily).length;
-    $("#pi-count").textContent = `全 ${items.length} 箇所（日々の点検 ${daily}・点検しない ${items.filter(i => !i.active).length}）／ 表示 ${list.length}`;
+    const unlinked = items.filter(i => i.daily && !i.sheets.length).length;
+    $("#pi-count").textContent = `全 ${items.length} 行（日々の点検 ${items.filter(i => i.daily).length}・うちチェック表にない ${unlinked}）／ 表示 ${list.length}`;
     const groups = groupBy(list, i => i.equipment);
     $("#pi-body").innerHTML = groups.length ? groups.map(([g, l]) => `
       <section class="cat-group">
-        <h2 class="area-title">${h(g)} <span class="g-count">${l.length}箇所</span><button class="btn small pi-add" data-g="${h(g)}" style="margin-left:auto">＋ 箇所</button></h2>
+        <h2 class="area-title">${h(g)} <span class="g-count">${l.length}行</span><button class="btn small pi-add" data-g="${h(g)}" style="margin-left:auto">＋ 行</button></h2>
         <div class="table-wrap"><table class="list responsive"><thead><tr>
-          <th>危害度</th><th>機械・器具</th><th>色</th><th>材質</th><th>点検方法</th><th>頻度</th><th>備考</th>
+          <th>危害度</th><th>機械・器具</th><th>色</th><th>材質</th><th>頻度</th><th>チェック表</th><th>備考</th>
         </tr></thead><tbody>${l.map(i => `
           <tr data-pi="${i.id}" class="${i.active ? "" : "retired"}">
             <td data-label="危害度">${hazardBadge(i.hazard) || '<span class="muted">—</span>'}</td>
-            <td data-label="機械・器具"><strong>${h(i.item)}</strong>${i.active ? "" : ' <span class="lv unknown">点検しない</span>'}${i.is_new ? ' <span class="lv soon">新規</span>' : ""}</td>
+            <td data-label="機械・器具"><strong>${h(i.item)}</strong>${i.active ? "" : ' <span class="lv unknown">点検しない</span>'}</td>
             <td data-label="色">${h(i.color || "")}</td>
             <td data-label="材質">${h([i.material, i.material_pct, i.material_maker].filter(Boolean).join(" ／ "))}</td>
-            <td data-label="点検方法" style="font-size:13px">${h((i.methods || "").replaceAll(",", "、"))}</td>
             <td class="nowrap" data-label="頻度">${h(i.frequency || "")}</td>
+            <td data-label="チェック表">${i.sheets.length ? [...new Map(i.sheets.map(s => [s.sheet_id, s])).values()].map(s => `<a href="#/pla/sheets" class="pi-sheet" data-s="${s.sheet_id}">${h(s.title)}</a>`).join("<br>") : i.daily ? '<span class="lv soon">なし</span>' : ""}</td>
             <td class="clip" data-label="備考">${h(i.note || "")}</td>
           </tr>`).join("")}</tbody></table></div>
-      </section>`).join("") : `<p class="empty">該当する箇所はありません</p>`;
-    $$("#pi-body [data-pi]").forEach(tr => tr.addEventListener("click", () => openPlaItemForm(items.find(i => i.id == tr.dataset.pi), items)));
+      </section>`).join("") : `<p class="empty">該当する行はありません</p>`;
+    $$("#pi-body [data-pi]").forEach(tr => tr.addEventListener("click", e => {
+      if (e.target.closest(".pi-sheet")) return;
+      openPlaItemForm(items.find(i => i.id == tr.dataset.pi), items);
+    }));
+    $$("#pi-body .pi-sheet").forEach(a => a.addEventListener("click", () => { plaState.editSheet = +a.dataset.s; plaState.showOldSheets = false; }));
     $$("#pi-body .pi-add").forEach(b => b.addEventListener("click", e => { e.stopPropagation(); openPlaItemForm(null, items, { equipment: b.dataset.g }); }));
   };
   let timer;
   $("#pi-q").addEventListener("input", e => { clearTimeout(timer); timer = setTimeout(() => { plaState.q = e.target.value; draw(); }, 200); });
   $("#pi-inactive").addEventListener("change", e => { plaState.showInactive = e.target.checked; draw(); });
+  $("#pi-unlinked").addEventListener("change", e => { plaState.onlyUnlinked = e.target.checked; draw(); });
   $("#pi-new").addEventListener("click", () => openPlaItemForm(null, items));
   bindPlaHeader();
   draw();
@@ -1654,7 +1871,7 @@ function openPlaItemForm(it, items, preset = {}) {
   const v = it || { process: plaState.process, active: 1, frequency: "2回/日", methods: "プラリスク点検表", hazard: "C", ...preset };
   const methods = (v.methods || "").split(",").filter(Boolean);
   const eqs = [...new Set(items.map(i => i.equipment))];
-  openModal(it ? "点検箇所の編集" : "点検箇所を追加", `
+  openModal(it ? "プラリストの行を編集" : "プラリストに行を追加", `
     <div class="form-grid">
       <label class="field full"><span>設備名<em class="req">*</em></span><input name="equipment" list="pla-eqs" value="${h(v.equipment || "")}"><datalist id="pla-eqs">${eqs.map(e => `<option value="${h(e)}">`).join("")}</datalist></label>
       <label class="field full"><span>機械・器具（点検箇所）<em class="req">*</em></span><input name="item" value="${h(v.item || "")}" placeholder="例: 非常停止ボタン(赤)×1"></label>
@@ -1664,10 +1881,11 @@ function openPlaItemForm(it, items, preset = {}) {
       <label class="field"><span>％（ぷらしる）</span><input name="material_pct" value="${h(v.material_pct || "")}"></label>
       <label class="field full"><span>材質（メーカー提示）</span><input name="material_maker" value="${h(v.material_maker || "")}"></label>
       <div class="field full"><span>点検方法</span><div class="pla-methods">${plaState.meta.methods.map(mt => `<label><input type="checkbox" name="m" value="${h(mt)}" ${methods.includes(mt) ? "checked" : ""}> ${h(mt)}</label>`).join("")}</div></div>
-      <label class="field"><span>頻度</span><input name="frequency" list="pla-freq" value="${h(v.frequency || "")}"><datalist id="pla-freq"><option value="2回/日"><option value="配合毎"><option value="1時間毎"></datalist><span class="hint">空欄で自主保全基準書だけなら日々の点検には出ません</span></label>
+      <label class="field"><span>頻度</span><input name="frequency" list="pla-freq" value="${h(v.frequency || "")}"><datalist id="pla-freq"><option value="2回/日"><option value="配合毎"><option value="1時間毎"></datalist></label>
       <label class="field"><span>状態</span><select name="active"><option value="1" ${v.active ? "selected" : ""}>点検する</option><option value="0" ${v.active ? "" : "selected"}>点検しない（撤去・項目から外した）</option></select></label>
       <label class="field full"><span>備考（更新記録など）</span><textarea name="note" rows="2">${h(v.note || "")}</textarea></label>
       <label class="field full"><input type="checkbox" name="is_new" ${v.is_new ? "checked" : ""}> 新規</label>
+      ${it?.sheets?.length ? `<div class="field full"><span>入っているチェック表</span><div style="font-size:14px">${[...new Set(it.sheets.map(s => s.title))].map(h).join("、")}</div></div>` : ""}
     </div><p class="err" id="form-err" hidden></p>`, `
     ${it ? `<button type="button" class="btn danger left" id="pi-del">削除</button>` : ""}
     <button type="button" class="btn" data-close>キャンセル</button><button type="submit" class="btn primary">保存</button>`);
@@ -1687,7 +1905,7 @@ function openPlaItemForm(it, items, preset = {}) {
     } catch (ex) { $("#form-err").textContent = ex.message; $("#form-err").hidden = false; }
   };
   $("#pi-del")?.addEventListener("click", async () => {
-    if (!confirm(`「${it.item}」を削除しますか？`)) return;
+    if (!confirm(`「${it.item}」をプラリストから削除しますか？（チェック表との紐づけも外れます）`)) return;
     try { await api(`/pla/items/${it.id}`, { method: "DELETE" }); closeModal(); toast("削除しました"); router(); }
     catch (ex) { $("#form-err").textContent = ex.message; $("#form-err").hidden = false; }
   });

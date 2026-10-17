@@ -150,16 +150,50 @@ CREATE TABLE IF NOT EXISTS pla_items (        -- 点検箇所（プラ樹脂点�
     source TEXT,
     updated_at TEXT
 );
-CREATE TABLE IF NOT EXISTS pla_results (      -- 点検結果（箇所 × 日 × 始業時/終業時）
+CREATE TABLE IF NOT EXISTS pla_sheets (       -- チェック表（紙の「プラスチック部品チェック表」1 枚）
     id INTEGER PRIMARY KEY,
+    process TEXT NOT NULL,
+    file TEXT, sheet_name TEXT,
+    title TEXT NOT NULL,
+    active INTEGER DEFAULT 1,  -- 0 = 古い版・撤去済み（記録のため残す）
+    sort_order INTEGER,
+    note TEXT,                 -- 改定履歴など
+    source TEXT,
+    updated_at TEXT
+);
+CREATE TABLE IF NOT EXISTS pla_points (       -- チェック表の 1 行（点検する箇所）
+    id INTEGER PRIMARY KEY,
+    sheet_id INTEGER NOT NULL REFERENCES pla_sheets(id),
+    location TEXT,             -- 点検箇所（場所）
+    item_text TEXT NOT NULL,   -- 項目
+    sort_order INTEGER,
+    active INTEGER DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS pla_point_items (  -- チェック表の行 ⇔ プラリストの行
+    point_id INTEGER NOT NULL REFERENCES pla_points(id),
     item_id INTEGER NOT NULL REFERENCES pla_items(id),
+    PRIMARY KEY (point_id, item_id)
+);
+CREATE TABLE IF NOT EXISTS pla_photos (       -- 写真（point_id が空ならチェック表全体の「場所の写真」）
+    id INTEGER PRIMARY KEY,
+    sheet_id INTEGER NOT NULL REFERENCES pla_sheets(id),
+    point_id INTEGER REFERENCES pla_points(id),
+    file TEXT NOT NULL,        -- data/pla_photos/ の中のファイル名
+    sort_order INTEGER,
+    caption TEXT,
+    source TEXT,               -- xls / app
+    created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS pla_checks (       -- 点検結果（箇所 × 日 × 始業時/終業時）
+    id INTEGER PRIMARY KEY,
+    point_id INTEGER NOT NULL REFERENCES pla_points(id),
     check_date TEXT NOT NULL,
     timing TEXT NOT NULL,      -- 始業時 / 終業時
     result TEXT NOT NULL,      -- ok / ng / na（稼働なし）
     note TEXT,                 -- 異常の内容
     checked_by TEXT,
     checked_at TEXT,
-    UNIQUE(item_id, check_date, timing)
+    UNIQUE(point_id, check_date, timing)
 );
 CREATE TABLE IF NOT EXISTS pla_reviews (      -- 確認（工程 × 日 × 始業時/終業時 ごとに確認者が見た記録）
     id INTEGER PRIMARY KEY,
@@ -171,7 +205,8 @@ CREATE TABLE IF NOT EXISTS pla_reviews (      -- 確認（工程 × 日 × 始�
     comment TEXT,
     UNIQUE(process, check_date, timing)
 );
-CREATE INDEX IF NOT EXISTS idx_pla_results_date ON pla_results(check_date);
+CREATE INDEX IF NOT EXISTS idx_pla_checks_date ON pla_checks(check_date);
+CREATE INDEX IF NOT EXISTS idx_pla_points_sheet ON pla_points(sheet_id);
 
 CREATE INDEX IF NOT EXISTS idx_records_eq ON records(equipment_id);
 CREATE INDEX IF NOT EXISTS idx_records_date ON records(done_date);
@@ -245,6 +280,10 @@ def init_db(conn):
     for col in ("source_file", "nickname", "category"):
         if col not in cols:
             conn.execute(f"ALTER TABLE equipment ADD COLUMN {col} TEXT")
+    # 箇所ごとの点検結果（pla_results）はチェック表ごと（pla_checks）に置き換えた。記録がなければ消す
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'pla_results'").fetchone():
+        if not conn.execute("SELECT 1 FROM pla_results LIMIT 1").fetchone():
+            conn.execute("DROP TABLE pla_results")
     for table in ("parts", "part_catalog"):
         if "location" not in {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN location TEXT")  # 保管場所

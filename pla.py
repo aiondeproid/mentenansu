@@ -11,18 +11,13 @@
 import argparse
 import datetime as dt
 import glob
-import io
 import os
 import re
 
 import xlrd
-from openpyxl import Workbook
-from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-from openpyxl.utils import get_column_letter
 
 from db import connect, init_db, norm
 
-TIMINGS = ["始業時", "終業時"]
 HAZARDS = ["A", "B", "C", "D"]
 # 日々の点検に入る点検方法（自主保全基準書は年次）
 DAILY_METHODS = ["配合チェック表", "他記録", "始業前点検表", "プラリスク点検表", "洗浄殺菌記録", "タレ記録表", "ライン上部点検表"]
@@ -160,10 +155,10 @@ def import_list(conn, path, replace=False):
     if conn.execute("SELECT 1 FROM pla_items WHERE source = ?", (source,)).fetchone():
         if not replace:
             raise SystemExit(f"{source} は取り込み済みです。入れ直すときは --replace を付けてください。")
-        # 点検記録のある箇所は消さずに停止中にする（記録を残すため）
+        # チェック表と紐づいている行は消さずに「点検しない」にする（つながりを残すため）
         conn.execute("""UPDATE pla_items SET active = 0 WHERE source = ?
-                        AND id IN (SELECT item_id FROM pla_results)""", (source,))
-        conn.execute("DELETE FROM pla_items WHERE source = ? AND id NOT IN (SELECT item_id FROM pla_results)", (source,))
+                        AND id IN (SELECT item_id FROM pla_point_items)""", (source,))
+        conn.execute("DELETE FROM pla_items WHERE source = ? AND id NOT IN (SELECT item_id FROM pla_point_items)", (source,))
     now = dt.datetime.now().isoformat(timespec="seconds")
     keys = ["process", "equipment", "item", "color", "material", "material_pct", "material_maker", "hazard", "methods",
             "is_new", "frequency", "severity", "possibility", "evaluation", "note", "active", "sort_order"]
@@ -180,113 +175,6 @@ def is_daily(item):
         return False
     methods = (item["methods"] or "").split(",")
     return bool(item["frequency"]) or any(m in DAILY_METHODS for m in methods)
-
-
-# ---------------------------------------------------------------- 点検記録の Excel（月ごと。紙の点検表と同じ形）
-THIN = Side(style="thin", color="999999")
-BOX = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
-
-
-def export_month(conn, process, ym):
-    """設備・箇所 × 日付（始・終）の表。○ / × と、× の内容は別シートに出す。"""
-    first = dt.date.fromisoformat(ym + "-01")
-    last = (first.replace(day=28) + dt.timedelta(days=4)).replace(day=1) - dt.timedelta(days=1)
-    items = [dict(r) for r in conn.execute(
-        "SELECT * FROM pla_items WHERE process = ? ORDER BY sort_order, id", (process,))]
-    items = [i for i in items if is_daily(i)]
-    res = {(r["item_id"], r["check_date"], r["timing"]): dict(r) for r in conn.execute(
-        """SELECT r.* FROM pla_results r JOIN pla_items i ON i.id = r.item_id
-           WHERE i.process = ? AND r.check_date BETWEEN ? AND ?""", (process, first.isoformat(), last.isoformat()))}
-    reviews = {(r["check_date"], r["timing"]): dict(r) for r in conn.execute(
-        "SELECT * FROM pla_reviews WHERE process = ? AND check_date BETWEEN ? AND ?",
-        (process, first.isoformat(), last.isoformat()))}
-    days = [first + dt.timedelta(days=i) for i in range((last - first).days + 1)]
-
-    wb = Workbook()
-    ws = wb.active
-    ws.title = f"{first.month}月"
-    ws.append([f"プラ・樹脂箇所 点検記録　{process}　{first.year}年{first.month}月"])
-    ws["A1"].font = Font(bold=True, size=14)
-    ws.append([])
-    head1 = ["設備名", "点検箇所", "危害度"] + sum(([f"{d.day}", ""] for d in days), [])
-    head2 = ["", "", ""] + ["始", "終"] * len(days)
-    ws.append(head1)
-    ws.append(head2)
-    for i in range(len(days)):
-        c = 4 + i * 2
-        ws.merge_cells(start_row=3, start_column=c, end_row=3, end_column=c + 1)
-    for c in (1, 2, 3):
-        ws.merge_cells(start_row=3, start_column=c, end_row=4, end_column=c)
-    fill_head = PatternFill("solid", fgColor="B5001F")
-    fill_sun = PatternFill("solid", fgColor="FDECEA")
-    fill_ng = PatternFill("solid", fgColor="F8C9C9")
-    for row in ws.iter_rows(min_row=3, max_row=4):
-        for cell in row:
-            cell.fill, cell.font, cell.border = fill_head, Font(bold=True, color="FFFFFF"), BOX
-            cell.alignment = Alignment(horizontal="center", vertical="center")
-    prev = None
-    for it in items:
-        row = [it["equipment"] if it["equipment"] != prev else "", it["item"], it["hazard"] or ""]
-        prev = it["equipment"]
-        for d in days:
-            for t in TIMINGS:
-                r = res.get((it["id"], d.isoformat(), t))
-                row.append({"ok": "○", "ng": "×", "na": "－"}.get(r["result"]) if r else "")
-        ws.append(row)
-        for i, cell in enumerate(ws[ws.max_row], start=1):
-            cell.border = BOX
-            if i > 3:
-                cell.alignment = Alignment(horizontal="center")
-                if cell.value == "×":
-                    cell.fill = fill_ng
-                    cell.font = Font(bold=True, color="C62828")
-                elif days[(i - 4) // 2].weekday() == 6:
-                    cell.fill = fill_sun
-    # 点検者・確認者の行
-    for label, key in (("点検者", "checked_by"), ("確認者", "reviewer")):
-        row = ["", label, ""]
-        for d in days:
-            for t in TIMINGS:
-                if key == "reviewer":
-                    rv = reviews.get((d.isoformat(), t))
-                    row.append(rv["reviewer"] if rv else "")
-                else:
-                    names = {r["checked_by"] for (iid, cd, tt), r in res.items() if cd == d.isoformat() and tt == t and r["checked_by"]}
-                    row.append("、".join(sorted(names)))
-        ws.append(row)
-        for i, cell in enumerate(ws[ws.max_row], start=1):
-            cell.border = BOX
-            cell.font = Font(bold=True) if i == 2 else Font(size=8)
-            if i > 3:
-                cell.alignment = Alignment(horizontal="center", vertical="top", wrap_text=True, text_rotation=255)
-    ws.column_dimensions["A"].width = 22
-    ws.column_dimensions["B"].width = 34
-    ws.column_dimensions["C"].width = 6
-    for i in range(len(days) * 2):
-        ws.column_dimensions[get_column_letter(4 + i)].width = 3.2
-    ws.freeze_panes = "D5"
-    ws.page_setup.orientation = "landscape"
-    ws.page_setup.fitToWidth = 1
-    ws.sheet_properties.pageSetUpPr.fitToPage = True
-    ws.page_setup.fitToHeight = 0
-    ws.print_title_rows = "3:4"
-
-    ws2 = wb.create_sheet("異常の内容")
-    ws2.append(["日付", "時", "設備名", "点検箇所", "危害度", "結果", "内容", "点検者", "記入日時"])
-    by_id = {i["id"]: i for i in items}
-    for (iid, cd, t), r in sorted(res.items(), key=lambda x: (x[0][1], x[0][2])):
-        if r["result"] != "ng" or iid not in by_id:
-            continue
-        it = by_id[iid]
-        ws2.append([cd, t, it["equipment"], it["item"], it["hazard"], "×", r["note"], r["checked_by"], r["checked_at"]])
-    for i, w in enumerate((11, 7, 22, 34, 6, 5, 40, 10, 18), start=1):
-        ws2.column_dimensions[get_column_letter(i)].width = w
-    for cell in ws2[1]:
-        cell.fill, cell.font = fill_head, Font(bold=True, color="FFFFFF")
-
-    buf = io.BytesIO()
-    wb.save(buf)
-    return buf.getvalue()
 
 
 if __name__ == "__main__":
