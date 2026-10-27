@@ -637,9 +637,11 @@ function evChip(ev, i) {
   const cls = ["ev", `ev-${key}`, ev.type === "due" ? ev.level : "", late ? "late" : ""].join(" ");
   const eq = ev.equipment_nickname || ev.equipment_name || ev.location || "";
   const drag = ev.type === "planned" || ev.type === "due";
-  const start = ev.start_time ? ev.start_time.replace(/^0(\d)/, "$1") + " " : "";
-  return `<div class="${cls}" data-ev="${i}" ${drag ? 'draggable="true"' : ""} title="${h(`${EV_TYPES[key].label}${late ? "（遅れ）" : ""}：${timeRange(ev)} ${eq} ${ev.title || ""}`)}">
-    <span class="ev-tag">${late ? "遅れ" : EV_TYPES[key].label}</span>${h(start + eq)} <span class="ev-title">${h(ev.title || "")}</span></div>`;
+  const start = ev.start_time ? ev.start_time.replace(/^0(\d)/, "$1") : "";
+  /* 1 段目: 種類・時刻・設備（場所）、2 段目: 作業内容（2 行まで） */
+  return `<div class="${cls}" data-ev="${i}" ${drag ? 'draggable="true"' : ""} title="${h(`${EV_TYPES[key].label}${late ? "（遅れ）" : ""}：${timeRange(ev)} ${eq}\n${ev.title || ""}`)}">
+    <div class="ev-head"><span class="ev-tag">${late ? "遅れ" : EV_TYPES[key].label}</span>${ev.kind === "工事" || ev.kind === "臨時" ? `<span class="ev-kind">${ev.kind}</span>` : ""}${start ? `<span class="ev-time">${start}</span>` : ""}<span class="ev-eq">${h(eq)}</span></div>
+    ${ev.title ? `<div class="ev-title">${h(ev.title)}</div>` : ""}</div>`;
 }
 
 async function drawMonth() {

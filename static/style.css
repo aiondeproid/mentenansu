@@ -542,12 +542,22 @@ details.table-view table { margin-top: 8px; }
 .ev-more { font-size: 11px; color: var(--text-2); padding-left: 4px; }
 
 .ev {
-  display: block; font-size: 12px; line-height: 1.45; padding: 1px 5px; border-radius: 4px; border-left: 3px solid;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text);
+  display: block; font-size: 12px; line-height: 1.4; padding: 2px 5px 3px; border-radius: 4px; border-left: 3px solid;
+  overflow: hidden; color: var(--text);
 }
 .ev[draggable="true"] { cursor: grab; }
 .ev-tag { font-size: 10px; font-weight: 800; margin-right: 4px; }
-.ev-title { color: var(--text-2); }
+/* バッジで狭くなったら設備（場所）は次の行へ回す */
+.ev-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 4px; white-space: nowrap; min-width: 0; }
+.ev-head .ev-tag { margin-right: 0; flex: none; }
+.ev-kind { flex: none; font-size: 10px; font-weight: 700; padding: 0 4px; border-radius: 3px; background: rgba(0,0,0,.08); }
+.ev-time { flex: none; font-weight: 700; font-variant-numeric: tabular-nums; }
+.ev-eq { flex: 1 0 auto; max-width: 100%; font-weight: 700; overflow: hidden; text-overflow: ellipsis; }
+.ev-title {
+  color: var(--text); font-size: 11.5px; overflow-wrap: anywhere;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+.ev-done .ev-title, .ev-projected .ev-title { color: var(--text-2); }
 .ev-planned { background: #e6f0fb; border-color: var(--primary); }
 .ev-planned .ev-tag { color: #14508f; }
 .ev-due.soon { background: var(--lv-soon-bg); border-color: #d89200; }
