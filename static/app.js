@@ -42,6 +42,8 @@ function statusBadge(s) {
 function kindBadge(k) {
   if (k === "定期") return `<span class="kind teiki">定期</span>`;
   if (k === "不定期") return `<span class="kind futeiki">不定期</span>`;
+  if (k === "工事") return `<span class="kind koji">工事</span>`;
+  if (k === "臨時") return `<span class="kind rinji">臨時</span>`;
   return `<span class="muted">—</span>`;
 }
 const LV_LABEL = { over: "⚠ 期限超過", soon: "● まもなく", ok: "✓ 余裕あり", unknown: "？ 基準なし", none: "—" };
@@ -49,12 +51,20 @@ function lvBadge(lv, text) {
   return `<span class="lv ${lv}">${h(text || LV_LABEL[lv])}</span>`;
 }
 function eqLabel(r) {
-  return `${r.equipment_code ? `<span class="code">${h(r.equipment_code)}</span> ` : ""}${h(r.equipment_name)}`;
+  const loc = r.location ? `<span class="loc">場所 ${h(r.location)}</span>` : "";
+  return `${r.equipment_code ? `<span class="code">${h(r.equipment_code)}</span> ` : ""}${h(r.equipment_name)}${r.equipment_name && loc ? " " : ""}${loc}`;
 }
 function dateCell(r) {
   const shown = r.done_date ? fmtDate(r.done_date) : r.date_raw || "日付なし";
   const chip = r.date_uncertain ? `<span class="chip-uncertain" title="元の表記: ${h(r.date_raw)}">要確認</span>` : "";
-  return `${h(shown)}${chip}`;
+  const time = timeRange(r);
+  return `${h(shown)}${time ? ` <span class="time">${h(time)}</span>` : ""}${chip}`;
+}
+/* 工事の時間（9:00〜12:00 / 9:00〜 / 〜12:00） */
+function timeRange(r) {
+  if (!r.start_time && !r.end_time) return "";
+  const t = s => (s ? s.replace(/^0(\d)/, "$1") : "");
+  return `${t(r.start_time)}〜${t(r.end_time)}`;
 }
 function currentUser() {
   return $("#current-user").value.trim();
@@ -77,7 +87,7 @@ document.addEventListener("mousemove", e => {
 const routes = {
   dashboard: ["ダッシュボード", renderDashboard],
   records: ["作業計画/履歴", renderRecords],
-  calendar: ["点検計画", renderCalendar],
+  calendar: ["工事点検計画", renderCalendar],
   plans: ["交換アラート", renderPlans],
   equipment: ["設備台帳", renderEquipment],
   parts: ["部品・研磨管理", renderParts],
@@ -181,7 +191,7 @@ function fileChip(name, size, url, btnAttr, isNew = false) {
 
 function timelineItem(r) {
   return `<li class="${r.kind === "定期" ? "teiki" : r.kind === "不定期" ? "futeiki" : ""}" data-record="${r.id}">
-    <div class="tl-date">${dateCell(r)} ${kindBadge(r.kind)} ${r.equipment_name ? eqLabel(r) : ""}${r.file_count ? ` <span class="rf-count" title="添付ファイル">📎${r.file_count}</span>` : ""}</div>
+    <div class="tl-date">${dateCell(r)} ${kindBadge(r.kind)} ${r.equipment_name || r.location ? eqLabel(r) : ""}${r.file_count ? ` <span class="rf-count" title="添付ファイル">📎${r.file_count}</span>` : ""}</div>
     <div class="tl-title">${h(r.content)}</div>
     ${r.reason ? `<div class="tl-body">${h(r.reason)}</div>` : ""}
   </li>`;
@@ -207,7 +217,7 @@ async function renderRecords() {
     </div>
     <div class="filters">
       <label>設備 <select id="f-eq"><option value="">すべて</option>${equipmentOptions(inArea, q.equipment_id)}</select></label>
-      <label>区分 <select id="f-kind"><option value="">すべて</option><option ${q.kind === "定期" ? "selected" : ""}>定期</option><option ${q.kind === "不定期" ? "selected" : ""}>不定期</option></select></label>
+      <label>区分 <select id="f-kind"><option value="">すべて</option><option ${q.kind === "定期" ? "selected" : ""}>定期</option><option ${q.kind === "不定期" ? "selected" : ""}>不定期</option><option ${q.kind === "臨時" ? "selected" : ""}>臨時</option><option ${q.kind === "工事" ? "selected" : ""}>工事</option></select></label>
       <label>作業状況 <select id="f-status"><option value="">すべて</option><option value="${statuses.filter(s => s !== "完了").join(",")}" ${q.status && q.status !== "完了" ? "selected" : ""}>未完了のみ</option>${statuses.map(s => `<option ${q.status === s ? "selected" : ""}>${s}</option>`).join("")}</select></label>
       <label>期間 <input type="date" id="f-from" value="${h(q.from || "")}">〜<input type="date" id="f-to" value="${h(q.to || "")}"></label>
       <label><input type="checkbox" id="f-uncertain" ${q.uncertain === "1" ? "checked" : ""}>日付要確認のみ</label>
@@ -272,16 +282,25 @@ async function openRecordForm(id, preset = {}) {
     kind: "不定期", status: "完了", done_date: state.meta.today, author: currentUser(), ...preset,
   };
   const eqOptions = equipmentOptions(e => (e.status !== "廃止" && inArea(e)) || e.id == rec.equipment_id, rec.equipment_id);
+  /* 工事は設備に限らない（建屋・配管など）。設備は任意にして場所を入れられるようにする */
+  const koji = rec.kind === "工事";
   const body = `
     <div class="form-grid">
-      <label class="field full"><span>設備<em class="req">*</em></span><select name="equipment_id" required><option value="">選択してください</option>${eqOptions}</select></label>
-      <div class="field"><span>区分</span><div class="seg">
+      <div class="field full"><span>設備<em class="req" id="eq-req">*</em></span>
+        <div class="eq-row"><select name="equipment_id"><option value="">選択してください</option>${eqOptions}</select>
+          <button type="button" class="btn koji-toggle" id="koji-toggle" aria-pressed="${koji}">工事</button></div></div>
+      <label class="field full" id="loc-field"><span>場所<em class="req">*</em><em class="hint" style="font-weight:400">（設備を選ばない場合）</em></span><input name="location" list="location-list" value="${h(rec.location || "")}" placeholder="例: 2階 前処理室 天井配管"><datalist id="location-list"></datalist></label>
+      <input type="hidden" name="koji" value="${koji ? "1" : ""}">
+      <div class="field" id="kind-field"><span>区分</span><div class="seg">
         <label><input type="radio" name="kind" value="定期" ${rec.kind === "定期" ? "checked" : ""}>定期</label>
         <label><input type="radio" name="kind" value="不定期" ${rec.kind === "不定期" ? "checked" : ""}>不定期（故障）</label>
+        <label><input type="radio" name="kind" value="臨時" ${rec.kind === "臨時" ? "checked" : ""}>臨時</label>
       </div></div>
       <label class="field"><span>作業状況</span><select name="status">${state.meta.record_statuses.map(s => `<option ${rec.status === s ? "selected" : ""}>${s}</option>`).join("")}</select></label>
       <label class="field"><span>実施日<em class="hint" style="font-weight:400">（未完了なら予定日）</em></span><input type="date" name="done_date" value="${h(rec.done_date || "")}">
         ${rec.date_uncertain ? `<span class="hint">⚠ 元の表記「${h(rec.date_raw)}」。正しい日付を入れると要確認が外れます</span>` : ""}</label>
+      <div class="field" id="time-field"><span>時間</span>
+        <div class="time-row"><input type="time" name="start_time" value="${h(rec.start_time || "")}" aria-label="開始時刻">〜<input type="time" name="end_time" value="${h(rec.end_time || "")}" aria-label="終了時刻"></div></div>
       <label class="field"><span>記入者</span><input name="author" list="author-list" value="${h(rec.author || "")}"></label>
       <label class="field full"><span>実施内容<em class="req">*</em></span><textarea name="content" rows="2" required>${h(rec.content || "")}</textarea></label>
       <label class="field full"><span>実施の理由・状況</span><textarea name="reason" rows="3">${h(rec.reason || "")}</textarea></label>
@@ -319,6 +338,23 @@ async function openRecordForm(id, preset = {}) {
   form.equipment_id.addEventListener("change", fillEqLinked);
   await fillEqLinked();
 
+  const setKoji = on => {
+    form.koji.value = on ? "1" : "";
+    $("#koji-toggle").setAttribute("aria-pressed", on);
+    $("#eq-req").hidden = on;
+    $("#loc-field").hidden = !on;
+    $("#time-field").hidden = !on;
+    $("#kind-field").hidden = on;
+  };
+  $("#koji-toggle").addEventListener("click", () => {
+    setKoji(!form.koji.value);
+    if (form.koji.value) form.location.focus();
+  });
+  setKoji(koji);
+  api("/records/locations").then(locs => {
+    $("#location-list").innerHTML = locs.map(l => `<option value="${h(l)}">`).join("");
+  }).catch(() => { /* 候補は補助なので無視 */ });
+
   /* 添付ファイル: 登録済みはすぐ外せる。新しく選んだものは保存のときに送る */
   const savedFiles = rec.files || [];
   let pending = [];
@@ -354,10 +390,16 @@ async function openRecordForm(id, preset = {}) {
   form.onsubmit = async e => {
     e.preventDefault();
     const data = Object.fromEntries(new FormData(form));
-    data.kind = data.kind || null;
+    const isKoji = !!data.koji;
+    delete data.koji;
+    data.kind = isKoji ? "工事" : data.kind || null;
+    if (!isKoji) data.location = data.start_time = data.end_time = "";
     const err = $("#form-err");
-    if (!data.equipment_id || !data.content.trim()) {
-      err.textContent = "設備と実施内容は必須です";
+    const msg = !data.content.trim() ? "実施内容は必須です"
+      : isKoji ? (!data.equipment_id && !data.location.trim() ? "工事は設備か場所のどちらかを入力してください" : "")
+      : !data.equipment_id ? "設備と実施内容は必須です" : "";
+    if (msg) {
+      err.textContent = msg;
       err.hidden = false;
       return;
     }
@@ -499,7 +541,7 @@ async function openRuleForm(rule, preset = {}) {
   });
 }
 
-/* ================================================================ 点検計画（カレンダー） */
+/* ================================================================ 工事点検計画（カレンダー） */
 const pad2 = n => String(n).padStart(2, "0");
 const isoDate = d => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
 const parseISO = s => { const [y, m, d] = s.split("-").map(Number); return new Date(y, m - 1, d); };
@@ -593,10 +635,11 @@ function evChip(ev, i) {
   const key = evKey(ev);
   const late = ev.type === "planned" && ev.date < state.meta.today;
   const cls = ["ev", `ev-${key}`, ev.type === "due" ? ev.level : "", late ? "late" : ""].join(" ");
-  const eq = ev.equipment_nickname || ev.equipment_name || "";
+  const eq = ev.equipment_nickname || ev.equipment_name || ev.location || "";
   const drag = ev.type === "planned" || ev.type === "due";
-  return `<div class="${cls}" data-ev="${i}" ${drag ? 'draggable="true"' : ""} title="${h(`${EV_TYPES[key].label}${late ? "（遅れ）" : ""}：${eq} ${ev.title || ""}`)}">
-    <span class="ev-tag">${late ? "遅れ" : EV_TYPES[key].label}</span>${h(eq)} <span class="ev-title">${h(ev.title || "")}</span></div>`;
+  const start = ev.start_time ? ev.start_time.replace(/^0(\d)/, "$1") + " " : "";
+  return `<div class="${cls}" data-ev="${i}" ${drag ? 'draggable="true"' : ""} title="${h(`${EV_TYPES[key].label}${late ? "（遅れ）" : ""}：${timeRange(ev)} ${eq} ${ev.title || ""}`)}">
+    <span class="ev-tag">${late ? "遅れ" : EV_TYPES[key].label}</span>${h(start + eq)} <span class="ev-title">${h(ev.title || "")}</span></div>`;
 }
 
 async function drawMonth() {
@@ -728,8 +771,8 @@ function dayItem(ev) {
   return `<li class="day-item">
     <div class="day-head"><span class="ev ev-${key} ${ev.type === "due" ? ev.level : ""} ${late ? "late" : ""} legend-chip"><span class="ev-tag">${late ? "遅れ" : EV_TYPES[key].label}</span></span>
       ${ev.type === "planned" && ev.status !== "未着手" ? statusBadge(ev.status) : ""}</div>
-    <div class="day-eq">${eqLabel({ equipment_code: ev.equipment_code, equipment_name: ev.equipment_nickname || ev.equipment_name })}</div>
-    <div class="day-title">${h(ev.title || "")}</div>
+    <div class="day-eq">${ev.kind === "工事" || ev.kind === "臨時" ? kindBadge(ev.kind) + " " : ""}${eqLabel({ equipment_code: ev.equipment_code, equipment_name: ev.equipment_nickname || ev.equipment_name, location: ev.location })}</div>
+    <div class="day-title">${timeRange(ev) ? `<span class="time">${h(timeRange(ev))}</span> ` : ""}${h(ev.title || "")}</div>
     ${ev.type === "projected" ? `<div class="muted" style="font-size:12px">${ev.interval_days}日ごと。前回の実施日によって前後します</div>` : ""}
     ${ev.author ? `<div class="muted" style="font-size:12px">記入者 ${h(ev.author)}</div>` : ""}
     <div class="day-actions">${actions}</div>

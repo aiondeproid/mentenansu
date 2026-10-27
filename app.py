@@ -113,10 +113,15 @@ def part_state(part):
     return "ok"
 
 
-def area_filter(alias="e"):
-    """?area=前処理 のようなエリア指定を SQL 条件にする。"""
+def area_filter(alias="e", keep_no_equipment=False):
+    """?area=前処理 のようなエリア指定を SQL 条件にする。
+
+    keep_no_equipment: 設備のない記録（場所だけの工事）はエリアが決まらないので、どのエリアでも出す。
+    """
     area = request.args.get("area") if has_request_context() else None  # 通知バッチからも呼ばれる
     if area:
+        if keep_no_equipment:
+            return f" AND ({alias}.area = ? OR {alias}.id IS NULL)", [area]
         return f" AND {alias}.area = ?", [area]
     return "", []
 
@@ -285,11 +290,11 @@ def query_records(conn, args):
     sql = """SELECT r.*, e.name AS equipment_name, e.code AS equipment_code, ru.title AS rule_title,
                     (SELECT COUNT(*) FROM record_files f WHERE f.record_id = r.id) AS file_count,
                     (SELECT GROUP_CONCAT(f.name, ' ') FROM record_files f WHERE f.record_id = r.id) AS file_names
-             FROM records r JOIN equipment e ON e.id = r.equipment_id
+             FROM records r LEFT JOIN equipment e ON e.id = r.equipment_id
              LEFT JOIN rules ru ON ru.id = r.rule_id WHERE 1=1"""
     params = []
     if args.get("area"):
-        sql += " AND e.area = ?"
+        sql += " AND (e.area = ? OR e.id IS NULL)"
         params.append(args["area"])
     if args.get("equipment_id"):
         sql += " AND r.equipment_id = ?"
@@ -311,8 +316,8 @@ def query_records(conn, args):
         params.append(args["to"])
     for word in norm(args.get("q", "")).split():
         sql += """ AND (r.content LIKE ? OR r.reason LIKE ? OR r.result LIKE ? OR r.countermeasure LIKE ?
-                       OR r.author LIKE ? OR e.name LIKE ? OR e.code LIKE ? OR r.part_serial LIKE ?)"""
-        params += [f"%{word}%"] * 8
+                       OR r.author LIKE ? OR e.name LIKE ? OR e.code LIKE ? OR r.part_serial LIKE ? OR r.location LIKE ?)"""
+        params += [f"%{word}%"] * 9
     sort = args.get("sort", "done_date")
     if sort not in ("done_date", "equipment_code", "status", "kind", "downtime_min", "author"):
         sort = "done_date"
@@ -329,11 +334,12 @@ def records_list():
 @app.get("/api/records.csv")
 def records_csv():
     recs = query_records(db(), request.args)
-    cols = [("equipment_code", "設備No"), ("equipment_name", "設備名"), ("kind", "定期/不定期"),
+    cols = [("equipment_code", "設備No"), ("equipment_name", "設備名"), ("location", "場所"), ("kind", "区分"),
             ("status", "作業状況"), ("done_date", "実施日"), ("date_raw", "実施日(元表記)"),
             ("downtime_min", "停止・修理時間(分)"), ("hour_meter", "稼働時間(h)"), ("content", "実施内容"),
             ("reason", "実施の理由"), ("result", "実施の結果"), ("countermeasure", "備考(今後の対策)"),
-            ("author", "記入者"), ("cost", "費用(円)"), ("part_serial", "部品シリアル")]
+            ("author", "記入者"), ("cost", "費用(円)"), ("part_serial", "部品シリアル"),
+            ("start_time", "開始時刻"), ("end_time", "終了時刻")]
     buf = io.StringIO()
     w = csv.writer(buf)
     w.writerow([c[1] for c in cols])
@@ -341,6 +347,13 @@ def records_csv():
         w.writerow([r.get(c[0]) if r.get(c[0]) is not None else "" for c in cols])
     return Response("﻿" + buf.getvalue(), mimetype="text/csv",
                     headers={"Content-Disposition": "attachment; filename=maintenance_records.csv"})
+
+
+@app.get("/api/records/locations")
+def record_locations():
+    """工事の場所の入力候補（よく使う順）。"""
+    return jsonify([r["location"] for r in db().execute(
+        "SELECT location FROM records WHERE location IS NOT NULL GROUP BY location ORDER BY COUNT(*) DESC LIMIT 200")])
 
 
 @app.get("/api/records/<int:rec_id>")
@@ -354,7 +367,8 @@ def record_get(rec_id):
 
 
 REC_FIELDS = ["equipment_id", "kind", "status", "done_date", "downtime_min", "hour_meter", "content",
-              "reason", "result", "countermeasure", "author", "cost", "part_serial", "rule_id"]
+              "reason", "result", "countermeasure", "author", "cost", "part_serial", "rule_id", "location",
+              "start_time", "end_time"]
 
 
 def clean_record(d):
@@ -367,9 +381,23 @@ def clean_record(d):
     if v.get("done_date"):
         dt.date.fromisoformat(v["done_date"])  # 形式チェック
         v["date_uncertain"] = 0
+    for f in ("start_time", "end_time"):
+        if v.get(f):
+            v[f] = dt.time.fromisoformat(v[f]).strftime("%H:%M")  # 形式チェック（秒は捨てる）
     if v.get("part_serial"):
         v["part_serial"] = norm(v["part_serial"]).upper()
     return v
+
+
+def check_record_target(v):
+    """設備は必須。ただし工事は設備の代わりに場所でもよい。"""
+    if not v.get("content"):
+        abort(400, "実施内容は必須です")
+    if v.get("kind") == "工事":
+        if not v.get("equipment_id") and not v.get("location"):
+            abort(400, "工事は設備か場所のどちらかを入力してください")
+    elif not v.get("equipment_id"):
+        abort(400, "設備と実施内容は必須です")
 
 
 def after_record_saved(conn, rec_id, v):
@@ -401,8 +429,7 @@ def record_create():
         v = clean_record(body())
     except ValueError as e:
         abort(400, f"入力値が不正です: {e}")
-    if not v.get("equipment_id") or not v.get("content"):
-        abort(400, "設備と実施内容は必須です")
+    check_record_target(v)
     v.setdefault("status", "完了")
     v["source"] = "app"
     conn = db()
@@ -422,9 +449,11 @@ def record_update(rec_id):
     old = conn.execute("SELECT * FROM records WHERE id=?", (rec_id,)).fetchone()
     if not old:
         abort(404)
+    merged = dict(old) | v
+    if {"kind", "equipment_id", "location", "content"} & v.keys():
+        check_record_target(merged)
     v["updated_at"] = dt.datetime.now().isoformat(timespec="seconds")
     conn.execute(f"UPDATE records SET {', '.join(k + '=?' for k in v)} WHERE id=?", list(v.values()) + [rec_id])
-    merged = dict(old) | v
     after_record_saved(conn, rec_id, merged)
     conn.commit()
     return jsonify(ok=True)
@@ -546,7 +575,7 @@ def rule_delete(rule_id):
     return jsonify(ok=True)
 
 
-# ---------------------------------------------------------------- 点検計画（カレンダー）
+# ---------------------------------------------------------------- 工事点検計画（カレンダー）
 SCHEDULE_MAX_DAYS = 400
 
 
@@ -566,18 +595,19 @@ def schedule():
     if not start <= end or (end - start).days > SCHEDULE_MAX_DAYS:
         abort(400, f"期間は {SCHEDULE_MAX_DAYS} 日以内で指定してください")
     conn = db()
-    cond, args = area_filter()
+    cond, args = area_filter(keep_no_equipment=True)
     rules = load_rules(conn)
     s, e = start.isoformat(), end.isoformat()
 
     eq_cols = "e.name AS equipment_name, e.nickname AS equipment_nickname, e.code AS equipment_code, e.area"
+    rec_cols = "r.id, r.equipment_id, r.rule_id, r.kind, r.status, r.done_date, r.content, r.author, r.location, r.start_time, r.end_time"
     open_recs = rows(conn.execute(
-        f"""SELECT r.id, r.equipment_id, r.rule_id, r.kind, r.status, r.done_date, r.content, r.author, {eq_cols}
-            FROM records r JOIN equipment e ON e.id = r.equipment_id
+        f"""SELECT {rec_cols}, {eq_cols}
+            FROM records r LEFT JOIN equipment e ON e.id = r.equipment_id
             WHERE r.status != '完了' AND r.done_date IS NOT NULL""" + cond + " ORDER BY r.done_date", args))
     done_recs = rows(conn.execute(
-        f"""SELECT r.id, r.equipment_id, r.rule_id, r.kind, r.status, r.done_date, r.content, r.author, {eq_cols}
-            FROM records r JOIN equipment e ON e.id = r.equipment_id
+        f"""SELECT {rec_cols}, {eq_cols}
+            FROM records r LEFT JOIN equipment e ON e.id = r.equipment_id
             WHERE r.status = '完了' AND r.done_date BETWEEN ? AND ?""" + cond + " ORDER BY r.done_date",
         [s, e] + args))
 
@@ -614,7 +644,8 @@ def schedule():
             nxt += step
 
     order = {"planned": 0, "due": 1, "projected": 2, "done": 3}
-    events.sort(key=lambda x: (x["date"], order[x["type"]], x.get("equipment_code") or "", x["title"] or ""))
+    events.sort(key=lambda x: (x["date"], order[x["type"]], x.get("start_time") or "", x.get("equipment_code") or "",
+                               x["title"] or ""))
     overdue.sort(key=lambda x: (x["due_date"] or "", x["equipment_code"] or ""))
     return jsonify(events=events, overdue=overdue, hours_only=hours_only, today=today().isoformat(),
                    rules=[{k: r[k] for k in ("id", "equipment_id", "equipment_name", "equipment_nickname", "equipment_code",
@@ -1180,14 +1211,15 @@ def dashboard():
     parts = [dict(p) | {"level": part_state(p)} for p in conn.execute(
         "SELECT p.*, e.name AS equipment_name FROM parts p LEFT JOIN equipment e ON e.id = p.equipment_id"
         + (" WHERE e.area = ?" if args else ""), args)]
+    rcond, rargs = area_filter(keep_no_equipment=True)
     open_records = rows(conn.execute(
         """SELECT r.*, e.name AS equipment_name, e.code AS equipment_code FROM records r
-           JOIN equipment e ON e.id = r.equipment_id WHERE r.status != '完了'""" + cond + """
-           ORDER BY r.done_date DESC""", args))
+           LEFT JOIN equipment e ON e.id = r.equipment_id WHERE r.status != '完了'""" + rcond + """
+           ORDER BY r.done_date DESC""", rargs))
     recent = rows(conn.execute(
         """SELECT r.*, e.name AS equipment_name, e.code AS equipment_code FROM records r
-           JOIN equipment e ON e.id = r.equipment_id WHERE r.done_date IS NOT NULL""" + cond + """
-           ORDER BY r.done_date DESC, r.id DESC LIMIT 8""", args))
+           LEFT JOIN equipment e ON e.id = r.equipment_id WHERE r.done_date IS NOT NULL""" + rcond + """
+           ORDER BY r.done_date DESC, r.id DESC LIMIT 8""", rargs))
     uncertain = conn.execute(
         "SELECT COUNT(*) FROM records r JOIN equipment e ON e.id = r.equipment_id WHERE r.date_uncertain=1" + cond,
         args).fetchone()[0]

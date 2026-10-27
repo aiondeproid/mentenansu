@@ -7,6 +7,31 @@ import unicodedata
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.environ.get("MAINT_DB", os.path.join(BASE_DIR, "data", "maintenance.db"))
 
+# 作業履歴（Excel の 1 行 = 1 レコード）。工事は設備なしで場所だけのこともある
+RECORDS_COLUMNS = """(
+    id INTEGER PRIMARY KEY,
+    equipment_id INTEGER REFERENCES equipment(id),
+    kind TEXT,                 -- 定期 / 不定期 / 臨時 / 工事
+    status TEXT DEFAULT '完了',
+    done_date TEXT,            -- YYYY-MM-DD（不明なら NULL）
+    date_raw TEXT,             -- 取り込み元の表記
+    date_uncertain INTEGER DEFAULT 0,
+    downtime_min INTEGER,      -- ライン停止時間（分）
+    downtime_raw TEXT,
+    hour_meter REAL,           -- 部品・設備の稼働時間（h）
+    content TEXT, reason TEXT, result TEXT, countermeasure TEXT,
+    author TEXT,
+    cost INTEGER,              -- 費用（円）
+    part_serial TEXT,
+    rule_id INTEGER REFERENCES rules(id),
+    source TEXT,               -- 'xls' / 'app'
+    created_at TEXT DEFAULT (datetime('now','localtime')),
+    updated_at TEXT,
+    location TEXT,             -- 工事の場所
+    start_time TEXT,           -- 工事の開始時刻（HH:MM）
+    end_time TEXT              -- 工事の終了時刻（HH:MM）
+)"""
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS vendors (
     id INTEGER PRIMARY KEY,
@@ -37,27 +62,7 @@ CREATE TABLE IF NOT EXISTS equipment (
     category TEXT              -- 種類（成型・包装など。台帳のグループ分けに使う）
 );
 
--- 作業履歴（Excel の 1 行 = 1 レコード）
-CREATE TABLE IF NOT EXISTS records (
-    id INTEGER PRIMARY KEY,
-    equipment_id INTEGER NOT NULL REFERENCES equipment(id),
-    kind TEXT,                 -- 定期 / 不定期
-    status TEXT DEFAULT '完了',
-    done_date TEXT,            -- YYYY-MM-DD（不明なら NULL）
-    date_raw TEXT,             -- 取り込み元の表記
-    date_uncertain INTEGER DEFAULT 0,
-    downtime_min INTEGER,      -- ライン停止時間（分）
-    downtime_raw TEXT,
-    hour_meter REAL,           -- 部品・設備の稼働時間（h）
-    content TEXT, reason TEXT, result TEXT, countermeasure TEXT,
-    author TEXT,
-    cost INTEGER,              -- 費用（円）
-    part_serial TEXT,
-    rule_id INTEGER REFERENCES rules(id),
-    source TEXT,               -- 'xls' / 'app'
-    created_at TEXT DEFAULT (datetime('now','localtime')),
-    updated_at TEXT
-);
+CREATE TABLE IF NOT EXISTS records """ + RECORDS_COLUMNS + """;
 
 -- 定期交換・点検ルール（作業計画）
 CREATE TABLE IF NOT EXISTS rules (
@@ -236,7 +241,10 @@ def connect(path=None):
 
 # 設備の種類（上から順に判定。台帳でもこの順に並べる）
 CATEGORY_RULES = [
-    ("検査機（X線・金検）", r"X線|金検|ウェイト"),
+    # 検査室の機器は「冷蔵庫」「殺菌」などほかの種類の言葉も含むので先に判定する
+    ("細菌検査", r"細菌|微生物|培養|培地|インキュベーター|孵卵器|ふ卵器|クリーンベンチ|オートクレーブ|ATP"),
+    ("検査機（X線・金検）", r"X線|金検|ウェイト"),  # 「品管金検」は検査機
+    ("品質管理", r"品質|品管|糖度計|塩分計|水分計|色差計|粘度計|pH計"),
     ("冷凍・冷蔵・解凍", r"フリーザー|予冷|冷蔵|冷凍|解凍|製氷"),
     ("成型", r"成型|包餡|包あん|丸目|ハントマン|メガフォーマ|ロトフォーム"),
     ("包装・充填・計数", r"包装|ムルチ|ポリスター|封函|カートン|計数|インクジェット|印字|充填"),
@@ -253,7 +261,7 @@ CATEGORY_RULES = [
 # 台帳での表示順（工程の流れ → 検査・搬送 → 付帯設備）
 CATEGORIES = [
     "切断・粉砕", "配合・混合", "成型", "加熱・殺菌", "冷凍・冷蔵・解凍", "包装・充填・計数",
-    "検査機（X線・金検）", "搬送", "洗浄", "ボイラー・蒸気", "給水・圧縮空気", "空調・換気", "排水処理", "その他",
+    "検査機（X線・金検）", "細菌検査", "品質管理", "搬送", "洗浄", "ボイラー・蒸気", "給水・圧縮空気", "空調・換気", "排水処理", "その他",
 ]
 assert set(CATEGORIES) == {c for c, _ in CATEGORY_RULES} | {"その他"}
 
@@ -284,9 +292,37 @@ def make_nickname(sheet_name, name):
     return nick
 
 
+def migrate_records(conn):
+    """records を設備なし（工事）でも入る形に作り直す。SQLite は NOT NULL を外せないのでコピーして入れ替える。"""
+    cols = {r["name"]: r for r in conn.execute("PRAGMA table_info(records)")}
+    if not cols["equipment_id"]["notnull"] and "location" in cols:
+        return
+    names = ", ".join(cols)
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys = OFF")  # 添付・部品履歴が records を参照しているため
+    try:
+        conn.execute("BEGIN")
+        conn.execute("CREATE TABLE records_new " + RECORDS_COLUMNS)
+        conn.execute(f"INSERT INTO records_new ({names}) SELECT {names} FROM records")
+        conn.execute("DROP TABLE records")
+        conn.execute("ALTER TABLE records_new RENAME TO records")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.execute("PRAGMA foreign_keys = ON")
+    conn.executescript(SCHEMA)  # 消えた索引を作り直す
+
+
 def init_db(conn):
     conn.executescript(SCHEMA)
+    migrate_records(conn)
     # 既存 DB への列追加（取り込み済みデータは残したまま）
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(records)")}
+    for col in ("start_time", "end_time"):
+        if col not in cols:
+            conn.execute(f"ALTER TABLE records ADD COLUMN {col} TEXT")
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(equipment)")}
     for col in ("source_file", "nickname", "category"):
         if col not in cols:

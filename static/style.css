@@ -165,6 +165,9 @@ td.st-cell .status { display: flex; min-height: 44px; border-radius: 0; height: 
 .kind { display: inline-block; font-size: 12px; font-weight: 700; padding: 1px 8px; border-radius: 999px; border: 1px solid; white-space: nowrap; }
 .kind.teiki { color: #1f5fa8; border-color: #9cc0ea; background: #eef5fd; }
 .kind.futeiki { color: #b24714; border-color: #f2b99c; background: #fff2eb; }
+.kind.koji { color: #6b4e16; border-color: #d9c08a; background: #fbf5e6; }
+.kind.rinji { color: #5b3f99; border-color: #c4b2e6; background: #f4f0fb; }
+.loc { color: var(--text-2); }
 .warn-date { color: var(--lv-over); font-weight: 700; }
 .chip-uncertain { display: inline-block; font-size: 11px; font-weight: 700; color: var(--lv-soon); background: var(--lv-soon-bg); border-radius: 4px; padding: 0 6px; margin-left: 4px; }
 .muted { color: var(--muted); }
@@ -272,6 +275,14 @@ dialog#modal::backdrop { background: rgba(0,0,0,.4); }
 }
 .field textarea { min-height: 70px; resize: vertical; }
 .field .hint { font-size: 12px; color: var(--muted); }
+.field[hidden] { display: none; }
+.eq-row { display: flex; gap: 8px; }
+.eq-row select { flex: 1; min-width: 0; }
+.koji-toggle { white-space: nowrap; }
+.time-row { display: flex; align-items: center; gap: 6px; }
+.time-row input { flex: 1; min-width: 0; }
+.time { font-variant-numeric: tabular-nums; color: var(--text-2); white-space: nowrap; }
+.koji-toggle[aria-pressed="true"] { background: #6b4e16; border-color: #6b4e16; color: #fff; }
 .seg { display: inline-flex; border: 1px solid #cfcec9; border-radius: var(--radius); overflow: hidden; }
 .seg label { padding: 8px 16px; cursor: pointer; font-weight: 700; border-right: 1px solid #cfcec9; }
 .seg label:last-child { border-right: 0; }
@@ -500,7 +511,7 @@ details.table-view table { margin-top: 8px; }
 .mail-preview pre { margin: 0; white-space: pre-wrap; font-family: inherit; font-size: 14px; line-height: 1.6; }
 .btn[disabled] { opacity: .5; cursor: not-allowed; }
 
-/* ------------------------------------------------ 点検計画（カレンダー） */
+/* ------------------------------------------------ 工事点検計画（カレンダー） */
 .cal-toolbar .spacer { flex: 1; }
 .cal-nav { display: flex; align-items: center; gap: 8px; }
 .cal-nav strong { font-size: 18px; min-width: 120px; text-align: center; font-variant-numeric: tabular-nums; }
