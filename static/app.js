@@ -1027,7 +1027,7 @@ async function renderEquipmentDetail(id) {
           <dt>納入年月日</dt><dd>${h(eq.delivered)}</dd>
           <dt>メモ</dt><dd>${h(eq.note)}</dd>
         </dl>
-        <div style="margin-top:12px"><button class="btn small" id="edit-eq">設備情報を編集</button></div>
+        <div style="margin-top:12px"><button class="btn small" id="edit-eq">設備情報を編集</button> <button class="btn small" id="copy-eq">この設備をコピー</button></div>
       </div>
       <div class="card">
         <h3>取引業者</h3>
@@ -1083,6 +1083,7 @@ async function renderEquipmentDetail(id) {
     bindRowClicks($("#rec-list"));
   };
   $("#edit-eq").addEventListener("click", () => openEquipmentForm(eq));
+  $("#copy-eq").addEventListener("click", () => openEquipmentForm(null, eq));
   $("#add-rule").addEventListener("click", () => openRuleForm(null, { equipment_id: id }));
   $("#add-rec").addEventListener("click", () => openRecordForm(null, { equipment_id: id }));
   $("#hours-form").addEventListener("submit", async e => {
@@ -1098,11 +1099,15 @@ async function renderEquipmentDetail(id) {
   $("#rec-q")?.addEventListener("input", drawRecs);
 }
 
-async function openEquipmentForm(eq) {
+/* src を渡すとその設備をコピーした内容で「追加」の画面を開く（1台ごとに違う設備No・資産No・製造番号などは空にする） */
+async function openEquipmentForm(eq, src) {
   const vendors = await api("/vendors");
-  const e = eq || { status: "稼働", area: "前処理" };
+  const e = eq || (src ? { ...src, code: "", asset_no: "", serial_no: "", manufactured: "", delivered: "", status: "稼働" }
+    : { status: "稼働", area: "前処理" });
   const f = (name, label, cls = "") => `<label class="field ${cls}"><span>${label}</span><input name="${name}" value="${h(e[name] ?? "")}"></label>`;
-  openModal(eq ? "設備情報の編集" : "設備を追加", `
+  const copyRules = src?.rules?.length
+    ? `<label class="field full"><span><input type="checkbox" name="copy_rules_from" value="${src.id}" checked> 定期交換・点検項目もコピーする（${src.rules.length}件。前回実施日は空になります）</span></label>` : "";
+  openModal(eq ? "設備情報の編集" : src ? `「${eqTitle(src)}」をコピーして追加` : "設備を追加", `
     <div class="form-grid">
       ${f("code", "設備No")}${f("nickname", "通称（現場での呼び名）")}
       ${f("name", "正式名 *", "full")}
@@ -1115,6 +1120,7 @@ async function openEquipmentForm(eq) {
       <label class="field"><span>状態</span><select name="status"><option ${e.status === "稼働" ? "selected" : ""}>稼働</option><option ${e.status === "廃止" ? "selected" : ""}>廃止</option></select></label>
       ${f("area", "エリア")}
       <label class="field full"><span>メモ</span><textarea name="note">${h(e.note || "")}</textarea></label>
+      ${copyRules}
     </div><p class="err" id="form-err" hidden></p>`, `
     <button type="button" class="btn" data-close>キャンセル</button><button type="submit" class="btn primary">保存</button>`);
   const form = $("#modal-form");

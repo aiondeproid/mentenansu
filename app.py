@@ -230,6 +230,12 @@ def equipment_create():
     cur = conn.execute(
         f"INSERT INTO equipment({','.join(EQ_FIELDS)}) VALUES ({','.join('?' * len(EQ_FIELDS))})",
         [blank_to_none(d.get(f)) for f in EQ_FIELDS])
+    # 設備のコピー: 元の設備の定期交換・点検項目も引き継ぐ（前回実施日・稼働時間は新しい設備なので空にする）
+    if d.get("copy_rules_from"):
+        conn.execute(
+            """INSERT INTO rules(equipment_id, title, interval_days, interval_hours, keyword, note, active)
+               SELECT ?, title, interval_days, interval_hours, keyword, note, active FROM rules WHERE equipment_id = ? AND active = 1""",
+            (cur.lastrowid, int(d["copy_rules_from"])))
     conn.commit()
     return jsonify(id=cur.lastrowid), 201
 
