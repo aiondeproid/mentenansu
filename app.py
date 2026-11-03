@@ -1252,6 +1252,14 @@ def dashboard():
         """SELECT r.*, e.name AS equipment_name, e.code AS equipment_code FROM records r
            LEFT JOIN equipment e ON e.id = r.equipment_id WHERE r.done_date IS NOT NULL""" + rcond + """
            ORDER BY r.done_date DESC, r.id DESC LIMIT 8""", rargs))
+    # 作業履歴の最近の登録・編集（Excel から取り込んだだけの記録は除く）。created_at は「 」区切り、updated_at は「T」区切りなのでそろえて比べる
+    rec_updates = rows(conn.execute(
+        """SELECT r.*, e.name AS equipment_name, e.code AS equipment_code,
+                  MAX(r.created_at, COALESCE(REPLACE(r.updated_at, 'T', ' '), '')) AS touched_at,
+                  CASE WHEN r.updated_at IS NULL THEN '新規' ELSE '編集' END AS touch
+           FROM records r LEFT JOIN equipment e ON e.id = r.equipment_id
+           WHERE (r.source = 'app' OR r.updated_at IS NOT NULL)""" + rcond + """
+           ORDER BY touched_at DESC, r.id DESC LIMIT 10""", rargs))
     uncertain = conn.execute(
         "SELECT COUNT(*) FROM records r JOIN equipment e ON e.id = r.equipment_id WHERE r.date_uncertain=1" + cond,
         args).fetchone()[0]
@@ -1270,6 +1278,7 @@ def dashboard():
         eq_updates[key]["items"].append({k: x[k] for k in ("field", "old_value", "new_value")})
     return jsonify(
         eq_updates=list(eq_updates.values()),
+        rec_updates=rec_updates,
         rules_over=[r for r in rules if r["level"] == "over"],
         rules_soon=[r for r in rules if r["level"] == "soon"],
         rules_unknown=[r for r in rules if r["level"] == "unknown"],

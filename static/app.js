@@ -173,6 +173,19 @@ async function renderDashboard() {
         ${d.rules_unknown.length ? `<p class="muted" style="font-size:13px;margin-top:12px">※ ${d.rules_unknown.length} 項目は前回実施日またはアワーメーターが未入力のため判定できません（<a href="#/plans">交換アラート</a>で確認）</p>` : ""}
       </div>
       <div class="card full">
+        <h3>作業履歴の更新 <span class="sub">登録・編集した順に10件。行を押すとその記録を開く</span></h3>
+        ${d.rec_updates.length ? `<div class="table-wrap"><table class="list responsive"><thead><tr><th>更新日時</th><th></th><th>実施日</th><th>設備</th><th>実施内容</th><th>記入者</th><th>作業状況</th></tr></thead><tbody>${d.rec_updates.map(r => `
+          <tr data-record="${r.id}">
+            <td class="nowrap" data-label="更新日時">${h(fmtStamp(r.touched_at))}${r.touched_at.startsWith(state.meta.today) ? ' <span class="lv ok">今日</span>' : ""}</td>
+            <td class="nowrap" data-label="">${r.touch === "新規" ? "<strong>新規</strong>" : '<span class="muted">編集</span>'}</td>
+            <td class="nowrap" data-label="実施日">${dateCell(r)}</td>
+            <td class="eqcol" data-label="設備">${eqLabel(r)}</td>
+            <td class="clip" data-label="実施内容">${h(r.content)}</td>
+            <td data-label="記入者">${h(r.author || "—")}</td>
+            <td class="st-cell" data-label="作業状況">${statusBadge(r.status)}</td>
+          </tr>`).join("")}</tbody></table></div>` : `<p class="empty">まだ更新はありません</p>`}
+      </div>
+      <div class="card full">
         <h3>設備台帳の更新 <span class="sub">新しい順に10件。行を押すとその設備へ</span></h3>
         ${d.eq_updates.length ? `<div class="table-wrap"><table class="list responsive"><thead><tr><th>日時</th><th>設備</th><th>記入者</th><th>操作</th><th>内容</th></tr></thead><tbody>${d.eq_updates.map(u => `
           <tr data-eq="${u.equipment_id}">
