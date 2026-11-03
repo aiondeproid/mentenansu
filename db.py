@@ -1,4 +1,5 @@
 """SQLite スキーマと接続ヘルパー。"""
+import datetime as dt
 import os
 import re
 import sqlite3
@@ -224,6 +225,19 @@ CREATE TABLE IF NOT EXISTS record_files (
 );
 CREATE INDEX IF NOT EXISTS idx_record_files_rec ON record_files(record_id);
 
+-- 設備台帳の変更履歴（1 項目の変更 = 1 行。追加のときは field が空）
+CREATE TABLE IF NOT EXISTS equipment_history (
+    id INTEGER PRIMARY KEY,
+    equipment_id INTEGER NOT NULL REFERENCES equipment(id),
+    changed_at TEXT NOT NULL,
+    changed_by TEXT,           -- 記入者（右上の欄。空なら不明）
+    action TEXT NOT NULL,      -- 追加 / 変更 / Excel取込
+    field TEXT,                -- equipment の列名
+    old_value TEXT,
+    new_value TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_equipment_history_eq ON equipment_history(equipment_id);
+
 CREATE INDEX IF NOT EXISTS idx_records_eq ON records(equipment_id);
 CREATE INDEX IF NOT EXISTS idx_records_date ON records(done_date);
 CREATE INDEX IF NOT EXISTS idx_part_events_part ON part_events(part_id);
@@ -290,6 +304,29 @@ def make_nickname(sheet_name, name):
     if not nick or re.fullmatch(r"Sheet\d+", nick) or nick == norm(name):
         return None
     return nick
+
+
+def log_equipment(conn, eq_id, action, changes=None, by=None, note=None):
+    """設備台帳の変更履歴を残す。changes は {列名: (前の値, 新しい値)}。取引業者は ID でなく会社名で残す。"""
+    at = dt.datetime.now().isoformat(timespec="seconds")
+    if not changes:
+        conn.execute("INSERT INTO equipment_history(equipment_id, changed_at, changed_by, action, new_value) VALUES (?,?,?,?,?)",
+                     (eq_id, at, by, action, note))
+        return
+
+    def text(field, v):
+        if v in (None, ""):
+            return None
+        if field == "vendor_id":
+            row = conn.execute("SELECT name FROM vendors WHERE id = ?", (v,)).fetchone()
+            return row["name"] if row else str(v)
+        if isinstance(v, float) and v.is_integer():
+            v = int(v)  # アワーメーターの 120.0 は 120 と出す
+        return str(v)
+
+    conn.executemany(
+        "INSERT INTO equipment_history(equipment_id, changed_at, changed_by, action, field, old_value, new_value) VALUES (?,?,?,?,?,?,?)",
+        [(eq_id, at, by, action, f, text(f, old), text(f, new)) for f, (old, new) in changes.items()])
 
 
 def migrate_records(conn):

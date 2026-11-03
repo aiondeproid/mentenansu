@@ -127,6 +127,7 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .card h3 .sub { font-weight: 400; color: var(--muted); font-size: 13px; }
 .grid { display: grid; gap: 16px; }
 .grid.cols-2 { grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); }
+.grid.cols-2 > .full { grid-column: 1 / -1; }
 .grid.kpi { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); margin-bottom: 16px; }
 .kpi-tile { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; display: block; color: inherit; }
 .kpi-tile:hover { text-decoration: none; border-color: #c9c8c4; }
@@ -227,6 +228,19 @@ details.eq-group[open] > summary { border-bottom: 1px solid var(--line); }
 details.eq-group > .eq-grid { padding: 12px; background: var(--surface-2); border-radius: 0 0 8px 8px; }
 details.eq-group > .table-wrap { border: 0; border-radius: 0 0 8px 8px; }
 .g-title { font-size: 15px; }
+
+/* 種類ごとの色分け（--cat は app.js の CAT_COLORS から入る） */
+details.eq-group[style*="--cat"] { border-left: 6px solid var(--cat); }
+details.eq-group[style*="--cat"] > summary { background: var(--surface-2); background: color-mix(in srgb, var(--cat) 9%, var(--surface)); border-radius: 0 8px 8px 0; }
+details.eq-group[style*="--cat"][open] > summary { border-radius: 0 8px 0 0; }
+details.eq-group[style*="--cat"] .g-title { color: var(--cat); }
+details.eq-group[style*="--cat"] .g-title::before { content: ""; display: inline-block; width: 10px; height: 10px; border-radius: 3px; background: var(--cat); margin-right: 8px; vertical-align: 1px; }
+.eq-card[style*="--cat"] { border-top: 4px solid var(--cat); }
+.eq-card[style*="--cat"]:hover { border-color: var(--cat); }
+details.eq-group[style*="--cat"] .eq-table tbody td:first-child { box-shadow: inset 4px 0 0 var(--cat); }
+.chip.cat::before { content: ""; display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--cat); margin-right: 6px; vertical-align: 1px; }
+.chip.cat.on { background: var(--cat); border-color: var(--cat); }
+.chip.cat.on::before { background: #fff; }
 .crumb { font-size: 13px; margin-left: 8px; }
 .eq-card .eq-meta { display: flex; flex-wrap: wrap; gap: 0 10px; }
 .eq-card .eq-meta > span { white-space: nowrap; }

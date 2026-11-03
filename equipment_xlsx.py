@@ -9,7 +9,7 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font
 from openpyxl.worksheet.datavalidation import DataValidation
 
-from db import CATEGORIES, guess_category, norm
+from db import CATEGORIES, guess_category, log_equipment, norm
 from parts_catalog import _num, _read, _sheet, _str, col_letter
 
 STATUSES = ["稼働", "廃止"]
@@ -158,14 +158,16 @@ def plan_import(conn, data):
     return plan
 
 
-def apply_import(conn, plan):
+def apply_import(conn, plan, by=None):
     if plan["errors"]:
         raise ValueError("エラーのある行を直してから取り込んでください")
     for a in plan["add"]:
         v = {k: a[k] for k in (*TEXT_FIELDS, "vendor_id") if k in a}
-        conn.execute(f"INSERT INTO equipment({','.join(v)}) VALUES ({','.join('?' * len(v))})", list(v.values()))
+        cur = conn.execute(f"INSERT INTO equipment({','.join(v)}) VALUES ({','.join('?' * len(v))})", list(v.values()))
+        log_equipment(conn, cur.lastrowid, "Excel取込", by=by, note="Excel取込で追加")
     for u in plan["update"]:
         sets = {k: val[1] for k, val in u["changes"].items()}
         conn.execute(f"UPDATE equipment SET {', '.join(k + '=?' for k in sets)} WHERE id=?", [*sets.values(), u["id"]])
+        log_equipment(conn, u["id"], "Excel取込", u["changes"], by=by)
     conn.commit()
     return {"add": len(plan["add"]), "update": len(plan["update"])}

@@ -10,11 +10,11 @@ import io
 import os
 
 import re
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 from flask import Flask, Response, abort, g, has_request_context, jsonify, request, send_from_directory
 
-from db import CATEGORIES, DB_PATH, connect, init_db
+from db import CATEGORIES, DB_PATH, connect, init_db, log_equipment
 from import_xls import norm
 import equipment_xlsx
 import pla
@@ -76,6 +76,11 @@ def body():
 
 def blank_to_none(v):
     return None if v in ("", None) else v
+
+
+def request_user():
+    """右上の「記入者」（ヘッダーは ASCII しか通らないので画面側で URL エンコードして送る）。"""
+    return unquote(request.headers.get("X-Maint-User", "")).strip() or None
 
 
 # ---------------------------------------------------------------- アラート判定
@@ -214,6 +219,8 @@ def equipment_detail(eq_id):
         p["level"] = part_state(p)
     eq["catalog"] = rows(conn.execute(
         "SELECT * FROM part_catalog WHERE equipment_id = ? ORDER BY sort_order, id", (eq_id,)))
+    eq["history"] = rows(conn.execute(
+        "SELECT * FROM equipment_history WHERE equipment_id = ? ORDER BY changed_at DESC, id", (eq_id,)))
     return jsonify(eq)
 
 
@@ -230,12 +237,17 @@ def equipment_create():
     cur = conn.execute(
         f"INSERT INTO equipment({','.join(EQ_FIELDS)}) VALUES ({','.join('?' * len(EQ_FIELDS))})",
         [blank_to_none(d.get(f)) for f in EQ_FIELDS])
+    note = None
     # 設備のコピー: 元の設備の定期交換・点検項目も引き継ぐ（前回実施日・稼働時間は新しい設備なので空にする）
     if d.get("copy_rules_from"):
+        src = conn.execute("SELECT name, nickname FROM equipment WHERE id = ?", (int(d["copy_rules_from"]),)).fetchone()
+        if src:
+            note = f"「{src['nickname'] or src['name']}」をコピーして追加"
         conn.execute(
             """INSERT INTO rules(equipment_id, title, interval_days, interval_hours, keyword, note, active)
-               SELECT ?, title, interval_days, interval_hours, keyword, note, active FROM rules WHERE equipment_id = ? AND active = 1""",
+               SELECT ?, title, interval_days, interval_hours, keyword, note, active FROM rules WHERE equipment_id = ?""",
             (cur.lastrowid, int(d["copy_rules_from"])))
+    log_equipment(conn, cur.lastrowid, "追加", by=request_user(), note=note)
     conn.commit()
     return jsonify(id=cur.lastrowid), 201
 
@@ -247,8 +259,17 @@ def equipment_update(eq_id):
     if not fields:
         abort(400)
     conn = db()
+    old = conn.execute("SELECT * FROM equipment WHERE id = ?", (eq_id,)).fetchone()
+    if not old:
+        abort(404)
+    new = {f: blank_to_none(d[f]) for f in fields}
+    # 画面からは文字列で来るので（取引業者の ID など）文字にそろえて比べ、変わった項目だけ履歴に残す
+    as_text = lambda v: None if v in (None, "") else str(v)
+    changes = {f: (old[f], new[f]) for f in fields if as_text(old[f]) != as_text(new[f])}
     conn.execute(f"UPDATE equipment SET {', '.join(f + '=?' for f in fields)} WHERE id=?",
-                 [blank_to_none(d[f]) for f in fields] + [eq_id])
+                 list(new.values()) + [eq_id])
+    if changes:
+        log_equipment(conn, eq_id, "変更", changes, by=request_user())
     conn.commit()
     return jsonify(ok=True)
 
@@ -271,7 +292,7 @@ def equipment_import():
     try:
         plan = equipment_xlsx.plan_import(conn, f.read())
         if request.args.get("apply") == "1":
-            return jsonify(applied=equipment_xlsx.apply_import(conn, plan))
+            return jsonify(applied=equipment_xlsx.apply_import(conn, plan, by=request_user()))
     except ValueError as e:
         abort(400, str(e))
     return jsonify(plan)
@@ -285,8 +306,13 @@ def equipment_hours(eq_id):
     except (KeyError, TypeError, ValueError):
         abort(400, "アワーメーター値が不正です")
     conn = db()
+    old = conn.execute("SELECT current_hours FROM equipment WHERE id=?", (eq_id,)).fetchone()
+    if not old:
+        abort(404)
     conn.execute("UPDATE equipment SET current_hours=?, hours_updated=? WHERE id=?",
                  (hours, today().isoformat(), eq_id))
+    if old["current_hours"] != hours:
+        log_equipment(conn, eq_id, "変更", {"current_hours": (old["current_hours"], hours)}, by=request_user())
     conn.commit()
     return jsonify(ok=True)
 
@@ -1229,7 +1255,21 @@ def dashboard():
     uncertain = conn.execute(
         "SELECT COUNT(*) FROM records r JOIN equipment e ON e.id = r.equipment_id WHERE r.date_uncertain=1" + cond,
         args).fetchone()[0]
+    # 設備台帳の最近の更新（同じ時刻・同じ人・同じ設備の変更は 1 件にまとめて、新しい順に 10 件）
+    eq_updates = {}
+    for x in conn.execute(
+            """SELECT h.*, e.name AS equipment_name, e.nickname AS equipment_nickname, e.code AS equipment_code
+               FROM equipment_history h JOIN equipment e ON e.id = h.equipment_id WHERE 1=1""" + cond + """
+               ORDER BY h.changed_at DESC, h.id LIMIT 300""", args):
+        key = (x["equipment_id"], x["changed_at"], x["changed_by"], x["action"])
+        if key not in eq_updates:
+            if len(eq_updates) == 10:
+                break
+            eq_updates[key] = {k: x[k] for k in ("equipment_id", "equipment_name", "equipment_nickname", "equipment_code",
+                                                 "changed_at", "changed_by", "action")} | {"items": []}
+        eq_updates[key]["items"].append({k: x[k] for k in ("field", "old_value", "new_value")})
     return jsonify(
+        eq_updates=list(eq_updates.values()),
         rules_over=[r for r in rules if r["level"] == "over"],
         rules_soon=[r for r in rules if r["level"] == "soon"],
         rules_unknown=[r for r in rules if r["level"] == "unknown"],

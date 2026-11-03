@@ -22,6 +22,8 @@ async function api(path, opts = {}) {
     init.body = JSON.stringify(opts.body);
     init.headers["Content-Type"] = "application/json";
   }
+  // 記入者は変更履歴に残す（日本語はヘッダーに入らないので URL エンコード）
+  if (currentUser()) init.headers["X-Maint-User"] = encodeURIComponent(currentUser());
   const res = await fetch("/api" + path, init);
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || `エラー (${res.status})`);
@@ -169,6 +171,17 @@ async function renderDashboard() {
           <tr data-part="${p.id}"><td>${lvBadge(p.level, p.level === "over" ? "⚠ 上限到達" : "● 残りわずか")}</td><td class="code">${h(p.serial)}</td><td>${h(p.equipment_name || "")}</td><td>${grindMeter(p)}</td></tr>`).join("")}
         </tbody></table></div>` : `<p class="empty">該当なし</p>`}
         ${d.rules_unknown.length ? `<p class="muted" style="font-size:13px;margin-top:12px">※ ${d.rules_unknown.length} 項目は前回実施日またはアワーメーターが未入力のため判定できません（<a href="#/plans">交換アラート</a>で確認）</p>` : ""}
+      </div>
+      <div class="card full">
+        <h3>設備台帳の更新 <span class="sub">新しい順に10件。行を押すとその設備へ</span></h3>
+        ${d.eq_updates.length ? `<div class="table-wrap"><table class="list responsive"><thead><tr><th>日時</th><th>設備</th><th>記入者</th><th>操作</th><th>内容</th></tr></thead><tbody>${d.eq_updates.map(u => `
+          <tr data-eq="${u.equipment_id}">
+            <td class="nowrap" data-label="日時">${h(fmtStamp(u.changed_at))}${u.changed_at.startsWith(state.meta.today) ? ' <span class="lv ok">今日</span>' : ""}</td>
+            <td class="eqcol" data-label="設備">${eqLabel({ ...u, equipment_name: u.equipment_nickname || u.equipment_name })}</td>
+            <td data-label="記入者">${h(u.changed_by || "—")}</td>
+            <td class="nowrap" data-label="操作">${h(u.action)}</td>
+            <td data-label="内容">${eqChangeLines(u.items)}</td>
+          </tr>`).join("")}</tbody></table></div>` : `<p class="empty">まだ更新はありません</p>`}
       </div>
     </div>`;
   $("#kpi-uncertain").addEventListener("click", () => {
@@ -890,6 +903,15 @@ function groupBy(list, key, order = []) {
   return [...map].filter(([, v]) => v.length);
 }
 
+/* 種類ごとの色（台帳の見出し・カード・種類チップで同じ色を使う。隣り合う種類は色相を離す） */
+const CAT_COLORS = {
+  "切断・粉砕": "#d35400", "配合・混合": "#b7950b", "成型": "#8e44ad", "加熱・殺菌": "#c0392b",
+  "冷凍・冷蔵・解凍": "#3498db", "包装・充填・計数": "#16a085", "検査機（X線・金検）": "#34495e", "細菌検査": "#a93f7a",
+  "品質管理": "#5b6abf", "搬送": "#6d8b2f", "洗浄": "#17a2b8", "ボイラー・蒸気": "#a0522d",
+  "給水・圧縮空気": "#1a5276", "空調・換気": "#58a55c", "排水処理": "#7f6a4f", "その他": "#8a8984",
+};
+const catStyle = c => `style="--cat:${CAT_COLORS[c] || CAT_COLORS["その他"]}"`;
+
 function alertChips(list) {
   const over = list.reduce((s, e) => s + e.alerts.over, 0);
   const soon = list.reduce((s, e) => s + e.alerts.soon, 0);
@@ -897,7 +919,7 @@ function alertChips(list) {
 }
 
 function eqCard(e) {
-  return `<div class="eq-card ${e.status === "廃止" ? "retired" : ""}" data-eq="${e.id}">
+  return `<div class="eq-card ${e.status === "廃止" ? "retired" : ""}" data-eq="${e.id}" ${catStyle(e.category)}>
     <div class="eq-name">${h(eqTitle(e))}${e.status === "廃止" ? ' <span class="lv unknown">廃止</span>' : ""}</div>
     ${e.nickname ? `<div class="eq-formal" title="${h(e.name)}">${h(e.name)}</div>` : ""}
     <div class="eq-meta">${e.code ? `<span class="code">${h(e.code)}</span>` : ""}<span title="全${e.record_count}件のうち故障${e.failure_count}件">故障 ${e.failure_count}/${e.record_count}件</span><span>最終 ${h(fmtDate(e.last_date) || "—")}</span></div>
@@ -952,7 +974,7 @@ async function renderEquipment(id) {
 
   const groupHtml = (key, label, list, level) => {
     const open = !eqCollapsed.has(key);
-    return `<details class="eq-group lv${level}" data-key="${h(key)}" ${open ? "open" : ""}>
+    return `<details class="eq-group lv${level}" data-key="${h(key)}" ${catStyle(label)} ${open ? "open" : ""}>
       <summary><span class="g-title">${h(label)}</span><span class="g-count">${list.length}台</span>${alertChips(list)}</summary>
       ${eqPrefs.view === "list" ? eqTable(list) : `<div class="eq-grid">${list.map(eqCard).join("")}</div>`}
     </details>`;
@@ -965,7 +987,7 @@ async function renderEquipment(id) {
     // 種類チップ（件数つき）
     const cats = groupBy(base, e => e.category, state.meta.categories);
     $("#cat-chips").innerHTML = `<button class="chip ${category ? "" : "on"}" data-cat="">すべて <b>${base.length}</b></button>` +
-      cats.map(([c, l]) => `<button class="chip ${category === c ? "on" : ""}" data-cat="${h(c)}">${h(c)} <b>${l.length}</b></button>`).join("");
+      cats.map(([c, l]) => `<button class="chip cat ${category === c ? "on" : ""}" data-cat="${h(c)}" ${catStyle(c)}>${h(c)} <b>${l.length}</b></button>`).join("");
     $$("#cat-chips .chip").forEach(b => b.addEventListener("click", () => { category = b.dataset.cat; draw(); }));
 
     const list = base.filter(e => !category || e.category === category);
@@ -1005,6 +1027,37 @@ async function renderEquipment(id) {
 /* 半角カナ・全角英数をそろえる（サーバー側の norm と同じ考え方） */
 function norm(s) {
   return String(s ?? "").normalize("NFKC").trim();
+}
+
+/* 設備台帳の変更履歴（ふだんは閉じておく。同じ時刻・同じ人の変更は 1 行にまとめる） */
+const EQ_FIELD_LABELS = {
+  code: "設備No", name: "正式名", nickname: "通称", category: "種類", model: "型式", maker: "メーカー",
+  vendor_id: "取引業者", supplier: "納入業者", asset_no: "資産No", serial_no: "製造番号", manufactured: "製造年",
+  delivered: "納入年月日", area: "エリア", status: "状態", note: "メモ", current_hours: "アワーメーター",
+};
+/* 変更内容の行（「設備No: 空欄 → K9」）。追加のときは field が空 */
+function eqChangeLines(items) {
+  const val = v => v == null ? '<span class="muted">（空欄）</span>' : h(v);
+  return items.map(c => c.field
+    ? `<div><strong>${h(EQ_FIELD_LABELS[c.field] || c.field)}</strong>: ${val(c.old_value)} → ${val(c.new_value)}</div>`
+    : `<div>${h(c.new_value || "新しく登録")}</div>`).join("");
+}
+const fmtStamp = s => s.replace("T", " ").slice(0, 16);
+
+function eqHistory(list) {
+  if (!list?.length) return "";
+  const groups = groupBy(list, x => `${x.changed_at}|${x.changed_by || ""}|${x.action}`);
+  return `<details class="eq-history card" style="margin-top:18px">
+    <summary><strong>設備台帳の変更履歴</strong> <span class="muted">（${groups.length}件）</span></summary>
+    <div class="table-wrap"><table class="list responsive"><thead><tr><th>日時</th><th>記入者</th><th>操作</th><th>内容</th></tr></thead><tbody>
+      ${groups.map(([, items]) => { const x = items[0]; return `<tr style="cursor:default">
+        <td class="nowrap" data-label="日時">${h(fmtStamp(x.changed_at))}</td>
+        <td data-label="記入者">${h(x.changed_by || "—")}</td>
+        <td class="nowrap" data-label="操作">${h(x.action)}</td>
+        <td data-label="内容">${eqChangeLines(items)}</td>
+      </tr>`; }).join("")}
+    </tbody></table></div>
+  </details>`;
 }
 
 async function renderEquipmentDetail(id) {
@@ -1066,6 +1119,8 @@ async function renderEquipmentDetail(id) {
     <div class="table-wrap"><table class="list responsive"><thead><tr><th>部品名</th><th class="num">単価</th><th class="num">数量</th><th>保管場所</th><th>備考</th></tr></thead><tbody>
       ${eq.catalog.map(c => `<tr style="cursor:default"><td data-label="部品名"><strong>${h(c.name)}</strong></td><td class="num nowrap" data-label="単価">${c.unit_price != null ? yen(c.unit_price) : '<span class="muted">未登録</span>'}</td><td class="num" data-label="数量">${c.qty != null ? fmtNum(c.qty) : ""}</td><td data-label="保管場所">${h(c.location || "")}</td><td class="clip" data-label="備考">${h([c.note, c.memo].filter(Boolean).join(" ／ "))}</td></tr>`).join("")}
     </tbody></table></div>` : ""}
+
+    ${eqHistory(eq.history)}
 
     <div class="section-title"><h2 id="rec-count">作業履歴（${recs.length}件）</h2><button class="btn primary" id="add-rec">作業を記録</button></div>
     ${recs.length ? `<div class="search" style="margin-bottom:8px"><span>🔍</span><input id="rec-q" type="search" placeholder="作業内容・原因・結果・対策・作業者・日付で絞り込み"></div>` : ""}
