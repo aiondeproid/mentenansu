@@ -238,6 +238,21 @@ CREATE TABLE IF NOT EXISTS equipment_history (
 );
 CREATE INDEX IF NOT EXISTS idx_equipment_history_eq ON equipment_history(equipment_id);
 
+-- 新着（アプリでの登録・変更・削除を 1 操作 1 行で残す。ダッシュボードの「新着」に出す）
+CREATE TABLE IF NOT EXISTS activity (
+    id INTEGER PRIMARY KEY,
+    at TEXT NOT NULL,          -- YYYY-MM-DDTHH:MM:SS
+    by TEXT,                   -- 記入者
+    area TEXT,                 -- エリアで絞り込むため（設備・工程から決まらなければ空）
+    kind TEXT NOT NULL,        -- 作業記録 / 設備台帳 / 交換アラート / 部品 / プラ点検 / 取引業者 / 通知
+    action TEXT NOT NULL,      -- 登録 / 変更 / 削除 など
+    target TEXT,               -- 何に対して（「K001 玉葱ダイサー」など）
+    detail TEXT,
+    ref_type TEXT,             -- 画面で開く先（record / equipment / rule / part / catalog / pla / vendor / notify）
+    ref_id INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_activity_at ON activity(at);
+
 CREATE INDEX IF NOT EXISTS idx_records_eq ON records(equipment_id);
 CREATE INDEX IF NOT EXISTS idx_records_date ON records(done_date);
 CREATE INDEX IF NOT EXISTS idx_part_events_part ON part_events(part_id);
@@ -352,7 +367,36 @@ def migrate_records(conn):
     conn.executescript(SCHEMA)  # 消えた索引を作り直す
 
 
+EQ_FIELD_LABELS = {
+    "code": "設備No", "name": "正式名", "nickname": "通称", "category": "種類", "model": "型式", "maker": "メーカー",
+    "vendor_id": "取引業者", "supplier": "納入業者", "asset_no": "資産No", "serial_no": "製造番号", "manufactured": "製造年",
+    "delivered": "納入年月日", "area": "エリア", "status": "状態", "note": "メモ", "current_hours": "アワーメーター",
+}
+
+
+def seed_activity(conn):
+    """新着を始めたときに、それまでの作業記録（アプリで入れた・直したもの）と設備台帳の変更履歴を入れておく。"""
+    conn.execute(
+        """INSERT INTO activity(at, by, area, kind, action, target, detail, ref_type, ref_id)
+           SELECT REPLACE(MAX(COALESCE(r.created_at, ''), COALESCE(REPLACE(r.updated_at, 'T', ' '), '')), ' ', 'T'), r.author, e.area,
+                  '作業記録', CASE WHEN r.updated_at IS NULL THEN '登録' ELSE '変更' END,
+                  TRIM(COALESCE(e.code || ' ', '') || COALESCE(e.nickname, e.name, '場所 ' || r.location, '')), r.content, 'record', r.id
+           FROM records r LEFT JOIN equipment e ON e.id = r.equipment_id
+           WHERE (r.source = 'app' OR r.updated_at IS NOT NULL) AND COALESCE(r.created_at, r.updated_at) IS NOT NULL""")
+    for x in conn.execute(
+            """SELECT h.equipment_id, h.changed_at, h.changed_by, h.action, e.area, e.code, e.name, e.nickname,
+                      GROUP_CONCAT(h.field) AS fields, MAX(h.new_value) AS note
+               FROM equipment_history h JOIN equipment e ON e.id = h.equipment_id
+               GROUP BY h.equipment_id, h.changed_at, h.changed_by, h.action""").fetchall():
+        detail = "・".join(EQ_FIELD_LABELS.get(f, f) for f in x["fields"].split(",")) if x["fields"] else x["note"]
+        conn.execute(
+            "INSERT INTO activity(at, by, area, kind, action, target, detail, ref_type, ref_id) VALUES (?,?,?,?,?,?,?,?,?)",
+            (x["changed_at"], x["changed_by"], x["area"], "設備台帳", "登録" if x["action"] == "追加" else x["action"],
+             " ".join(filter(None, [x["code"], x["nickname"] or x["name"]])), detail, "equipment", x["equipment_id"]))
+
+
 def init_db(conn):
+    new_activity = not conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'activity'").fetchone()
     conn.executescript(SCHEMA)
     migrate_records(conn)
     # 既存 DB への列追加（取り込み済みデータは残したまま）
@@ -374,4 +418,6 @@ def init_db(conn):
     for e in conn.execute("SELECT id, name, sheet_name FROM equipment WHERE category IS NULL").fetchall():
         conn.execute("UPDATE equipment SET category=?, nickname=COALESCE(nickname, ?) WHERE id=?",
                      (guess_category(e["sheet_name"], e["name"]), make_nickname(e["sheet_name"], e["name"]), e["id"]))
+    if new_activity:
+        seed_activity(conn)
     conn.commit()

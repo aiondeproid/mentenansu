@@ -14,7 +14,7 @@ from urllib.parse import quote, unquote
 
 from flask import Flask, Response, abort, g, has_request_context, jsonify, request, send_from_directory
 
-from db import CATEGORIES, DB_PATH, connect, init_db, log_equipment
+from db import CATEGORIES, DB_PATH, EQ_FIELD_LABELS, connect, init_db, log_equipment
 from import_xls import norm
 import equipment_xlsx
 import pla
@@ -81,6 +81,159 @@ def blank_to_none(v):
 def request_user():
     """右上の「記入者」（ヘッダーは ASCII しか通らないので画面側で URL エンコードして送る）。"""
     return unquote(request.headers.get("X-Maint-User", "")).strip() or None
+
+
+# ---------------------------------------------------------------- 新着（アプリでの書き込みを 1 操作 1 行で残す）
+# 書き込みの API が成功したら after_request で activity に残す。何に対する操作かは before_request で調べておく
+# （削除は消える前でないと名前が分からないため）。API ごとの中身は下の ACTIVITY の表で決める。
+def _eq_target(conn, eq_id):
+    e = conn.execute("SELECT code, name, nickname, area FROM equipment WHERE id=?", (eq_id,)).fetchone() if eq_id else None
+    return (" ".join(filter(None, [e["code"], e["nickname"] or e["name"]])), e["area"]) if e else (None, None)
+
+
+def _row(conn, sql, key):
+    r = conn.execute(sql, (key,)).fetchone() if key else None
+    return dict(r) if r else {}
+
+
+def _act_record(conn, rec_id, d, detail=None):
+    r = _row(conn, "SELECT equipment_id, location, content, author FROM records WHERE id=?", rec_id)
+    r |= {k: d[k] for k in ("equipment_id", "location", "content", "author") if d.get(k)}
+    name, area = _eq_target(conn, r.get("equipment_id"))
+    return {"target": name or (f"場所 {r['location']}" if r.get("location") else None), "area": area, "by": r.get("author"),
+            "detail": detail or r.get("content"), "ref_type": "record", "ref_id": rec_id}
+
+
+def _act_rule(conn, rule_id, d):
+    r = _row(conn, "SELECT equipment_id, title FROM rules WHERE id=?", rule_id) | {k: d[k] for k in ("equipment_id", "title") if d.get(k)}
+    name, area = _eq_target(conn, r.get("equipment_id"))
+    return {"target": name, "area": area, "detail": r.get("title"), "ref_type": "rule", "ref_id": rule_id}
+
+
+def _act_part(conn, part_id, d, detail=None):
+    r = _row(conn, "SELECT serial, part_type, equipment_id FROM parts WHERE id=?", part_id) | {k: d[k] for k in ("serial", "part_type", "equipment_id") if d.get(k)}
+    name, area = _eq_target(conn, r.get("equipment_id"))
+    return {"target": " ".join(filter(None, [r.get("part_type"), r.get("serial")])), "area": area,
+            "detail": detail or name, "ref_type": "part", "ref_id": part_id}
+
+
+def _act_catalog(conn, item_id, d):
+    r = _row(conn, "SELECT name, machine, area, equipment_id FROM part_catalog WHERE id=?", item_id) | {k: d[k] for k in ("name", "machine", "area") if d.get(k)}
+    return {"target": r.get("name"), "area": r.get("area") or _eq_target(conn, r.get("equipment_id"))[1],
+            "detail": r.get("machine"), "ref_type": "catalog"}
+
+
+def _act_pla(process, target, detail=None):
+    return {"target": target, "area": pla.PROCESS_AREA.get(process), "detail": detail, "ref_type": "pla"}
+
+
+def _act_pla_sheet(conn, sheet_id, detail=None):
+    s = _row(conn, "SELECT process, title FROM pla_sheets WHERE id=?", sheet_id)
+    return _act_pla(s.get("process"), " ".join(filter(None, [s.get("process"), s.get("title")])), detail)
+
+
+def _act_pla_point(conn, point_id, d):
+    p = _row(conn, "SELECT sheet_id, location, item_text FROM pla_points WHERE id=?", point_id) | {k: d[k] for k in ("sheet_id", "location", "item_text") if d.get(k)}
+    return _act_pla_sheet(conn, p.get("sheet_id"), " ".join(filter(None, [p.get("location"), p.get("item_text")])))
+
+
+def _act_pla_results(conn, d):
+    results = d.get("results") or []
+    first = results[0]["point_id"] if results else None
+    s = _row(conn, "SELECT s.process FROM pla_points p JOIN pla_sheets s ON s.id = p.sheet_id WHERE p.id=?", first)
+    ng = sum(1 for r in results if r.get("result") == "ng")
+    return _act_pla(s.get("process"), s.get("process"),
+                    f"{d.get('date')} {d.get('timing')} {len(results)}箇所" + (f"（異常 {ng}）" if ng else ""))
+
+
+def _act_pla_review(conn, d):
+    return _act_pla(d.get("process"), d.get("process"), f"{d.get('date')} {d.get('timing')}") | (
+        {"action": "確認を取消"} if d.get("cancel") else {})
+
+
+ACTIVITY = {  # API の関数名: (分類, 操作, 何に対してかを返す関数(conn, URL の引数, JSON))
+    "equipment_create": ("設備台帳", "登録", lambda c, a, d: {"target": d.get("name"), "area": d.get("area"), "ref_type": "equipment"}),
+    "equipment_update": ("設備台帳", "変更", lambda c, a, d: dict(zip(("target", "area"), _eq_target(c, a["eq_id"])), ref_type="equipment", ref_id=a["eq_id"])),
+    "equipment_hours": ("設備台帳", "アワーメーター更新", lambda c, a, d: dict(zip(("target", "area"), _eq_target(c, a["eq_id"])), detail=f"{d.get('current_hours')}h", ref_type="equipment", ref_id=a["eq_id"])),
+    "equipment_import": ("設備台帳", "Excel取込", lambda c, a, d: {"only_applied": True}),
+    "record_create": ("作業記録", "登録", lambda c, a, d: _act_record(c, None, d)),
+    "record_update": ("作業記録", "変更", lambda c, a, d: _act_record(c, a["rec_id"], d)),
+    "record_delete": ("作業記録", "削除", lambda c, a, d: _act_record(c, a["rec_id"], d)),
+    "record_file_upload": ("作業記録", "添付ファイル追加", lambda c, a, d: _act_record(c, a["rec_id"], d, f"{len(request.files.getlist('file'))}件")),
+    "record_file_delete": ("作業記録", "添付ファイル削除", lambda c, a, d: (lambda f: _act_record(c, f.get("record_id"), d, f.get("name")))(
+        _row(c, "SELECT record_id, name FROM record_files WHERE id=?", a["file_id"]))),
+    "rule_create": ("交換アラート", "項目を登録", lambda c, a, d: _act_rule(c, None, d)),
+    "rule_update": ("交換アラート", "項目を変更", lambda c, a, d: _act_rule(c, a["rule_id"], d)),
+    "rule_delete": ("交換アラート", "項目を削除", lambda c, a, d: _act_rule(c, a["rule_id"], d)),
+    "part_create": ("部品", "登録", lambda c, a, d: _act_part(c, None, d)),
+    "part_update": ("部品", "変更", lambda c, a, d: _act_part(c, a["part_id"], d)),
+    "part_event": ("部品", "記録", lambda c, a, d: _act_part(c, a["part_id"], {}, d.get("event"))),
+    "catalog_create": ("部品", "部品一覧に登録", lambda c, a, d: _act_catalog(c, None, d)),
+    "catalog_update": ("部品", "部品一覧を変更", lambda c, a, d: _act_catalog(c, a["item_id"], d)),
+    "catalog_delete": ("部品", "部品一覧から削除", lambda c, a, d: _act_catalog(c, a["item_id"], d)),
+    "parts_import": ("部品", "Excel取込", lambda c, a, d: {"only_applied": True, "ref_type": "catalog"}),
+    "pla_results_save": ("プラ点検", "点検を記入", lambda c, a, d: _act_pla_results(c, d) | {"by": d.get("checked_by")}),
+    "pla_review_save": ("プラ点検", "確認", lambda c, a, d: _act_pla_review(c, d) | {"by": d.get("reviewer")}),
+    "pla_item_create": ("プラ点検", "プラリストに登録", lambda c, a, d: _act_pla(d.get("process"), d.get("equipment"), d.get("item"))),
+    "pla_item_update": ("プラ点検", "プラリストを変更", lambda c, a, d: (lambda i: _act_pla(i.get("process"), i.get("equipment"), i.get("item")))(
+        _row(c, "SELECT process, equipment, item FROM pla_items WHERE id=?", a["item_id"]) | {k: d[k] for k in ("process", "equipment", "item") if d.get(k)})),
+    "pla_item_delete": ("プラ点検", "プラリストから削除", lambda c, a, d: (lambda i: _act_pla(i.get("process"), i.get("equipment"), i.get("item")))(
+        _row(c, "SELECT process, equipment, item FROM pla_items WHERE id=?", a["item_id"]))),
+    "pla_sheet_create": ("プラ点検", "チェック表を登録", lambda c, a, d: _act_pla(d.get("process"), " ".join(filter(None, [d.get("process"), d.get("title")])))),
+    "pla_sheet_update": ("プラ点検", "チェック表を変更", lambda c, a, d: _act_pla_sheet(c, a["sheet_id"])),
+    "pla_point_create": ("プラ点検", "チェック表に行を追加", lambda c, a, d: _act_pla_point(c, None, d)),
+    "pla_point_update": ("プラ点検", "チェック表の行を変更", lambda c, a, d: _act_pla_point(c, a["point_id"], d)),
+    "pla_point_delete": ("プラ点検", "チェック表の行を削除", lambda c, a, d: _act_pla_point(c, a["point_id"], d)),
+    "pla_photo_upload": ("プラ点検", "写真を追加", lambda c, a, d: _act_pla_sheet(c, request.form.get("sheet_id", type=int))),
+    "pla_photo_delete": ("プラ点検", "写真を削除", lambda c, a, d: _act_pla_sheet(
+        c, _row(c, "SELECT sheet_id FROM pla_photos WHERE id=?", a["photo_id"]).get("sheet_id"))),
+    "vendor_update": ("取引業者", "変更", lambda c, a, d: {"target": _row(c, "SELECT name FROM vendors WHERE id=?", a["vendor_id"]).get("name"), "ref_type": "vendor"}),
+    "notify_recipients_update": ("通知", "通知先を変更", lambda c, a, d: {"ref_type": "notify"}),
+}
+APPLIED_LABELS = {"add": "追加", "update": "変更", "delete": "削除", "catalog": "部品一覧", "serial": "研磨管理"}
+
+
+def note_activity(**kw):
+    """API の中から新着の中身を足す（detail を詳しくする、skip=True で残さない など）。"""
+    if "activity" in g:
+        g.activity.update(kw)
+
+
+@app.before_request
+def activity_before():
+    if request.method in ("POST", "PUT", "DELETE") and request.endpoint in ACTIVITY:
+        try:
+            g.activity = ACTIVITY[request.endpoint][2](db(), request.view_args or {}, request.get_json(silent=True) or {})
+        except Exception:  # 新着は補助なので、調べられなくても本来の処理は止めない
+            app.logger.exception("新着の対象を調べられませんでした")
+            g.activity = {}
+
+
+@app.after_request
+def activity_after(resp):
+    info = g.pop("activity", None)
+    if info is None or resp.status_code >= 300 or info.get("skip"):
+        return resp
+    data = resp.get_json(silent=True) or {}
+    detail = info.get("detail")
+    if info.get("only_applied"):  # Excel 取込は確認だけのときは残さない
+        if "applied" not in data:
+            return resp
+        flat = lambda v: "・".join(f"{APPLIED_LABELS.get(k, k)} {flat(x) if isinstance(x, dict) else f'{x}件'}" for k, x in v.items())
+        detail = flat(data["applied"])
+    kind, action, _ = ACTIVITY[request.endpoint]
+    try:
+        conn = db()
+        conn.execute(
+            "INSERT INTO activity(at, by, area, kind, action, target, detail, ref_type, ref_id) VALUES (?,?,?,?,?,?,?,?,?)",
+            # 右上の記入者が空なら、作業記録の記入者・プラ点検の点検者を使う
+            (dt.datetime.now().isoformat(timespec="seconds"), request_user() or info.get("by") or None, info.get("area"), kind,
+             info.get("action", action), info.get("target"), None if detail is None else str(detail)[:200],
+             info.get("ref_type"), info.get("ref_id") or data.get("id")))
+        conn.commit()
+    except Exception:
+        app.logger.exception("新着を残せませんでした")
+    return resp
 
 
 # ---------------------------------------------------------------- アラート判定
@@ -248,6 +401,7 @@ def equipment_create():
                SELECT ?, title, interval_days, interval_hours, keyword, note, active FROM rules WHERE equipment_id = ?""",
             (cur.lastrowid, int(d["copy_rules_from"])))
     log_equipment(conn, cur.lastrowid, "追加", by=request_user(), note=note)
+    note_activity(detail=note)
     conn.commit()
     return jsonify(id=cur.lastrowid), 201
 
@@ -270,6 +424,9 @@ def equipment_update(eq_id):
                  list(new.values()) + [eq_id])
     if changes:
         log_equipment(conn, eq_id, "変更", changes, by=request_user())
+        note_activity(detail="・".join(EQ_FIELD_LABELS[f] for f in changes))
+    else:
+        note_activity(skip=True)
     conn.commit()
     return jsonify(ok=True)
 
@@ -313,6 +470,8 @@ def equipment_hours(eq_id):
                  (hours, today().isoformat(), eq_id))
     if old["current_hours"] != hours:
         log_equipment(conn, eq_id, "変更", {"current_hours": (old["current_hours"], hours)}, by=request_user())
+    else:
+        note_activity(skip=True)
     conn.commit()
     return jsonify(ok=True)
 
@@ -1276,7 +1435,13 @@ def dashboard():
             eq_updates[key] = {k: x[k] for k in ("equipment_id", "equipment_name", "equipment_nickname", "equipment_code",
                                                  "changed_at", "changed_by", "action")} | {"items": []}
         eq_updates[key]["items"].append({k: x[k] for k in ("field", "old_value", "new_value")})
+    # 新着（エリアを選んでいるときは、そのエリアのものとエリアの決まらないもの）
+    area = request.args.get("area")
+    news = rows(conn.execute(
+        "SELECT * FROM activity" + (" WHERE area = ? OR area IS NULL" if area else "") + " ORDER BY at DESC, id DESC LIMIT 30",
+        [area] if area else []))
     return jsonify(
+        news=news,
         eq_updates=list(eq_updates.values()),
         rec_updates=rec_updates,
         rules_over=[r for r in rules if r["level"] == "over"],

@@ -121,6 +121,7 @@ async function refreshBadges() {
     const d = await api("/dashboard" + areaQS());
     setBadge("#badge-plans", d.rules_over.length + d.rules_soon.length);
     setBadge("#badge-parts", d.parts_alert.length);
+    setBadge("#badge-news", unreadNews(d.news).length);
   } catch { /* バッジは補助表示なので無視 */ }
 }
 function setBadge(sel, n) {
@@ -130,6 +131,75 @@ function setBadge(sel, n) {
 }
 
 /* ================================================================ ダッシュボード */
+/* 新着: どこまで見たかはブラウザごとに覚える（初めて開いたときは今までの分を見たことにする） */
+function newsSeen(news) {
+  let seen = null;
+  try { seen = localStorage.getItem("maint-news-seen"); } catch { /* noop */ }
+  if (seen == null && news?.length) { seen = news[0].at; markNewsSeen(seen); }
+  return seen || "";
+}
+function markNewsSeen(at) {
+  try { localStorage.setItem("maint-news-seen", at); } catch { /* 保存できなくても動作には影響しない */ }
+}
+/* 自分（右上の記入者）の書き込みは未読にしない */
+const isUnread = (n, seen) => n.at > seen && !(n.by && n.by === currentUser());
+const unreadNews = news => { const seen = newsSeen(news); return (news || []).filter(n => isUnread(n, seen)); };
+
+const NEWS_KIND_CLASS = { 作業記録: "record", 設備台帳: "equipment", 交換アラート: "rule", 部品: "part", プラ点検: "pla", 取引業者: "vendor", 通知: "notify" };
+const NEWS_PAGE = { catalog: "#/parts/catalog", pla: "#/pla", vendor: "#/vendors", notify: "#/notify" };
+
+function newsWhen(at) {
+  const day = at.slice(0, 10), time = at.slice(11, 16);
+  const y = new Date(Date.parse(state.meta.today) - 86400000).toISOString().slice(0, 10);
+  return day === state.meta.today ? `今日 ${time}` : day === y ? `昨日 ${time}` : `${fmtDate(day)} ${time}`;
+}
+
+/* 開く先（消したものは開けないのでリンクにしない） */
+function newsLink(n) {
+  if (/削除/.test(n.action)) return "";
+  if (NEWS_PAGE[n.ref_type]) return `data-href="${NEWS_PAGE[n.ref_type]}"`;
+  if (!n.ref_id) return "";
+  return { record: `data-record="${n.ref_id}"`, equipment: `data-eq="${n.ref_id}"`, rule: `data-rule="${n.ref_id}"`, part: `data-part="${n.ref_id}"` }[n.ref_type] || "";
+}
+
+function newsItem(n, seen) {
+  const link = newsLink(n);
+  return `<li class="news-item ${isUnread(n, seen) ? "unread" : ""} ${link ? "link" : ""}" ${link}>
+    <span class="news-when">${h(newsWhen(n.at))}</span>
+    <span class="news-kind k-${NEWS_KIND_CLASS[n.kind] || "other"}">${h(n.kind)}</span>
+    <span class="news-text"><strong>${h(n.action)}</strong>${n.target ? ` ${h(n.target)}` : ""}${n.detail ? ` <span class="news-detail">${h(n.detail)}</span>` : ""}</span>
+    <span class="news-by">${h(n.by || "記入者なし")}</span>
+  </li>`;
+}
+
+function newsCorner(news) {
+  const seen = newsSeen(news);
+  const unread = news.filter(n => isUnread(n, seen)).length;
+  return `<div class="card news" id="news">
+    <div class="news-head">
+      <h3>新着 ${unread ? `<span class="news-count">${unread}件</span>` : '<span class="sub">新しい書き込みはありません</span>'}</h3>
+      ${unread ? '<button class="btn small" id="news-read">既読にする</button>' : ""}
+    </div>
+    ${news.length ? `<ul class="news-list">${news.map(n => newsItem(n, seen)).join("")}</ul>
+      ${news.length > 8 ? `<button class="btn small" id="news-more">もっと見る（${news.length}件まで）</button>` : ""}` : `<p class="empty">まだ書き込みはありません</p>`}
+  </div>`;
+}
+
+function bindNews(news) {
+  const box = $("#news");
+  const items = $$(".news-item", box);
+  items.forEach((li, i) => (li.hidden = i >= 8));
+  $("#news-more")?.addEventListener("click", e => { items.forEach(li => (li.hidden = false)); e.target.remove(); });
+  $("#news-read")?.addEventListener("click", () => {
+    markNewsSeen(news[0].at);
+    items.forEach(li => li.classList.remove("unread"));
+    $(".news-head h3", box).innerHTML = '新着 <span class="sub">新しい書き込みはありません</span>';
+    $("#news-read").remove();
+    setBadge("#badge-news", 0);
+  });
+  $$("[data-href]", box).forEach(el => el.addEventListener("click", () => (location.hash = el.dataset.href)));
+}
+
 async function renderDashboard() {
   const d = await api("/dashboard" + areaQS());
   const ruleRow = r => `
@@ -142,6 +212,7 @@ async function renderDashboard() {
     </tr>`;
   const alertRules = [...d.rules_over, ...d.rules_soon];
   view.innerHTML = `
+    ${newsCorner(d.news)}
     <div class="grid kpi">
       <a class="kpi-tile" href="#/plans"><div class="kpi-label">${lvBadge("over", "⚠ 期限超過")}</div><div class="kpi-value">${d.rules_over.length}<small>項目</small></div></a>
       <a class="kpi-tile" href="#/plans"><div class="kpi-label">${lvBadge("soon", "● 14日以内")}</div><div class="kpi-value">${d.rules_soon.length}<small>項目</small></div></a>
@@ -204,6 +275,7 @@ async function renderDashboard() {
     state.recordQuery = { q: "", sort: "done_date", dir: "desc", status: state.meta.record_statuses.filter(s => s !== "完了").join(",") };
   });
   bindRowClicks();
+  bindNews(d.news);
 }
 
 /* 添付ファイル 1 件の表示（url があればリンク、btnAttr のボタンで外す） */
