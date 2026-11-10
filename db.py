@@ -225,6 +225,17 @@ CREATE TABLE IF NOT EXISTS record_files (
 );
 CREATE INDEX IF NOT EXISTS idx_record_files_rec ON record_files(record_id);
 
+-- 設備台帳の添付ファイル（取扱説明書・図面・銘板の写真など。本体は record_files と同じ data/record_files/）
+CREATE TABLE IF NOT EXISTS equipment_files (
+    id INTEGER PRIMARY KEY,
+    equipment_id INTEGER NOT NULL REFERENCES equipment(id),
+    file TEXT NOT NULL,
+    name TEXT,
+    size INTEGER,
+    created_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_equipment_files_eq ON equipment_files(equipment_id);
+
 -- 設備台帳の変更履歴（1 項目の変更 = 1 行。追加のときは field が空）
 CREATE TABLE IF NOT EXISTS equipment_history (
     id INTEGER PRIMARY KEY,
@@ -277,8 +288,9 @@ CATEGORY_RULES = [
     ("冷凍・冷蔵・解凍", r"フリーザー|予冷|冷蔵|冷凍|解凍|製氷"),
     ("成型", r"成型|包餡|包あん|丸目|ハントマン|メガフォーマ|ロトフォーム"),
     ("包装・充填・計数", r"包装|ムルチ|ポリスター|封函|カートン|計数|インクジェット|印字|充填"),
-    ("搬送", r"コンベア|バーチカル|シャトル"),
-    ("切断・粉砕", r"カッター|ダイサー|チョッパー|グラインダー|セパレーター|フレーカー"),
+    ("搬送", r"コンベア|バーチカル|シャトル"),  # 「玉ねぎコンベアー」は搬送のまま
+    ("玉葱", r"玉葱|玉ねぎ|玉ネギ|たまねぎ|タマネギ|オニオン"),  # 「玉ネギダイサー」は肉処理より先に判定する
+    ("肉処理", r"カッター|ダイサー|チョッパー|グラインダー|セパレーター|フレーカー"),
     ("配合・混合", r"配合|ミキサー|ニーダー"),
     ("洗浄", r"発泡|洗浄|ジェッター"),
     ("空調・換気", r"GHP|ガスヒート|換気|ファン|排気"),
@@ -289,10 +301,17 @@ CATEGORY_RULES = [
 ]
 # 台帳での表示順（工程の流れ → 検査・搬送 → 付帯設備）
 CATEGORIES = [
-    "切断・粉砕", "配合・混合", "成型", "加熱・殺菌", "冷凍・冷蔵・解凍", "包装・充填・計数",
+    "肉処理", "玉葱", "配合・混合", "成型", "加熱・殺菌", "冷凍・冷蔵・解凍", "包装・充填・計数",
     "検査機（X線・金検）", "細菌検査", "品質管理", "搬送", "洗浄", "ボイラー・蒸気", "給水・圧縮空気", "空調・換気", "排水処理", "その他",
 ]
 assert set(CATEGORIES) == {c for c, _ in CATEGORY_RULES} | {"その他"}
+# 台帳での小分類の並び順（ここにない小分類は設備Noの順で後ろに。英数字で始まる小分類＝Aライン などは名前順）
+SUBGROUP_ORDER = {
+    "肉処理": ["フローズンカッター", "サイレントカッター", "チョッパー", "ミートセパレーター", "キャリア"],
+    "加熱・殺菌": ["焼き", "蒸煮"],
+    "包装・充填・計数": ["包装", "充填", "計数", "印字"],
+    "検査機（X線・金検）": ["X線", "金検"],
+}
 
 
 def norm(s):
@@ -368,9 +387,10 @@ def migrate_records(conn):
 
 
 EQ_FIELD_LABELS = {
-    "code": "設備No", "name": "正式名", "nickname": "通称", "category": "種類", "model": "型式", "maker": "メーカー",
+    "code": "設備No", "name": "正式名", "nickname": "通称", "category": "種類", "subgroup": "小分類", "model": "型式", "maker": "メーカー",
     "vendor_id": "取引業者", "supplier": "納入業者", "asset_no": "資産No", "serial_no": "製造番号", "manufactured": "製造年",
     "delivered": "納入年月日", "area": "エリア", "status": "状態", "note": "メモ", "current_hours": "アワーメーター",
+    "files": "添付ファイル",
 }
 
 
@@ -405,7 +425,7 @@ def init_db(conn):
         if col not in cols:
             conn.execute(f"ALTER TABLE records ADD COLUMN {col} TEXT")
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(equipment)")}
-    for col in ("source_file", "nickname", "category"):
+    for col in ("source_file", "nickname", "category", "subgroup"):  # subgroup = 小分類（種類の中の枠）
         if col not in cols:
             conn.execute(f"ALTER TABLE equipment ADD COLUMN {col} TEXT")
     # 箇所ごとの点検結果（pla_results）はチェック表ごと（pla_checks）に置き換えた。記録がなければ消す
@@ -415,6 +435,7 @@ def init_db(conn):
     for table in ("parts", "part_catalog"):
         if "location" not in {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN location TEXT")  # 保管場所
+    conn.execute("UPDATE equipment SET category = '肉処理' WHERE category = '切断・粉砕'")  # 種類の名前を変えた（バックアップから戻した DB 用）
     for e in conn.execute("SELECT id, name, sheet_name FROM equipment WHERE category IS NULL").fetchall():
         conn.execute("UPDATE equipment SET category=?, nickname=COALESCE(nickname, ?) WHERE id=?",
                      (guess_category(e["sheet_name"], e["name"]), make_nickname(e["sheet_name"], e["name"]), e["id"]))

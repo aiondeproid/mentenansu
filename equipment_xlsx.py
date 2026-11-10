@@ -14,12 +14,12 @@ from parts_catalog import _num, _read, _sheet, _str, col_letter
 
 STATUSES = ["稼働", "廃止"]
 EQ_COLS = [  # (キー, Excel の見出し, 列幅)。vendor は取引業者の会社名
-    ("id", "ID", 7), ("area", "エリア", 11), ("category", "種類", 16), ("code", "設備No", 9),
+    ("id", "ID", 7), ("area", "エリア", 11), ("category", "種類", 16), ("subgroup", "小分類", 16), ("code", "設備No", 9),
     ("nickname", "通称", 22), ("name", "正式名", 34), ("model", "型式", 18), ("maker", "メーカー", 20),
     ("supplier", "納入業者", 18), ("vendor", "取引業者", 24), ("asset_no", "資産No", 15), ("serial_no", "製造番号", 14),
     ("manufactured", "製造年", 9), ("delivered", "納入年月日", 12), ("status", "状態", 7), ("note", "メモ", 40),
 ]
-TEXT_FIELDS = ["area", "category", "code", "nickname", "name", "model", "maker", "supplier", "asset_no", "serial_no",
+TEXT_FIELDS = ["area", "category", "subgroup", "code", "nickname", "name", "model", "maker", "supplier", "asset_no", "serial_no",
                "manufactured", "delivered", "status", "note"]
 LABELS = {k: label for k, label, _ in EQ_COLS} | {"vendor_id": "取引業者"}
 
@@ -65,6 +65,8 @@ def export_workbook(conn):
         "・正式名は必須です。通称は現場での呼び名（台帳で大きく表示される名前）です。",
         "・種類・状態・取引業者はプルダウン（選択肢シート）から選びます。",
         "  種類を空欄にすると、名前から自動で決めます。",
+        "・小分類は種類の中の枠です（肉処理の「サイレントカッター」など）。同じ言葉を入れた設備が 1 つの枠にまとまります。空欄なら枠なし。",
+        "  「X線／Aライン」のように「／」で区切ると、枠の中にさらに枠を作ります。",
         "・取引業者は、アプリの「取引業者」に登録済みの会社名だけ使えます。",
         "・設備は作業履歴とつながっているので、Excel からは削除できません。",
         "  使わなくなった設備は、状態を「廃止」にしてください。",

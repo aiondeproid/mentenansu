@@ -287,6 +287,48 @@ function fileChip(name, size, url, btnAttr, isNew = false) {
     <button type="button" class="rf-del" ${btnAttr} aria-label="外す">✕</button></span>`;
 }
 
+/* フォームの添付ファイル欄（作業記録・設備台帳で共通）。bindFileAttach と組で使う */
+function fileAttachField(examples) {
+  return `<div class="field full"><span>添付ファイル<em class="hint" style="font-weight:400">（PDF・写真。${h(examples)}）</em></span>
+    <div class="rf-list" id="rf-list"></div>
+    <div><button type="button" class="btn small" id="rf-add">ファイルを追加</button> <span class="hint">1ファイル30MBまで。保存すると添付されます</span></div>
+  </div>`;
+}
+
+/* 添付ファイル: 登録済みはすぐ外せる（delBase/{id} を DELETE）。新しく選んだものは返す配列に入るので、保存のときに送る */
+function bindFileAttach(savedFiles, delBase) {
+  const pending = [];
+  const drawFiles = () => {
+    $("#rf-list").innerHTML = [
+      ...savedFiles.map(f => fileChip(f.name, f.size, `/record-files/${f.file}`, `data-rf="${f.id}"`)),
+      ...pending.map((f, i) => fileChip(f.name, f.size, "", `data-pend="${i}"`, true)),
+    ].join("") || `<span class="hint">なし</span>`;
+    $$("#rf-list [data-rf]").forEach(b => b.addEventListener("click", async () => {
+      if (!confirm("この添付ファイルを外しますか？")) return;
+      try {
+        await api(`${delBase}/${b.dataset.rf}`, { method: "DELETE" });
+        savedFiles.splice(savedFiles.findIndex(f => f.id == b.dataset.rf), 1);
+        drawFiles();
+      } catch (ex) { toast(ex.message); }
+    }));
+    $$("#rf-list [data-pend]").forEach(b => b.addEventListener("click", () => { pending.splice(+b.dataset.pend, 1); drawFiles(); }));
+  };
+  $("#rf-add").addEventListener("click", () => {
+    const inp = document.createElement("input");
+    inp.type = "file"; inp.multiple = true;
+    inp.accept = "application/pdf,.pdf,image/jpeg,.jpg,.jpeg,image/png,.png";
+    inp.onchange = () => {
+      const big = [...inp.files].filter(f => f.size > 30 * 1024 * 1024);
+      if (big.length) toast(`30MB を超えるファイルは添付できません: ${big.map(f => f.name).join("、")}`, 4000);
+      pending.push(...[...inp.files].filter(f => f.size <= 30 * 1024 * 1024));
+      drawFiles();
+    };
+    inp.click();
+  });
+  drawFiles();
+  return pending;
+}
+
 function timelineItem(r) {
   return `<li class="${r.kind === "定期" ? "teiki" : r.kind === "不定期" ? "futeiki" : ""}" data-record="${r.id}">
     <div class="tl-date">${dateCell(r)} ${kindBadge(r.kind)} ${r.equipment_name || r.location ? eqLabel(r) : ""}${r.file_count ? ` <span class="rf-count" title="添付ファイル">📎${r.file_count}</span>` : ""}</div>
@@ -410,10 +452,7 @@ async function openRecordForm(id, preset = {}) {
       <label class="field"><span>関連する定期項目</span><select name="rule_id"><option value="">なし</option></select><span class="hint">完了で保存すると前回実施日が更新されます</span></label>
       <label class="field"><span>部品シリアル</span><input name="part_serial" list="serial-list" value="${h(rec.part_serial || "")}" placeholder="例: M1005.1"><datalist id="serial-list"></datalist></label>
       <label class="field"><span>費用（円）</span><input type="number" min="0" name="cost" value="${h(rec.cost ?? "")}" inputmode="numeric"></label>
-      <div class="field full"><span>添付ファイル<em class="hint" style="font-weight:400">（PDF・写真。報告書・見積書・現場写真など）</em></span>
-        <div class="rf-list" id="rf-list"></div>
-        <div><button type="button" class="btn small" id="rf-add">ファイルを追加</button> <span class="hint">1ファイル30MBまで。保存すると添付されます</span></div>
-      </div>
+      ${fileAttachField("報告書・見積書・現場写真など")}
     </div>
     <p class="err" id="form-err" hidden></p>`;
   const foot = `
@@ -453,37 +492,7 @@ async function openRecordForm(id, preset = {}) {
     $("#location-list").innerHTML = locs.map(l => `<option value="${h(l)}">`).join("");
   }).catch(() => { /* 候補は補助なので無視 */ });
 
-  /* 添付ファイル: 登録済みはすぐ外せる。新しく選んだものは保存のときに送る */
-  const savedFiles = rec.files || [];
-  let pending = [];
-  const drawFiles = () => {
-    $("#rf-list").innerHTML = [
-      ...savedFiles.map(f => fileChip(f.name, f.size, `/record-files/${f.file}`, `data-rf="${f.id}"`)),
-      ...pending.map((f, i) => fileChip(f.name, f.size, "", `data-pend="${i}"`, true)),
-    ].join("") || `<span class="hint">なし</span>`;
-    $$("#rf-list [data-rf]").forEach(b => b.addEventListener("click", async () => {
-      if (!confirm("この添付ファイルを外しますか？")) return;
-      try {
-        await api(`/record-files/${b.dataset.rf}`, { method: "DELETE" });
-        savedFiles.splice(savedFiles.findIndex(f => f.id == b.dataset.rf), 1);
-        drawFiles();
-      } catch (ex) { toast(ex.message); }
-    }));
-    $$("#rf-list [data-pend]").forEach(b => b.addEventListener("click", () => { pending.splice(+b.dataset.pend, 1); drawFiles(); }));
-  };
-  $("#rf-add").addEventListener("click", () => {
-    const inp = document.createElement("input");
-    inp.type = "file"; inp.multiple = true;
-    inp.accept = "application/pdf,.pdf,image/jpeg,.jpg,.jpeg,image/png,.png";
-    inp.onchange = () => {
-      const big = [...inp.files].filter(f => f.size > 30 * 1024 * 1024);
-      if (big.length) toast(`30MB を超えるファイルは添付できません: ${big.map(f => f.name).join("、")}`, 4000);
-      pending.push(...[...inp.files].filter(f => f.size <= 30 * 1024 * 1024));
-      drawFiles();
-    };
-    inp.click();
-  });
-  drawFiles();
+  const pending = bindFileAttach(rec.files || [], "/record-files");
 
   form.onsubmit = async e => {
     e.preventDefault();
@@ -990,7 +999,7 @@ function groupBy(list, key, order = []) {
 
 /* 種類ごとの色（台帳の見出し・カード・種類チップで同じ色を使う。隣り合う種類は色相を離す） */
 const CAT_COLORS = {
-  "切断・粉砕": "#d35400", "配合・混合": "#b7950b", "成型": "#8e44ad", "加熱・殺菌": "#c0392b",
+  "肉処理": "#d35400", "玉葱": "#d6567a", "配合・混合": "#b7950b", "成型": "#8e44ad", "加熱・殺菌": "#c0392b",
   "冷凍・冷蔵・解凍": "#3498db", "包装・充填・計数": "#16a085", "検査機（X線・金検）": "#34495e", "細菌検査": "#a93f7a",
   "品質管理": "#5b6abf", "搬送": "#6d8b2f", "洗浄": "#17a2b8", "ボイラー・蒸気": "#a0522d",
   "給水・圧縮空気": "#1a5276", "空調・換気": "#58a55c", "排水処理": "#7f6a4f", "その他": "#8a8984",
@@ -1057,18 +1066,41 @@ async function renderEquipment(id) {
     <div class="cat-chips" id="cat-chips"></div>
     <div id="eq-body"></div>`;
 
-  const groupHtml = (key, label, list, level) => {
-    const open = !eqCollapsed.has(key);
-    return `<details class="eq-group lv${level}" data-key="${h(key)}" ${catStyle(label)} ${open ? "open" : ""}>
-      <summary><span class="g-title">${h(label)}</span><span class="g-count">${list.length}台</span>${alertChips(list)}</summary>
-      ${eqPrefs.view === "list" ? eqTable(list) : `<div class="eq-grid">${list.map(eqCard).join("")}</div>`}
-    </details>`;
+  const itemsHtml = list => eqPrefs.view === "list" ? eqTable(list) : `<div class="eq-grid">${list.map(eqCard).join("")}</div>`;
+  /* 小分類の枠。小分類は「X線／Aライン」のように「／」で区切ると枠の中にさらに枠を作る。
+     depth 段目の言葉で分け、その段に言葉のない設備は最後に「その他」 */
+  const subPath = e => (e.subgroup || "").split(/\s*[\/／]\s*/).filter(Boolean);
+  const subsHtml = (key, list, depth, order) => {
+    if (!list.some(e => subPath(e)[depth])) return itemsHtml(list);
+    // 枠の並びは db.py の SUBGROUP_ORDER の順、なければ稼働中の設備の順（廃止を表示しても枠の順が変わらないように）。
+    // ただし小分類がすべて英数字で始まる（Aライン・Bライン など）ときは名前順
+    const active = [...list].sort((a, b) => (a.status === "廃止") - (b.status === "廃止"));
+    const seg = e => subPath(e)[depth];
+    let subs = groupBy([...active.filter(seg), ...active.filter(e => !seg(e))], seg, order);
+    const named = subs.filter(([, l]) => seg(l[0]));
+    if (named.every(([s]) => /^[A-Za-z0-9]/.test(norm(s)))) {
+      subs = [...named.sort(([a], [b]) => norm(a).localeCompare(norm(b), "ja", { numeric: true })),
+        ...subs.filter(([, l]) => !seg(l[0]))];
+    }
+    return `<div class="eq-subs">${subs.map(([s, l]) => {
+      const k = `${key}|${s}`;
+      return `<details class="eq-sub" data-key="${h(k)}" ${eqCollapsed.has(k) ? "" : "open"}>
+        <summary><span class="s-title">${h(s)}</span><span class="g-count">${l.length}台</span>${alertChips(l)}</summary>
+        ${seg(l[0]) ? subsHtml(k, l, depth + 1, []) : itemsHtml(l)}
+      </details>`;
+    }).join("")}</div>`;
   };
+  /* 種類の枠 */
+  const groupHtml = (key, label, list, level) => `
+    <details class="eq-group lv${level}" data-key="${h(key)}" ${catStyle(label)} ${eqCollapsed.has(key) ? "" : "open"}>
+      <summary><span class="g-title">${h(label)}</span><span class="g-count">${list.length}台</span>${alertChips(list)}</summary>
+      ${subsHtml(key, list, 0, state.meta.subgroup_order?.[label] || [])}
+    </details>`;
 
   const draw = () => {
     const q = norm($("#eq-q").value).toLowerCase();
     const base = all.filter(e => inArea(e) && (eqPrefs.retired || e.status !== "廃止") &&
-      (!q || norm([e.code, e.name, e.nickname, e.maker, e.vendor_name, e.category].join(" ")).toLowerCase().includes(q)));
+      (!q || norm([e.code, e.name, e.nickname, e.maker, e.vendor_name, e.category, e.subgroup].join(" ")).toLowerCase().includes(q)));
     // 種類チップ（件数つき）
     const cats = groupBy(base, e => e.category, state.meta.categories);
     $("#cat-chips").innerHTML = `<button class="chip ${category ? "" : "on"}" data-cat="">すべて <b>${base.length}</b></button>` +
@@ -1116,9 +1148,9 @@ function norm(s) {
 
 /* 設備台帳の変更履歴（ふだんは閉じておく。同じ時刻・同じ人の変更は 1 行にまとめる） */
 const EQ_FIELD_LABELS = {
-  code: "設備No", name: "正式名", nickname: "通称", category: "種類", model: "型式", maker: "メーカー",
+  code: "設備No", name: "正式名", nickname: "通称", category: "種類", subgroup: "小分類", model: "型式", maker: "メーカー",
   vendor_id: "取引業者", supplier: "納入業者", asset_no: "資産No", serial_no: "製造番号", manufactured: "製造年",
-  delivered: "納入年月日", area: "エリア", status: "状態", note: "メモ", current_hours: "アワーメーター",
+  delivered: "納入年月日", area: "エリア", status: "状態", note: "メモ", current_hours: "アワーメーター", files: "添付ファイル",
 };
 /* 変更内容の行（「設備No: 空欄 → K9」）。追加のときは field が空 */
 function eqChangeLines(items) {
@@ -1155,7 +1187,7 @@ async function renderEquipmentDetail(id) {
         <h3>${h(eq.code || "設備No未採番")} ${h(eqTitle(eq))} ${eq.status === "廃止" ? '<span class="lv unknown">廃止</span>' : ""}</h3>
         <dl class="info">
           <dt>正式名</dt><dd>${h(eq.name)}</dd>
-          <dt>エリア・種類</dt><dd>${h(eq.area)} ／ ${h(eq.category)}</dd>
+          <dt>エリア・種類</dt><dd>${h(eq.area)} ／ ${h(eq.category)}${eq.subgroup ? ` ／ ${h(eq.subgroup)}` : ""}</dd>
           <dt>型式</dt><dd>${h(eq.model)}</dd>
           <dt>メーカー</dt><dd>${h(eq.maker)}</dd>
           <dt>納入業者</dt><dd>${h(eq.supplier)}</dd>
@@ -1164,6 +1196,7 @@ async function renderEquipmentDetail(id) {
           <dt>製造年</dt><dd>${h(eq.manufactured)}</dd>
           <dt>納入年月日</dt><dd>${h(eq.delivered)}</dd>
           <dt>メモ</dt><dd>${h(eq.note)}</dd>
+          <dt>添付ファイル</dt><dd>${eq.files.length ? `<div class="rf-list">${eq.files.map(f => `<span class="rf-item"><a href="/record-files/${h(f.file)}" target="_blank" rel="noopener"><span class="rf-name"><span class="rf-type">${/\.pdf$/i.test(f.name) ? "PDF" : "写真"}</span>${h(f.name)}</span></a></span>`).join("")}</div>` : `<span class="muted">なし</span>`}</dd>
         </dl>
         <div style="margin-top:12px"><button class="btn small" id="edit-eq">設備情報を編集</button> <button class="btn small" id="copy-eq">この設備をコピー</button></div>
       </div>
@@ -1241,7 +1274,7 @@ async function renderEquipmentDetail(id) {
 
 /* src を渡すとその設備をコピーした内容で「追加」の画面を開く（1台ごとに違う設備No・資産No・製造番号などは空にする） */
 async function openEquipmentForm(eq, src) {
-  const vendors = await api("/vendors");
+  const [vendors] = await Promise.all([api("/vendors"), loadEquipment()]);  // 設備一覧は小分類の入力候補に使う
   const e = eq || (src ? { ...src, code: "", asset_no: "", serial_no: "", manufactured: "", delivered: "", status: "稼働" }
     : { status: "稼働", area: "前処理" });
   const f = (name, label, cls = "") => `<label class="field ${cls}"><span>${label}</span><input name="${name}" value="${h(e[name] ?? "")}"></label>`;
@@ -1252,6 +1285,8 @@ async function openEquipmentForm(eq, src) {
       ${f("code", "設備No")}${f("nickname", "通称（現場での呼び名）")}
       ${f("name", "正式名 *", "full")}
       <label class="field"><span>種類</span><select name="category">${state.meta.categories.map(c => `<option ${e.category === c ? "selected" : ""}>${h(c)}</option>`).join("")}</select></label>
+      <label class="field"><span>小分類</span><input name="subgroup" value="${h(e.subgroup ?? "")}" list="subgroup-list" placeholder="例：サイレントカッター、X線／Aライン"><span class="hint">同じ言葉の設備が種類の中で 1 つの枠にまとまります。「／」で区切ると枠の中にさらに枠を作ります</span></label>
+      <datalist id="subgroup-list">${[...new Set(state.equipment.map(x => x.subgroup).filter(Boolean))].map(s => `<option value="${h(s)}">`).join("")}</datalist>
       ${f("model", "型式")}${f("maker", "メーカー")}
       ${f("supplier", "納入業者名")}
       <label class="field"><span>取引業者</span><select name="vendor_id"><option value="">なし</option>${vendors.map(v => `<option value="${v.id}" ${e.vendor_id == v.id ? "selected" : ""}>${h(v.name)}</option>`).join("")}</select></label>
@@ -1260,18 +1295,31 @@ async function openEquipmentForm(eq, src) {
       <label class="field"><span>状態</span><select name="status"><option ${e.status === "稼働" ? "selected" : ""}>稼働</option><option ${e.status === "廃止" ? "selected" : ""}>廃止</option></select></label>
       ${f("area", "エリア")}
       <label class="field full"><span>メモ</span><textarea name="note">${h(e.note || "")}</textarea></label>
+      ${fileAttachField("取扱説明書・図面・銘板や設備の写真など")}
       ${copyRules}
     </div><p class="err" id="form-err" hidden></p>`, `
     <button type="button" class="btn" data-close>キャンセル</button><button type="submit" class="btn primary">保存</button>`);
+  const pending = bindFileAttach(eq?.files || [], "/equipment-files");  // コピーのときは元の設備のファイルを引き継がない
   const form = $("#modal-form");
   form.onsubmit = async ev => {
     ev.preventDefault();
     const data = Object.fromEntries(new FormData(form));
     try {
+      let eqId = eq?.id;
       if (eq) await api(`/equipment/${eq.id}`, { method: "PUT", body: data });
-      else { const r = await api("/equipment", { method: "POST", body: data }); location.hash = `#/equipment/${r.id}`; }
+      else { eqId = (await api("/equipment", { method: "POST", body: data })).id; location.hash = `#/equipment/${eqId}`; }
       state.equipment = [];
-      closeModal(); toast("保存しました"); router();
+      if (pending.length) {
+        const fd = new FormData();
+        pending.forEach(f => fd.append("file", f));
+        try { await api(`/equipment/${eqId}/files`, { method: "POST", body: fd }); }
+        catch (ex) {  // 設備情報は保存できているので、開き直してファイルだけ付け直してもらう
+          closeModal(); router();
+          toast(`設備情報は保存しましたが、ファイルを添付できませんでした: ${ex.message}`, 6000);
+          return;
+        }
+      }
+      closeModal(); toast(pending.length ? `保存しました（ファイル ${pending.length} 件を添付）` : "保存しました"); router();
     } catch (ex) { $("#form-err").textContent = ex.message; $("#form-err").hidden = false; }
   };
 }
@@ -1435,7 +1483,7 @@ async function openCatalogForm(c, preset = {}) {
 const IMPORT_LABELS = {
   group_name: "区分", machine: "機械・場所", name: "部品名", unit_price: "単価", qty: "数量", note: "備考", memo: "補足",
   location: "保管場所", equipment_id: "紐づけ設備", area: "エリア",
-  category: "種類", code: "設備No", nickname: "通称", model: "型式", maker: "メーカー", supplier: "納入業者", vendor_id: "取引業者",
+  category: "種類", subgroup: "小分類", code: "設備No", nickname: "通称", model: "型式", maker: "メーカー", supplier: "納入業者", vendor_id: "取引業者",
   asset_no: "資産No", serial_no: "製造番号", manufactured: "製造年", delivered: "納入年月日", part_type: "種別", status: "状態", grind_count: "研磨回数", grind_limit: "研磨上限",
 };
 

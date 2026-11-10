@@ -14,7 +14,7 @@ from urllib.parse import quote, unquote
 
 from flask import Flask, Response, abort, g, has_request_context, jsonify, request, send_from_directory
 
-from db import CATEGORIES, DB_PATH, EQ_FIELD_LABELS, connect, init_db, log_equipment
+from db import CATEGORIES, DB_PATH, EQ_FIELD_LABELS, SUBGROUP_ORDER, connect, init_db, log_equipment
 from import_xls import norm
 import equipment_xlsx
 import pla
@@ -155,6 +155,9 @@ ACTIVITY = {  # API の関数名: (分類, 操作, 何に対してかを返す�
     "equipment_create": ("設備台帳", "登録", lambda c, a, d: {"target": d.get("name"), "area": d.get("area"), "ref_type": "equipment"}),
     "equipment_update": ("設備台帳", "変更", lambda c, a, d: dict(zip(("target", "area"), _eq_target(c, a["eq_id"])), ref_type="equipment", ref_id=a["eq_id"])),
     "equipment_hours": ("設備台帳", "アワーメーター更新", lambda c, a, d: dict(zip(("target", "area"), _eq_target(c, a["eq_id"])), detail=f"{d.get('current_hours')}h", ref_type="equipment", ref_id=a["eq_id"])),
+    "equipment_file_upload": ("設備台帳", "添付ファイル追加", lambda c, a, d: dict(zip(("target", "area"), _eq_target(c, a["eq_id"])), detail=f"{len(request.files.getlist('file'))}件", ref_type="equipment", ref_id=a["eq_id"])),
+    "equipment_file_delete": ("設備台帳", "添付ファイル削除", lambda c, a, d: (lambda f: dict(zip(("target", "area"), _eq_target(c, f.get("equipment_id"))), detail=f.get("name"), ref_type="equipment", ref_id=f.get("equipment_id")))(
+        _row(c, "SELECT equipment_id, name FROM equipment_files WHERE id=?", a["file_id"]))),
     "equipment_import": ("設備台帳", "Excel取込", lambda c, a, d: {"only_applied": True}),
     "record_create": ("作業記録", "登録", lambda c, a, d: _act_record(c, None, d)),
     "record_update": ("作業記録", "変更", lambda c, a, d: _act_record(c, a["rec_id"], d)),
@@ -323,6 +326,7 @@ def meta():
         record_statuses=RECORD_STATUSES,
         part_statuses=PART_STATUSES,
         categories=CATEGORIES,
+        subgroup_order=SUBGROUP_ORDER,
         part_events=list(PART_EVENT_STATUS),
         authors=authors,
         areas=[r[0] for r in conn.execute(
@@ -372,12 +376,13 @@ def equipment_detail(eq_id):
         p["level"] = part_state(p)
     eq["catalog"] = rows(conn.execute(
         "SELECT * FROM part_catalog WHERE equipment_id = ? ORDER BY sort_order, id", (eq_id,)))
+    eq["files"] = rows(conn.execute("SELECT * FROM equipment_files WHERE equipment_id = ? ORDER BY id", (eq_id,)))
     eq["history"] = rows(conn.execute(
         "SELECT * FROM equipment_history WHERE equipment_id = ? ORDER BY changed_at DESC, id", (eq_id,)))
     return jsonify(eq)
 
 
-EQ_FIELDS = ["code", "name", "nickname", "category", "model", "maker", "vendor_id", "supplier", "asset_no", "serial_no",
+EQ_FIELDS = ["code", "name", "nickname", "category", "subgroup", "model", "maker", "vendor_id", "supplier", "asset_no", "serial_no",
              "manufactured", "delivered", "area", "status", "note"]
 
 
@@ -660,7 +665,7 @@ def record_delete(rec_id):
     return jsonify(ok=True)
 
 
-# ---- 添付ファイル（PDF・写真）
+# ---- 添付ファイル（PDF・写真）。作業記録と設備台帳で共通。本体はどちらも data/record_files/ に置く（バックアップも共通）
 RECORD_FILE_DIR = os.path.join(os.path.dirname(DB_PATH), "record_files")
 RECORD_FILE_TYPES = {"application/pdf": "pdf", "image/jpeg": "jpg", "image/png": "png"}
 RECORD_FILE_MAX = 30 * 1024 * 1024
@@ -670,17 +675,15 @@ RECORD_FILE_MAX = 30 * 1024 * 1024
 def record_file(name):
     """inline で返す（PDF・写真はブラウザでそのまま開く）。?dl=1 なら元のファイル名でダウンロード。"""
     if request.args.get("dl"):
-        r = db().execute("SELECT name FROM record_files WHERE file=? LIMIT 1", (name,)).fetchone()
+        r = db().execute("""SELECT name FROM record_files WHERE file=? UNION ALL
+                            SELECT name FROM equipment_files WHERE file=? LIMIT 1""", (name, name)).fetchone()
         return send_from_directory(RECORD_FILE_DIR, name, as_attachment=True,
                                    download_name=(r and r["name"]) or name)
     return send_from_directory(RECORD_FILE_DIR, name, max_age=86400 * 30)
 
 
-@app.post("/api/records/<int:rec_id>/files")
-def record_file_upload(rec_id):
-    conn = db()
-    if not conn.execute("SELECT 1 FROM records WHERE id=?", (rec_id,)).fetchone():
-        abort(404)
+def save_uploaded_files():
+    """送られたファイルを保存して (保存名, 元のファイル名, サイズ, 日時) の一覧を返す。"""
     files = request.files.getlist("file")
     if not files:
         abort(400, "ファイルを選んでください")
@@ -699,9 +702,19 @@ def record_file_upload(rec_id):
         if not os.path.exists(path):
             with open(path, "wb") as out:
                 out.write(data)
-        saved.append((rec_id, name, os.path.basename(f.filename or "") or name, len(data),
+        saved.append((name, os.path.basename(f.filename or "") or name, len(data),
                       dt.datetime.now().isoformat(timespec="seconds")))
-    conn.executemany("INSERT INTO record_files(record_id, file, name, size, created_at) VALUES (?,?,?,?,?)", saved)
+    return saved
+
+
+@app.post("/api/records/<int:rec_id>/files")
+def record_file_upload(rec_id):
+    conn = db()
+    if not conn.execute("SELECT 1 FROM records WHERE id=?", (rec_id,)).fetchone():
+        abort(404)
+    saved = save_uploaded_files()
+    conn.executemany("INSERT INTO record_files(record_id, file, name, size, created_at) VALUES (?,?,?,?,?)",
+                     [(rec_id, *s) for s in saved])
     conn.commit()
     return jsonify(ok=True, count=len(saved)), 201
 
@@ -710,6 +723,31 @@ def record_file_upload(rec_id):
 def record_file_delete(file_id):
     conn = db()
     conn.execute("DELETE FROM record_files WHERE id=?", (file_id,))  # 同じ中身をほかの記録でも使っていることがあるので本体は残す
+    conn.commit()
+    return jsonify(ok=True)
+
+
+@app.post("/api/equipment/<int:eq_id>/files")
+def equipment_file_upload(eq_id):
+    conn = db()
+    if not conn.execute("SELECT 1 FROM equipment WHERE id=?", (eq_id,)).fetchone():
+        abort(404)
+    saved = save_uploaded_files()
+    conn.executemany("INSERT INTO equipment_files(equipment_id, file, name, size, created_at) VALUES (?,?,?,?,?)",
+                     [(eq_id, *s) for s in saved])
+    log_equipment(conn, eq_id, "変更", {"files": (None, "、".join(s[1] for s in saved))}, by=request_user())
+    conn.commit()
+    return jsonify(ok=True, count=len(saved)), 201
+
+
+@app.delete("/api/equipment-files/<int:file_id>")
+def equipment_file_delete(file_id):
+    conn = db()
+    f = conn.execute("SELECT equipment_id, name FROM equipment_files WHERE id=?", (file_id,)).fetchone()
+    if not f:
+        abort(404)
+    conn.execute("DELETE FROM equipment_files WHERE id=?", (file_id,))  # 本体はほかでも使っていることがあるので残す
+    log_equipment(conn, f["equipment_id"], "変更", {"files": (f["name"], None)}, by=request_user())
     conn.commit()
     return jsonify(ok=True)
 

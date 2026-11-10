@@ -8,7 +8,7 @@
 保存先の中身:
     db/maintenance_YYYYMMDD_HHMMSS.db   DB の世代バックアップ（古いものから消す）
     pla_photos/                         点検写真（追加・変更されたものだけコピー。アプリで消した写真も残す）
-    record_files/                       作業記録の添付ファイル（PDF・写真。コピーの仕方は pla_photos と同じ）
+    record_files/                       作業記録・設備台帳の添付ファイル（PDF・写真。コピーの仕方は pla_photos と同じ）
 
 戻すとき: アプリを止めて、残したい世代の .db を data/maintenance.db に、
 pla_photos/・record_files/ を data/ の同じ名前のフォルダにコピーしてから起動する。

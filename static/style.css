@@ -267,6 +267,19 @@ details.eq-group[style*="--cat"] .g-title::before { content: ""; display: inline
 .eq-card[style*="--cat"] { border-top: 4px solid var(--cat); }
 .eq-card[style*="--cat"]:hover { border-color: var(--cat); }
 details.eq-group[style*="--cat"] .eq-table tbody td:first-child { box-shadow: inset 4px 0 0 var(--cat); }
+/* 小分類の枠（種類の枠の中） */
+details.eq-group > .eq-subs { padding: 10px 12px 2px; background: var(--surface-2); border-radius: 0 0 8px 0; }
+details.eq-sub { border: 1px solid var(--line); border-radius: 8px; background: var(--surface); margin-bottom: 10px; }
+details.eq-sub > summary { list-style: none; cursor: pointer; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 7px 12px; font-weight: 700; font-size: 14px; user-select: none; }
+details.eq-sub > summary::-webkit-details-marker { display: none; }
+details.eq-sub > summary::before { content: "▸"; color: var(--muted); width: 10px; transition: transform .15s; }
+details.eq-sub[open] > summary::before { transform: rotate(90deg); }
+details.eq-sub[open] > summary { border-bottom: 1px solid var(--line); }
+details.eq-group[style*="--cat"] details.eq-sub { border-left: 4px solid var(--cat); }
+details.eq-group[style*="--cat"] .s-title { color: var(--cat); }
+details.eq-sub > .eq-grid { padding: 10px; }
+details.eq-sub > .eq-subs { padding: 10px 10px 0; background: var(--surface-2); border-radius: 0 0 8px 0; }  /* 2 段目の枠 */
+details.eq-sub > .table-wrap { border: 0; border-radius: 0 0 8px 8px; }
 .chip.cat::before { content: ""; display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--cat); margin-right: 6px; vertical-align: 1px; }
 .chip.cat.on { background: var(--cat); border-color: var(--cat); }
 .chip.cat.on::before { background: #fff; }
