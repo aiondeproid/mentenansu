@@ -284,6 +284,15 @@ details.eq-sub > .table-wrap { border: 0; border-radius: 0 0 8px 8px; }
 .chip.cat.on { background: var(--cat); border-color: var(--cat); }
 .chip.cat.on::before { background: #fff; }
 .crumb { font-size: 13px; margin-left: 8px; }
+/* 設備の画面の上の戻るリンクとパンくず */
+.eq-nav { display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 18px; margin-bottom: 10px; }
+.eq-nav .back { margin-bottom: 0; }
+.eq-nav .crumb { margin-left: 0; }
+.eq-nav .crumb a { color: inherit; text-decoration: underline; text-decoration-color: var(--line); text-underline-offset: 3px; }
+.eq-nav .crumb a:hover { color: var(--link); text-decoration-color: currentColor; }
+/* パンくずから来たときに、移動先の枠を少しの間目立たせる */
+details.flash { animation: eq-flash 2s ease-out; }
+@keyframes eq-flash { 0%, 40% { box-shadow: 0 0 0 3px var(--link); } 100% { box-shadow: 0 0 0 3px transparent; } }
 .eq-card .eq-meta { display: flex; flex-wrap: wrap; gap: 0 10px; }
 .eq-card .eq-meta > span { white-space: nowrap; }
 

@@ -1039,7 +1039,10 @@ function eqTable(list) {
 async function renderEquipment(id) {
   if (id) return renderEquipmentDetail(+id);
   const all = await loadEquipment(true);
-  let category = "";
+  // 設備の画面のパンくずから来たときは、その種類で絞り込んで、押した分類の枠まで移動する
+  const focus = state.eqFocus;
+  state.eqFocus = null;
+  let category = focus?.category || "";
   view.innerHTML = `
     <div class="toolbar">
       <div class="search"><span>🔍</span><input id="eq-q" type="search" placeholder="通称・正式名・設備No・メーカーで絞り込み"></div>
@@ -1069,7 +1072,7 @@ async function renderEquipment(id) {
   const itemsHtml = list => eqPrefs.view === "list" ? eqTable(list) : `<div class="eq-grid">${list.map(eqCard).join("")}</div>`;
   /* 小分類の枠。小分類は「X線／Aライン」のように「／」で区切ると枠の中にさらに枠を作る。
      depth 段目の言葉で分け、その段に言葉のない設備は最後に「その他」 */
-  const subPath = e => (e.subgroup || "").split(/\s*[\/／]\s*/).filter(Boolean);
+  const subPath = eqSubPath;
   const subsHtml = (key, list, depth, order) => {
     if (!list.some(e => subPath(e)[depth])) return itemsHtml(list);
     // 枠の並びは db.py の SUBGROUP_ORDER の順、なければ稼働中の設備の順（廃止を表示しても枠の順が変わらないように）。
@@ -1139,6 +1142,35 @@ async function renderEquipment(id) {
   $("#new-eq").addEventListener("click", () => openEquipmentForm(null));
   $("#eq-import").addEventListener("click", () => openXlsxImport(EQUIPMENT_IMPORT));
   draw();
+  if (focus) {
+    const key = [eqPrefs.group === "area" && !state.area ? focus.area : "*", focus.category, ...focus.path].join("|");
+    const target = $$("#eq-body details").find(d => d.dataset.key === key);
+    if (target) {
+      target.scrollIntoView({ block: "start" });
+      target.classList.add("flash");
+      setTimeout(() => target.classList.remove("flash"), 2000);
+    }
+  }
+}
+
+/* 小分類を段ごとに分ける（「X線／Aライン」→ ["X線", "Aライン"]） */
+function eqSubPath(e) {
+  return (e.subgroup || "").split(/\s*[\/／]\s*/).filter(Boolean);
+}
+
+/* 設備の画面の上のリンク。「← 設備台帳へ戻る」「← ひとつ上の分類へ戻る」と、エリア ＞ 種類 ＞ 小分類… のパンくず */
+function eqCrumbs(eq) {
+  const path = eqSubPath(eq);
+  const levels = [{ label: eq.category, path: [] }, ...path.map((s, i) => ({ label: s, path: path.slice(0, i + 1) }))];
+  const link = (lv, i) => `<a href="#/equipment" data-focus="${i}">${h(lv.label)}</a>`;
+  return {
+    levels,
+    html: `<div class="eq-nav">
+      <a class="back" href="#/equipment">← 設備台帳へ戻る</a>
+      ${eq.category ? `<a class="back" href="#/equipment" data-focus="${levels.length - 1}">← ${h(levels.at(-1).label)} へ戻る</a>` : ""}
+      <span class="muted crumb">${h(eq.area)}${eq.category ? ` ＞ ${levels.map(link).join(" ＞ ")}` : ""}</span>
+    </div>`,
+  };
 }
 
 /* 半角カナ・全角英数をそろえる（サーバー側の norm と同じ考え方） */
@@ -1180,8 +1212,9 @@ function eqHistory(list) {
 async function renderEquipmentDetail(id) {
   const [eq, recs] = await Promise.all([api(`/equipment/${id}`), api(`/records?equipment_id=${id}`)]);
   $("#page-title").textContent = eqTitle(eq);
+  const crumbs = eqCrumbs(eq);
   view.innerHTML = `
-    <a class="back" href="#/equipment">← 設備台帳へ戻る</a> <span class="muted crumb">${h(eq.area)} ＞ ${h(eq.category)}</span>
+    ${crumbs.html}
     <div class="grid cols-2">
       <div class="card">
         <h3>${h(eq.code || "設備No未採番")} ${h(eqTitle(eq))} ${eq.status === "廃止" ? '<span class="lv unknown">廃止</span>' : ""}</h3>
@@ -1255,6 +1288,10 @@ async function renderEquipmentDetail(id) {
       || `<li class="muted">${recs.length ? "該当する履歴なし" : "履歴なし"}</li>`;
     bindRowClicks($("#rec-list"));
   };
+  // パンくず: 押した分類を覚えてから設備台帳へ（リンク先の #/equipment への移動はブラウザに任せる）
+  $$(".eq-nav [data-focus]").forEach(a => a.addEventListener("click", () => {
+    state.eqFocus = { area: eq.area, category: eq.category, path: crumbs.levels[+a.dataset.focus].path };
+  }));
   $("#edit-eq").addEventListener("click", () => openEquipmentForm(eq));
   $("#copy-eq").addEventListener("click", () => openEquipmentForm(null, eq));
   $("#add-rule").addEventListener("click", () => openRuleForm(null, { equipment_id: id }));
