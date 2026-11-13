@@ -92,6 +92,7 @@ const routes = {
   calendar: ["工事点検計画", renderCalendar],
   plans: ["交換アラート", renderPlans],
   equipment: ["設備台帳", renderEquipment],
+  instruments: ["測定機器", renderInstruments],
   parts: ["部品・研磨管理", renderParts],
   analytics: ["分析", renderAnalytics],
   vendors: ["取引業者", renderVendors],
@@ -145,7 +146,7 @@ function markNewsSeen(at) {
 const isUnread = (n, seen) => n.at > seen && !(n.by && n.by === currentUser());
 const unreadNews = news => { const seen = newsSeen(news); return (news || []).filter(n => isUnread(n, seen)); };
 
-const NEWS_KIND_CLASS = { 作業記録: "record", 設備台帳: "equipment", 交換アラート: "rule", 部品: "part", プラ点検: "pla", 取引業者: "vendor", 通知: "notify" };
+const NEWS_KIND_CLASS = { 作業記録: "record", 設備台帳: "equipment", 交換アラート: "rule", 部品: "part", プラ点検: "pla", 取引業者: "vendor", 通知: "notify", 測定機器: "instrument" };
 const NEWS_PAGE = { catalog: "#/parts/catalog", pla: "#/pla", vendor: "#/vendors", notify: "#/notify" };
 
 function newsWhen(at) {
@@ -159,6 +160,7 @@ function newsLink(n) {
   if (/削除/.test(n.action)) return "";
   if (NEWS_PAGE[n.ref_type]) return `data-href="${NEWS_PAGE[n.ref_type]}"`;
   if (!n.ref_id) return "";
+  if (n.ref_type === "instrument") return `data-href="#/instruments${n.ref_id ? `/${n.ref_id}` : ""}"`;
   return { record: `data-record="${n.ref_id}"`, equipment: `data-eq="${n.ref_id}"`, rule: `data-rule="${n.ref_id}"`, part: `data-part="${n.ref_id}"` }[n.ref_type] || "";
 }
 
@@ -1361,6 +1363,174 @@ async function openEquipmentForm(eq, src) {
   };
 }
 
+/* ================================================================ 測定機器（秤量器など。「測定機器毎の管理台帳」） */
+const instState = { kind: "", q: "", status: "active", rank: "" };
+const INST_ACTIVE = ["使用中", "故障中", "予備"];
+const INST_ST_CLASS = { 使用中: "ok", 故障中: "over", 運休: "soon", 予備: "unknown", 廃棄: "none", 欠番: "none" };
+const instBadge = s => `<span class="lv ${INST_ST_CLASS[s] || "unknown"}">${h(s || "")}</span>`;
+let instMeta = null;
+/* 項目名は種類ごとに読み替える（秤量器の「最大秤量」はノギスでは「使用範囲」など） */
+const instLabel = (kind, key, def) => instMeta?.labels?.[kind]?.[key] || def;
+async function loadInstMeta() { return (instMeta ||= await api("/instruments/meta")); }
+
+async function renderInstruments(id) {
+  const [list] = await Promise.all([api("/instruments" + areaQS()), loadInstMeta()]);
+  const kinds = [...new Set([...instMeta.kinds, ...list.map(i => i.kind)])];
+  if (!kinds.includes(instState.kind)) instState.kind = kinds[0] || "";
+  view.innerHTML = `
+    <div class="tabs-row">
+      <nav class="tabs">${kinds.map(k => `<a href="#/instruments" data-kind="${h(k)}" class="${k === instState.kind ? "on" : ""}">${h(k)}</a>`).join("")}</nav>
+      <div class="tabs-actions">
+        <a class="btn" href="/api/instruments/export.xlsx" download>Excel出力</a>
+        <button class="btn" id="inst-import">Excel取込</button>
+      </div>
+    </div>
+    <div class="toolbar">
+      <div class="search"><span>🔍</span><input id="i-q" type="search" placeholder="№・プラント・工程・メーカー・型式・メモで絞り込み" value="${h(instState.q)}"></div>
+      <button class="btn primary lg" id="new-inst">追加</button>
+    </div>
+    <div class="filters">
+      <label>状態 <select id="i-status">
+        <option value="active">使用中・故障中・予備</option><option value="all">すべて</option>
+        ${instMeta.statuses.map(s => `<option>${h(s)}</option>`).join("")}</select></label>
+      <label>ランク <select id="i-rank"><option value="">すべて</option></select></label>
+    </div>
+    <div id="i-body"></div>`;
+  $("#i-status").value = instState.status;
+  const draw = () => {
+    const inKind = list.filter(i => i.kind === instState.kind);
+    const ranks = [...new Set(inKind.map(i => i.rank).filter(Boolean))].sort();
+    $("#i-rank").innerHTML = `<option value="">すべて</option>` + ranks.map(r => `<option ${r === instState.rank ? "selected" : ""}>${h(r)}</option>`).join("");
+    const q = norm(instState.q).toLowerCase();
+    const hit = inKind.filter(i =>
+      (instState.status === "all" || (instState.status === "active" ? INST_ACTIVE.includes(i.status) : i.status === instState.status)) &&
+      (!instState.rank || i.rank === instState.rank) &&
+      (!q || norm([i.no, i.plant, i.process, i.purpose, i.maker, i.model, i.serial_no, i.capacity, i.note, i.xls_memo, i.last_note].join(" ")).toLowerCase().includes(q)));
+    const groups = groupBy(hit, i => i.area || "エリアなし（予備機など）", [...state.meta.areas, "エリアなし（予備機など）"]);
+    const k = instState.kind, L = (key, def) => h(instLabel(k, key, def));
+    const hasRank = inKind.some(i => i.rank);  // ノギスなどランクのない種類は列を出さない
+    $("#i-body").innerHTML = groups.length ? groups.map(([g, l]) => `
+      <section class="cat-group">
+        <h2 class="area-title">${h(g)} <span class="g-count">${l.length}台</span></h2>
+        <div class="table-wrap"><table class="list responsive inst-table"><thead><tr>
+          <th>№</th>${hasRank ? "<th>ランク</th>" : ""}<th>${L("plant", "プラント")}</th><th>工程・用途</th><th>メーカー・${L("model", "型式")}</th><th class="num">${L("capacity", "最大秤量")}</th><th>${L("division", "表示目量")}</th><th>購入日</th><th>状態</th><th>最新の記録</th>
+        </tr></thead><tbody>${l.map(i => `
+          <tr data-inst="${i.id}">
+            <td class="code" data-label="№"><strong>${h(i.no)}</strong></td>
+            ${hasRank ? `<td data-label="ランク">${h(i.rank || "")}</td>` : ""}
+            <td data-label="${L("plant", "プラント")}">${h(i.plant || "")}</td>
+            <td data-label="工程・用途">${h([i.process, i.purpose].filter(Boolean).join("・"))}</td>
+            <td data-label="メーカー・${L("model", "型式")}">${h(i.maker || "")} ${i.model || i.type ? `<span class="muted">${h([i.model, i.type].filter(Boolean).join(" "))}</span>` : ""}</td>
+            <td class="num nowrap" data-label="${L("capacity", "最大秤量")}">${h(i.capacity || "")}</td>
+            <td data-label="${L("division", "表示目量")}">${h(i.division || "")}</td>
+            <td class="nowrap" data-label="購入日">${i.purchased ? fmtDate(i.purchased) : h(i.purchased_raw || "")}</td>
+            <td data-label="状態">${instBadge(i.status)}</td>
+            <td class="clip" data-label="最新の記録">${i.last_event ? `<span class="nowrap">${fmtDate(i.last_date) || "日付なし"}</span> ${h(i.last_event)} <span class="muted">${h(i.last_note || "")}</span>` : '<span class="muted">—</span>'}</td>
+          </tr>`).join("")}</tbody></table></div>
+      </section>`).join("") : `<p class="empty">該当する測定機器はありません</p>`;
+    $$("#i-body [data-inst]").forEach(tr => tr.addEventListener("click", () => openInstrument(+tr.dataset.inst)));
+  };
+  $$(".tabs [data-kind]").forEach(a => a.addEventListener("click", e => { e.preventDefault(); instState.kind = a.dataset.kind; instState.rank = ""; renderInstruments(); }));
+  let timer;
+  $("#i-q").addEventListener("input", e => { clearTimeout(timer); timer = setTimeout(() => { instState.q = e.target.value; draw(); }, 200); });
+  $("#i-status").addEventListener("change", e => { instState.status = e.target.value; draw(); });
+  $("#i-rank").addEventListener("change", e => { instState.rank = e.target.value; draw(); });
+  $("#new-inst").addEventListener("click", () => openInstrumentForm(null));
+  $("#inst-import").addEventListener("click", () => openXlsxImport(INSTRUMENTS_IMPORT));
+  draw();
+  if (id) openInstrument(+id);  // 新着から #/instruments/<id> で開いたとき
+}
+
+const INST_INFO = [["rank", "ランク"], ["ledger_no", "台帳№"], ["plant", "プラント"], ["process", "工程"], ["purpose", "用途"],
+  ["maker", "メーカー"], ["type", "方式"], ["model", "型式番号"], ["serial_no", "機器番号"], ["capacity", "最大秤量"], ["division", "表示目量"],
+  ["accuracy_class", "精度等級"], ["trade_cert", "取引証明"], ["asset_no", "資産№"], ["area", "エリア"]];
+
+async function openInstrument(id) {
+  const [i] = await Promise.all([api(`/instruments/${id}`), loadInstMeta()]);
+  const purchased = i.purchased ? fmtDate(i.purchased) + (i.purchased_raw && i.purchased_raw !== i.purchased ? `（${i.purchased_raw}）` : "") : i.purchased_raw;
+  openModal(`${i.kind} ${i.no}${i.plant ? `　${i.plant}` : ""}`, `
+    <dl class="info">
+      <dt>状態</dt><dd>${instBadge(i.status)}</dd>
+      ${INST_INFO.filter(([k]) => i[k]).map(([k, l]) => `<dt>${h(instLabel(i.kind, k, l))}</dt><dd>${h(i[k])}</dd>`).join("")}
+      ${purchased ? `<dt>購入日</dt><dd>${h(purchased)}</dd>` : ""}
+      ${i.note ? `<dt>メモ</dt><dd>${h(i.note)}</dd>` : ""}
+      ${i.xls_memo ? `<dt>台帳の記載</dt><dd class="muted" style="font-size:13px">${h(i.xls_memo)}</dd>` : ""}
+    </dl>
+    <h3 style="margin:18px 0 8px;font-size:15px">記録を追加</h3>
+    <div class="form-grid" id="iev-form">
+      <label class="field"><span>内容</span><select name="event">${instMeta.events.map(e => `<option>${h(e)}</option>`).join("")}</select></label>
+      <label class="field"><span>日付</span><input type="date" name="event_date" value="${state.meta.today}"></label>
+      <label class="field full"><span>メモ</span><input name="note" placeholder="例：落下で画面割れ、A&D SC-60KAM を発注"></label>
+      <label class="field"><span>状態も変える</span><select name="status"><option value="">変えない（${h(i.status)}）</option>${instMeta.statuses.map(s => `<option>${h(s)}</option>`).join("")}</select></label>
+    </div>
+    <h3 style="margin:18px 0 8px;font-size:15px">履歴 <span class="sub">${i.events.length}件</span></h3>
+    <ul class="timeline">${i.events.map(ev => `<li class="${ev.event === "故障" || ev.event === "廃棄" ? "futeiki" : ""}" style="cursor:default">
+      <div class="tl-date">${ev.event_date ? fmtDate(ev.event_date) : "日付なし"}${ev.date_uncertain ? `<span class="chip-uncertain" title="元の表記: ${h(ev.date_raw)}">要確認</span>` : ""}
+        ・ ${h(ev.event)}${ev.author ? ` ・ ${h(ev.author)}` : ""}${ev.source === "xls" ? ' <span class="muted">（台帳から）</span>' : ""}
+        <button type="button" class="btn small iev-del" data-id="${ev.id}" style="float:right">削除</button></div>
+      ${ev.note ? `<div class="tl-title">${h(ev.note)}</div>` : ""}</li>`).join("") || '<li class="muted" style="cursor:default">記録なし</li>'}</ul>`, `
+    <button type="button" class="btn left" id="edit-inst">機器情報を編集</button>
+    <button type="button" class="btn" data-close>閉じる</button>
+    <button type="submit" class="btn primary">記録する</button>`);
+  $("#iev-form [name=event]").addEventListener("change", e => {  // 故障・廃棄・運休は状態も合わせておく
+    const to = { 故障: "故障中", 廃棄: "廃棄", 運休: "運休", "新規・購入": i.status === "使用中" ? "" : "使用中", 修理: i.status === "故障中" ? "使用中" : "" }[e.target.value];
+    $("#iev-form [name=status]").value = to && to !== i.status ? to : "";
+  });
+  $("#edit-inst").addEventListener("click", () => openInstrumentForm(i));
+  $$(".iev-del").forEach(b => b.addEventListener("click", async () => {
+    if (!confirm("この記録を削除しますか？")) return;
+    try { await api(`/instrument-events/${b.dataset.id}`, { method: "DELETE" }); toast("削除しました"); openInstrument(id); }
+    catch (ex) { toast(ex.message); }
+  }));
+  $("#modal-form").onsubmit = async e => {
+    e.preventDefault();
+    const data = Object.fromEntries($$("#iev-form [name]").map(el => [el.name, el.value]));
+    if (!data.note.trim() && data.event === "メモ") { toast("メモを入れてください"); return; }
+    try {
+      await api(`/instruments/${id}/events`, { method: "POST", body: data });
+      closeModal(); toast("記録しました"); router();
+    } catch (ex) { toast(ex.message); }
+  };
+}
+
+async function openInstrumentForm(inst) {
+  await loadInstMeta();
+  const v = inst || { kind: instState.kind || instMeta.kinds[0], status: "使用中", area: state.area || "" };
+  const f = (name, label, attrs = "") => `<label class="field"><span>${instLabel(v.kind, name, label)}</span><input name="${name}" value="${h(v[name] ?? "")}" ${attrs}></label>`;
+  openModal(inst ? `${inst.kind} ${inst.no} の編集` : "測定機器を追加", `
+    <div class="form-grid">
+      <label class="field"><span>種類<em class="req">*</em></span><input name="kind" list="inst-kinds" value="${h(v.kind || "")}"><datalist id="inst-kinds">${instMeta.kinds.map(k => `<option value="${h(k)}">`).join("")}</datalist></label>
+      ${f("no", '№<em class="req">*</em>', 'placeholder="例：前27・後44"')}
+      <label class="field"><span>状態</span><select name="status">${instMeta.statuses.map(s => `<option ${s === v.status ? "selected" : ""}>${h(s)}</option>`).join("")}</select></label>
+      <label class="field"><span>エリア</span><select name="area"><option value="">なし（予備機など）</option>${state.meta.areas.map(a => `<option ${a === v.area ? "selected" : ""}>${h(a)}</option>`).join("")}</select></label>
+      ${f("rank", "ランク", 'placeholder="AA / A / B / C / D"')}${f("ledger_no", "台帳№")}
+      ${f("plant", "プラント（置き場所）")}${f("process", "工程")}
+      ${f("purpose", "用途")}${f("maker", "メーカー")}
+      ${f("type", "方式", 'placeholder="電気抵抗式など"')}${f("model", "型式番号")}
+      ${f("serial_no", "機器番号")}${f("capacity", "最大秤量")}
+      ${f("division", "表示目量")}${f("accuracy_class", "精度等級")}
+      ${f("trade_cert", "取引証明")}
+      <label class="field"><span>購入日</span><input type="date" name="purchased" value="${h(v.purchased || "")}">${v.purchased_raw && !v.purchased ? `<span class="hint">台帳の表記: ${h(v.purchased_raw)}</span>` : ""}</label>
+      ${f("asset_no", "資産№")}
+      <label class="field full"><span>メモ</span><textarea name="note" rows="2">${h(v.note || "")}</textarea></label>
+    </div><p class="err" id="form-err" hidden></p>`, `
+    <button type="button" class="btn" data-close>キャンセル</button><button type="submit" class="btn primary">保存</button>`);
+  const form = $("#modal-form");
+  form.onsubmit = async ev => {
+    ev.preventDefault();
+    const data = Object.fromEntries(new FormData(form));
+    if (inst && !data.purchased && inst.purchased_raw && !inst.purchased) delete data.purchased;  // 読めない表記のまま残す
+    try {
+      let id = inst?.id;
+      if (inst) await api(`/instruments/${inst.id}`, { method: "PUT", body: data });
+      else { id = (await api("/instruments", { method: "POST", body: data })).id; instState.kind = data.kind; }
+      closeModal(); toast("保存しました");
+      await renderInstruments();
+      openInstrument(id);
+    } catch (ex) { $("#form-err").textContent = ex.message; $("#form-err").hidden = false; }
+  };
+}
+
 /* ================================================================ 部品・研磨管理 */
 /* 保管場所の入力候補（今までに入れた場所） */
 const locList = () => `<datalist id="loc-list">${(state.meta.locations || []).map(l => `<option value="${h(l)}">`).join("")}</datalist>`;
@@ -1603,6 +1773,19 @@ const EQUIPMENT_IMPORT = {
   },
   done: r => `取り込みました（設備 追加${r.add}・変更${r.update}）`,
   after: async () => { state.equipment = []; state.meta = await api("/meta"); },  // 設備・エリアの一覧を読み直す
+};
+
+const INSTRUMENTS_IMPORT = {
+  title: "測定機器の Excel取込", what: "追加・変更", endpoint: "/instruments/import",
+  count: p => p.add.length + p.update.length,
+  preview: p => {
+    const labels = Object.fromEntries(INST_INFO.concat([["kind", "種類"], ["no", "№"], ["status", "状態"], ["purchased", "購入日"], ["note", "メモ"]]));
+    const val = (k, v) => (v == null || v === "" ? "（空欄）" : String(v));
+    return `
+      ${impSection("測定機器：追加", p.add, a => `<li><span class="muted">${h(a.row)}行目</span> <strong>${h(a.label)}</strong> <span class="muted">${h(a.area || "エリアなし")} ／ ${h(a.status)}</span></li>`)}
+      ${impSection("測定機器：変更", p.update, u => `<li><span class="muted">${h(u.row)}行目</span> <strong>${h(u.label)}</strong>${impChanges(u.changes, val, labels)}</li>`)}`;
+  },
+  done: r => `取り込みました（測定機器 追加${r.add}・変更${r.update}）`,
 };
 
 async function openPartDetail(id) {

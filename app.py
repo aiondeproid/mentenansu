@@ -17,6 +17,8 @@ from flask import Flask, Response, abort, g, has_request_context, jsonify, reque
 from db import CATEGORIES, DB_PATH, EQ_FIELD_LABELS, SUBGROUP_ORDER, connect, init_db, log_equipment
 from import_xls import norm
 import equipment_xlsx
+import instruments as inst_mod
+import instruments_xlsx
 import pla
 import pla_sheets
 import parts_catalog
@@ -151,6 +153,12 @@ def _act_pla_review(conn, d):
         {"action": "確認を取消"} if d.get("cancel") else {})
 
 
+def _act_inst(conn, inst_id, detail=None):
+    i = _row(conn, "SELECT kind, no, plant, area FROM instruments WHERE id=?", inst_id)
+    return {"target": " ".join(filter(None, [i.get("kind"), i.get("no"), i.get("plant")])), "area": i.get("area"),
+            "detail": detail, "ref_type": "instrument", "ref_id": inst_id}
+
+
 ACTIVITY = {  # API の関数名: (分類, 操作, 何に対してかを返す関数(conn, URL の引数, JSON))
     "equipment_create": ("設備台帳", "登録", lambda c, a, d: {"target": d.get("name"), "area": d.get("area"), "ref_type": "equipment"}),
     "equipment_update": ("設備台帳", "変更", lambda c, a, d: dict(zip(("target", "area"), _eq_target(c, a["eq_id"])), ref_type="equipment", ref_id=a["eq_id"])),
@@ -190,6 +198,12 @@ ACTIVITY = {  # API の関数名: (分類, 操作, 何に対してかを返す�
     "pla_photo_upload": ("プラ点検", "写真を追加", lambda c, a, d: _act_pla_sheet(c, request.form.get("sheet_id", type=int))),
     "pla_photo_delete": ("プラ点検", "写真を削除", lambda c, a, d: _act_pla_sheet(
         c, _row(c, "SELECT sheet_id FROM pla_photos WHERE id=?", a["photo_id"]).get("sheet_id"))),
+    "instrument_create": ("測定機器", "登録", lambda c, a, d: {"target": " ".join(filter(None, [d.get("kind"), d.get("no")])), "area": d.get("area"), "ref_type": "instrument"}),
+    "instruments_import": ("測定機器", "Excel取込", lambda c, a, d: {"only_applied": True, "ref_type": "instrument"}),
+    "instrument_update": ("測定機器", "変更", lambda c, a, d: _act_inst(c, a["inst_id"])),
+    "instrument_event_create": ("測定機器", "履歴を記録", lambda c, a, d: _act_inst(c, a["inst_id"], " ".join(filter(None, [d.get("event"), d.get("note")])))),
+    "instrument_event_delete": ("測定機器", "履歴を削除", lambda c, a, d: (lambda ev: _act_inst(c, ev.get("instrument_id"), " ".join(filter(None, [ev.get("event"), ev.get("note")]))))(
+        _row(c, "SELECT instrument_id, event, note FROM instrument_events WHERE id=?", a["event_id"]))),
     "vendor_update": ("取引業者", "変更", lambda c, a, d: {"target": _row(c, "SELECT name FROM vendors WHERE id=?", a["vendor_id"]).get("name"), "ref_type": "vendor"}),
     "notify_recipients_update": ("通知", "通知先を変更", lambda c, a, d: {"ref_type": "notify"}),
 }
@@ -1410,6 +1424,164 @@ def pla_export():
     return Response(pla_sheets.export_month(db(), process, ym),
                     mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     headers={"Content-Disposition": f"attachment; filename=pla.xlsx; filename*=UTF-8''{quote(name)}"})
+
+
+# ---------------------------------------------------------------- 測定機器（秤量器など）
+INST_FIELDS = ["kind", "no", "rank", "ledger_no", "plant", "process", "purpose", "maker", "type", "model", "serial_no",
+               "capacity", "division", "accuracy_class", "trade_cert", "purchased", "asset_no", "area", "status", "note"]
+INST_LABELS = {"kind": "種類", "no": "№", "rank": "ランク", "ledger_no": "台帳№", "plant": "プラント", "process": "工程",
+               "purpose": "用途", "maker": "メーカー", "type": "方式", "model": "型式", "serial_no": "機器番号",
+               "capacity": "最大秤量", "division": "表示目量", "accuracy_class": "精度等級", "trade_cert": "取引証明",
+               "purchased": "購入日", "asset_no": "資産№", "area": "エリア", "status": "状態", "note": "メモ"}
+ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+@app.get("/api/instruments")
+def instruments_list():
+    area = request.args.get("area")
+    cond, args = ("WHERE (i.area = ? OR i.area IS NULL)", [area]) if area else ("", [])  # 予備機（エリアなし）はどのエリアでも出す
+    return jsonify(rows(db().execute(
+        f"""SELECT i.*, ev.event_date AS last_date, ev.event AS last_event, ev.note AS last_note,
+                  (SELECT COUNT(*) FROM instrument_events x WHERE x.instrument_id = i.id) AS event_count
+           FROM instruments i
+           LEFT JOIN instrument_events ev ON ev.id = (
+               SELECT id FROM instrument_events WHERE instrument_id = i.id
+               ORDER BY event_date IS NULL, event_date DESC, id DESC LIMIT 1)
+           {cond} ORDER BY i.kind, i.sort_order IS NULL, i.sort_order, i.id""", args)))
+
+
+def equipment_areas(conn):
+    return [r[0] for r in conn.execute("SELECT area FROM equipment WHERE area IS NOT NULL GROUP BY area ORDER BY COUNT(*) DESC")]
+
+
+@app.get("/api/instruments/export.xlsx")
+def instruments_export():
+    conn = db()
+    name = f"測定機器_{today().strftime('%Y%m%d')}.xlsx"
+    return Response(instruments_xlsx.export_workbook(conn, equipment_areas(conn)),
+                    mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    headers={"Content-Disposition": f"attachment; filename=instruments.xlsx; filename*=UTF-8''{quote(name)}"})
+
+
+@app.post("/api/instruments/import")
+def instruments_import():
+    """?apply=1 のときだけ DB を変える。それ以外は変更内容の確認だけ。"""
+    f = request.files.get("file")
+    if not f:
+        abort(400, "ファイルを選んでください")
+    conn = db()
+    try:
+        plan = instruments_xlsx.plan_import(conn, f.read(), equipment_areas(conn))
+        if request.args.get("apply") == "1":
+            return jsonify(applied=instruments_xlsx.apply_import(conn, plan))
+    except ValueError as e:
+        abort(400, str(e))
+    return jsonify(plan)
+
+
+@app.get("/api/instruments/meta")
+def instruments_meta():
+    return jsonify(kinds=list(inst_mod.SHEETS), statuses=inst_mod.STATUSES, events=inst_mod.EVENTS,
+                   labels={k: cfg.get("labels", {}) for k, cfg in inst_mod.SHEETS.items()})  # 種類ごとの項目名（ノギスは「使用範囲」など）
+
+
+@app.get("/api/instruments/<int:inst_id>")
+def instrument_detail(inst_id):
+    conn = db()
+    i = conn.execute("SELECT * FROM instruments WHERE id=?", (inst_id,)).fetchone()
+    if not i:
+        abort(404, "測定機器が見つかりません")
+    out = dict(i)
+    out["events"] = rows(conn.execute(
+        "SELECT * FROM instrument_events WHERE instrument_id=? ORDER BY event_date IS NULL, event_date DESC, id DESC", (inst_id,)))
+    return jsonify(out)
+
+
+def inst_values(d):
+    v = {f: blank_to_none(norm(d[f]) if isinstance(d[f], str) else d[f]) for f in INST_FIELDS if f in d}
+    if "kind" in v and not v["kind"]:
+        abort(400, "種類は必須です")
+    if "no" in v and not v["no"]:
+        abort(400, "№は必須です")
+    if v.get("status") and v["status"] not in inst_mod.STATUSES:
+        abort(400, "状態が正しくありません")
+    if v.get("purchased") and not ISO_DATE.fullmatch(v["purchased"]):
+        abort(400, "購入日は日付で入れてください")
+    return v
+
+
+def inst_dup(conn, kind, no, inst_id=None):
+    if conn.execute("SELECT 1 FROM instruments WHERE kind=? AND no=? AND id IS NOT ?", (kind, no, inst_id)).fetchone():
+        abort(400, f"{kind} の № {no} は既にあります")
+
+
+@app.post("/api/instruments")
+def instrument_create():
+    conn = db()
+    v = inst_values(body())
+    if not v.get("kind") or not v.get("no"):
+        abort(400, "種類と№は必須です")
+    inst_dup(conn, v["kind"], v["no"])
+    v.setdefault("status", "使用中")
+    v["purchased_raw"] = v.get("purchased")
+    v["sort_order"] = conn.execute("SELECT COALESCE(MAX(sort_order), 0) + 1 FROM instruments WHERE kind=?", (v["kind"],)).fetchone()[0]
+    v["source"] = "app"
+    v["updated_at"] = dt.datetime.now().isoformat(timespec="seconds")
+    cur = conn.execute(f"INSERT INTO instruments({', '.join(v)}) VALUES ({', '.join('?' * len(v))})", list(v.values()))
+    conn.commit()
+    return jsonify(id=cur.lastrowid)
+
+
+@app.put("/api/instruments/<int:inst_id>")
+def instrument_update(inst_id):
+    conn = db()
+    old = conn.execute("SELECT * FROM instruments WHERE id=?", (inst_id,)).fetchone()
+    if not old:
+        abort(404, "測定機器が見つかりません")
+    v = inst_values(body())
+    inst_dup(conn, v.get("kind", old["kind"]), v.get("no", old["no"]), inst_id)
+    changed = [f for f in v if v[f] != old[f]]
+    if "purchased" in changed:
+        v["purchased_raw"] = v["purchased"]
+    if changed:
+        conn.execute(f"UPDATE instruments SET {', '.join(f + '=?' for f in v)}, updated_at=? WHERE id=?",
+                     (*v.values(), dt.datetime.now().isoformat(timespec="seconds"), inst_id))
+        conn.commit()
+    note_activity(detail="・".join(INST_LABELS.get(f, f) for f in changed) or None, skip=not changed)
+    return jsonify(ok=True)
+
+
+@app.post("/api/instruments/<int:inst_id>/events")
+def instrument_event_create(inst_id):
+    conn = db()
+    if not conn.execute("SELECT 1 FROM instruments WHERE id=?", (inst_id,)).fetchone():
+        abort(404, "測定機器が見つかりません")
+    d = body()
+    event = d.get("event") or "メモ"
+    if event not in inst_mod.EVENTS:
+        abort(400, "内容が正しくありません")
+    date = blank_to_none(d.get("event_date"))
+    if date and not ISO_DATE.fullmatch(date):
+        abort(400, "日付が正しくありません")
+    status = blank_to_none(d.get("status"))  # 状態も一緒に変える（故障 → 故障中 など）
+    if status and status not in inst_mod.STATUSES:
+        abort(400, "状態が正しくありません")
+    cur = conn.execute(
+        "INSERT INTO instrument_events(instrument_id, event_date, event, note, author, source) VALUES (?,?,?,?,?, 'app')",
+        (inst_id, date, event, blank_to_none((d.get("note") or "").strip()), request_user()))
+    if status:
+        conn.execute("UPDATE instruments SET status=?, updated_at=? WHERE id=?",
+                     (status, dt.datetime.now().isoformat(timespec="seconds"), inst_id))
+    conn.commit()
+    return jsonify(id=cur.lastrowid)
+
+
+@app.delete("/api/instrument-events/<int:event_id>")
+def instrument_event_delete(event_id):
+    conn = db()
+    conn.execute("DELETE FROM instrument_events WHERE id=?", (event_id,))
+    conn.commit()
+    return jsonify(ok=True)
 
 
 # ---------------------------------------------------------------- 取引業者

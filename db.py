@@ -264,6 +264,50 @@ CREATE TABLE IF NOT EXISTS activity (
 );
 CREATE INDEX IF NOT EXISTS idx_activity_at ON activity(at);
 
+-- 測定機器（「測定機器毎の管理台帳.xls」の 1 行 = 1 台。kind で秤量器・温度計などを分ける）
+CREATE TABLE IF NOT EXISTS instruments (
+    id INTEGER PRIMARY KEY,
+    kind TEXT NOT NULL,        -- 秤量器 など（管理台帳のシート名）
+    no TEXT NOT NULL,          -- № （前1・後12・予備3 など）
+    rank TEXT,                 -- ランク（AA / A / B / C / D）
+    ledger_no TEXT,            -- 台帳№
+    plant TEXT,                -- プラント（置き場所）
+    process TEXT,              -- 工程
+    purpose TEXT,              -- 用途
+    maker TEXT,
+    type TEXT,                 -- 秤の種類（電気抵抗式など）
+    model TEXT,                -- 型式番号
+    serial_no TEXT,            -- 秤量器番号
+    capacity TEXT,             -- 最大秤量
+    division TEXT,             -- 表示目量
+    accuracy_class TEXT,       -- 精度等級
+    trade_cert TEXT,           -- 取引証明
+    purchased TEXT,            -- 購入日（YYYY-MM-DD。読めなければ NULL）
+    purchased_raw TEXT,        -- 購入日の元の表記
+    asset_no TEXT,
+    area TEXT,                 -- 前処理 / 後処理（予備機は NULL = どのエリアでも出す）
+    status TEXT DEFAULT '使用中', -- 使用中 / 故障中 / 運休 / 予備 / 廃棄 / 欠番
+    note TEXT,
+    xls_memo TEXT,             -- 取り込み元の右側の欄（経緯メモ）の原文
+    sort_order INTEGER,
+    source TEXT,               -- 取り込み元ファイル名 / 'app'
+    updated_at TEXT,
+    UNIQUE(kind, no)
+);
+CREATE TABLE IF NOT EXISTS instrument_events (   -- 測定機器の履歴（故障・新規購入・修理など）
+    id INTEGER PRIMARY KEY,
+    instrument_id INTEGER NOT NULL REFERENCES instruments(id),
+    event_date TEXT,           -- YYYY-MM-DD
+    date_raw TEXT,
+    date_uncertain INTEGER DEFAULT 0,
+    event TEXT,                -- 故障 / 新規・購入 / 修理 / 変更・交換 / 運休 / 廃棄 / 校正 / メモ
+    note TEXT,
+    author TEXT,
+    source TEXT,               -- 'xls' / 'app'
+    created_at TEXT DEFAULT (datetime('now','localtime'))
+);
+CREATE INDEX IF NOT EXISTS idx_instrument_events_inst ON instrument_events(instrument_id);
+
 CREATE INDEX IF NOT EXISTS idx_records_eq ON records(equipment_id);
 CREATE INDEX IF NOT EXISTS idx_records_date ON records(done_date);
 CREATE INDEX IF NOT EXISTS idx_part_events_part ON part_events(part_id);

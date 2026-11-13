@@ -698,3 +698,8 @@ table.year-plan td.eqcol { background: var(--surface-2); font-weight: 700; }
   .cal-day { min-height: 90px; }
   * { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
 }
+
+/* 測定機器（設備台帳の下のメニュー） */
+#sidebar nav a.sub-nav { padding-left: 30px; font-size: 14px; }
+.news-kind.k-instrument { background: #2f6f8b; }
+.inst-table td.code strong { white-space: nowrap; }
