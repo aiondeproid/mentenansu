@@ -303,10 +303,41 @@ CREATE TABLE IF NOT EXISTS instrument_events (   -- 測定機器の履歴（故�
     event TEXT,                -- 故障 / 新規・購入 / 修理 / 変更・交換 / 運休 / 廃棄 / 校正 / メモ
     note TEXT,
     author TEXT,
-    source TEXT,               -- 'xls' / 'app'
+    source TEXT,               -- 'xls' / 'app' / 'calib'（校正記録から自動で作ったもの）
     created_at TEXT DEFAULT (datetime('now','localtime'))
 );
 CREATE INDEX IF NOT EXISTS idx_instrument_events_inst ON instrument_events(instrument_id);
+CREATE TABLE IF NOT EXISTS calibrations (   -- 校正（検査記録書）1 回分。様式は calibration.FORMS
+    id INTEGER PRIMARY KEY,
+    form TEXT NOT NULL,        -- 様式（'庫内温度計' など）
+    inspected_on TEXT,         -- 検査年月日 YYYY-MM-DD
+    inspector TEXT,            -- 検査者
+    reference TEXT,            -- 使用基準器（検査済みデジタル温度計の台帳№）
+    approved_qc TEXT,          -- 確認（品管）
+    approved_manager TEXT,     -- 確認（工場長）
+    note TEXT,
+    created_by TEXT,
+    created_at TEXT DEFAULT (datetime('now','localtime')),
+    updated_at TEXT
+);
+CREATE TABLE IF NOT EXISTS calibration_rows (   -- 検査記録書の 1 行（1 台）
+    id INTEGER PRIMARY KEY,
+    calibration_id INTEGER NOT NULL REFERENCES calibrations(id),
+    instrument_id INTEGER REFERENCES instruments(id),
+    sort_order INTEGER,
+    daily_ok INTEGER,          -- 日常点検 1=合 0=否
+    zone TEXT,                 -- 検査温度（冷蔵区 / 冷凍区）
+    min_display REAL,          -- 庫内温度計の最小表示（0.1 / 0.5 / 1.0）
+    ref_display REAL,          -- 基準温度計 表示
+    ref_corrected REAL,        -- 基準温度計 補正温度（Ａ）
+    rounded REAL,              -- 四捨五入等の処理後の温度
+    inst_display REAL,         -- 庫内温度計 表示温度（Ｂ）
+    error REAL,                -- 器差 = Ｂ − 処理後
+    result TEXT,               -- 合 / 否
+    correction REAL,           -- 補正温度 = −器差
+    action_no TEXT             -- 不合格時の処置記録の№
+);
+CREATE INDEX IF NOT EXISTS idx_calibration_rows_cal ON calibration_rows(calibration_id);
 
 CREATE INDEX IF NOT EXISTS idx_records_eq ON records(equipment_id);
 CREATE INDEX IF NOT EXISTS idx_records_date ON records(done_date);
@@ -476,6 +507,15 @@ def init_db(conn):
     if conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'pla_results'").fetchone():
         if not conn.execute("SELECT 1 FROM pla_results LIMIT 1").fetchone():
             conn.execute("DROP TABLE pla_results")
+    if "calibration_id" not in {r["name"] for r in conn.execute("PRAGMA table_info(instrument_events)")}:
+        conn.execute("ALTER TABLE instrument_events ADD COLUMN calibration_id INTEGER")  # 校正記録から作った履歴
+    # 校正の様式を増やした（タイマー・蒸煮コンベア）: 見出しの項目は extra（JSON）、行の中身は data（JSON）
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(calibrations)")}
+    for col in ("extra", "approved_staff", "result"):  # result = 記録全体の判定（合 / 否）
+        if col not in cols:
+            conn.execute(f"ALTER TABLE calibrations ADD COLUMN {col} TEXT")
+    if "data" not in {r["name"] for r in conn.execute("PRAGMA table_info(calibration_rows)")}:
+        conn.execute("ALTER TABLE calibration_rows ADD COLUMN data TEXT")
     for table in ("parts", "part_catalog"):
         if "location" not in {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN location TEXT")  # 保管場所

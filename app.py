@@ -7,6 +7,7 @@ import csv
 import datetime as dt
 import hashlib
 import io
+import json
 import os
 
 import re
@@ -17,6 +18,7 @@ from flask import Flask, Response, abort, g, has_request_context, jsonify, reque
 from db import CATEGORIES, DB_PATH, EQ_FIELD_LABELS, SUBGROUP_ORDER, connect, init_db, log_equipment
 from import_xls import norm
 import equipment_xlsx
+import calibration as calib_mod
 import instruments as inst_mod
 import instruments_xlsx
 import pla
@@ -159,6 +161,12 @@ def _act_inst(conn, inst_id, detail=None):
             "detail": detail, "ref_type": "instrument", "ref_id": inst_id}
 
 
+def _act_calib(conn, cal_id, d=None):
+    c = _row(conn, "SELECT form, inspected_on FROM calibrations WHERE id=?", cal_id) if cal_id else (d or {})
+    return {"target": " ".join(filter(None, [c.get("form"), "検査記録", (c.get("inspected_on") or "").replace("-", "/")])),
+            "ref_type": "calibration", "ref_id": cal_id}
+
+
 ACTIVITY = {  # API の関数名: (分類, 操作, 何に対してかを返す関数(conn, URL の引数, JSON))
     "equipment_create": ("設備台帳", "登録", lambda c, a, d: {"target": d.get("name"), "area": d.get("area"), "ref_type": "equipment"}),
     "equipment_update": ("設備台帳", "変更", lambda c, a, d: dict(zip(("target", "area"), _eq_target(c, a["eq_id"])), ref_type="equipment", ref_id=a["eq_id"])),
@@ -204,6 +212,9 @@ ACTIVITY = {  # API の関数名: (分類, 操作, 何に対してかを返す�
     "instrument_event_create": ("測定機器", "履歴を記録", lambda c, a, d: _act_inst(c, a["inst_id"], " ".join(filter(None, [d.get("event"), d.get("note")])))),
     "instrument_event_delete": ("測定機器", "履歴を削除", lambda c, a, d: (lambda ev: _act_inst(c, ev.get("instrument_id"), " ".join(filter(None, [ev.get("event"), ev.get("note")]))))(
         _row(c, "SELECT instrument_id, event, note FROM instrument_events WHERE id=?", a["event_id"]))),
+    "calibration_create": ("測定機器", "校正を記録", lambda c, a, d: _act_calib(c, None, d)),
+    "calibration_update": ("測定機器", "校正記録を変更", lambda c, a, d: _act_calib(c, a["cal_id"])),
+    "calibration_delete": ("測定機器", "校正記録を削除", lambda c, a, d: _act_calib(c, a["cal_id"])),
     "vendor_update": ("取引業者", "変更", lambda c, a, d: {"target": _row(c, "SELECT name FROM vendors WHERE id=?", a["vendor_id"]).get("name"), "ref_type": "vendor"}),
     "notify_recipients_update": ("通知", "通知先を変更", lambda c, a, d: {"ref_type": "notify"}),
 }
@@ -1481,8 +1492,11 @@ def instruments_import():
 
 @app.get("/api/instruments/meta")
 def instruments_meta():
-    return jsonify(kinds=list(inst_mod.SHEETS), statuses=inst_mod.STATUSES, events=inst_mod.EVENTS,
-                   labels={k: cfg.get("labels", {}) for k, cfg in inst_mod.SHEETS.items()})  # 種類ごとの項目名（ノギスは「使用範囲」など）
+    labels = {k: cfg.get("labels", {}) for k, cfg in inst_mod.SHEETS.items()}  # 種類ごとの項目名（ノギスは「使用範囲」など）
+    for f in calib_mod.FORMS.values():  # 校正の記録書から登録した種類（庫内・室温計）
+        if f.get("kind"):  # タイマー・蒸煮コンベアは機器に結びつかない様式（種類なし）
+            labels.setdefault(f["kind"], f.get("kind_labels", {}))
+    return jsonify(kinds=list(labels), statuses=inst_mod.STATUSES, events=inst_mod.EVENTS, labels=labels)
 
 
 @app.get("/api/instruments/<int:inst_id>")
@@ -1580,6 +1594,244 @@ def instrument_event_create(inst_id):
 def instrument_event_delete(event_id):
     conn = db()
     conn.execute("DELETE FROM instrument_events WHERE id=?", (event_id,))
+    conn.commit()
+    return jsonify(ok=True)
+
+
+# ---------------------------------------------------------------- 校正（検査記録書）
+# 様式は calibration.FORMS。type が temp（庫内温度計・室温計: 1 行 = 測定機器 1 台）と
+# timer・conveyor（タイマー・蒸煮コンベア: 機器に結びつかない行。中身は calibration_rows.data の JSON）で入力・計算・印刷が変わる
+CALIB_FIELDS = ["inspected_on", "inspector", "reference", "approved_qc", "approved_manager", "approved_staff", "note"]
+
+
+def calib_default_min(form, division):
+    """台帳の最小表示が 0.1 / 0.5 / 1 ならそれ、読めなければ 1.0（「-30」など）。"""
+    try:
+        v = float(re.sub(r"[℃\s]", "", division or ""))
+    except ValueError:
+        return 1.0
+    return v if v in form["min_displays"] else 1.0
+
+
+def _json(v):
+    try:
+        return json.loads(v) if v else {}
+    except ValueError:
+        return {}
+
+
+def calib_out(c):
+    out = dict(c)
+    out["extra"] = _json(out.get("extra"))
+    return out
+
+
+@app.get("/api/calibrations/meta")
+def calibrations_meta():
+    conn = db()
+    out = {}
+    for name, f in calib_mod.FORMS.items():
+        insts = []
+        if f.get("kind"):
+            insts = rows(conn.execute(
+                "SELECT id, no, plant, type, division, area, status FROM instruments WHERE kind=? AND status NOT IN ('廃棄','欠番') "
+                "ORDER BY sort_order IS NULL, sort_order, id", (f["kind"],)))
+            for i in insts:
+                i["default_min"] = calib_default_min(f, i["division"])
+        refs = rows(conn.execute(
+            "SELECT no, plant, type FROM instruments WHERE kind=? AND status NOT IN ('廃棄','欠番') ORDER BY sort_order IS NULL, sort_order, id",
+            (f.get("reference_kind"),)))
+        # 入力候補（今までに入れたライン名・加熱装置名・使用計測器など）
+        suggest = {}
+        for c in conn.execute("SELECT reference, extra FROM calibrations WHERE form=? ORDER BY inspected_on DESC", (name,)):
+            for k, val in [("reference", c["reference"]), *_json(c["extra"]).items()]:
+                if val and val not in suggest.setdefault(k, []):
+                    suggest[k].append(val)
+        if f.get("type") == "timer":
+            for r in conn.execute("SELECT r.data FROM calibration_rows r JOIN calibrations c ON c.id = r.calibration_id WHERE c.form=?", (name,)):
+                dev = _json(r["data"]).get("device")
+                if dev and dev not in suggest.setdefault("device", []):
+                    suggest["device"].append(dev)
+        out[name] = {**{k: v for k, v in f.items() if k != "seed"}, "type": f.get("type", "temp"),
+                     "instruments": insts, "references": refs, "suggest": suggest}
+    return jsonify(forms=out, order=list(calib_mod.FORMS))  # jsonify はキーを並べ替えるので順番は別に渡す
+
+
+@app.get("/api/calibrations")
+def calibrations_list():
+    form = request.args.get("form")
+    cond, args = ("WHERE c.form = ?", [form]) if form else ("", [])
+    return jsonify([calib_out(c) for c in db().execute(
+        f"""SELECT c.*, COUNT(r.id) AS row_count,
+                   SUM(r.result = '合') AS ok_count, SUM(r.result = '否') AS ng_count
+            FROM calibrations c LEFT JOIN calibration_rows r ON r.calibration_id = c.id
+            {cond} GROUP BY c.id ORDER BY c.inspected_on DESC, c.id DESC""", args)])
+
+
+@app.get("/api/calibrations/<int:cal_id>")
+def calibration_detail(cal_id):
+    conn = db()
+    c = conn.execute("SELECT * FROM calibrations WHERE id=?", (cal_id,)).fetchone()
+    if not c:
+        abort(404, "校正記録が見つかりません")
+    out = calib_out(c)
+    out["rows"] = rows(conn.execute(
+        """SELECT r.*, i.no, i.plant, i.type, i.kind FROM calibration_rows r LEFT JOIN instruments i ON i.id = r.instrument_id
+           WHERE r.calibration_id=? ORDER BY r.sort_order, r.id""", (cal_id,)))
+    for r in out["rows"]:
+        r["data"] = _json(r.get("data"))
+    return jsonify(out)
+
+
+def _calib_num(v, label, where):
+    try:
+        return calib_mod.to_num(v, label, where)
+    except ValueError as e:
+        abort(400, str(e))
+
+
+def calib_temp_rows(conn, form, raw_rows):
+    """庫内温度計・室温計の行（1 行 = 測定機器 1 台）。"""
+    kind_ids = {r[0]: r[1] for r in conn.execute("SELECT id, no FROM instruments WHERE kind=?", (form["kind"],))}
+    out_rows = []
+    for n, r in enumerate(raw_rows or [], 1):
+        iid = r.get("instrument_id")
+        if iid not in kind_ids:
+            abort(400, f"{n}行目: {form['kind']}ではない機器です")
+        where = f"{form['kind']} {kind_ids[iid]}"
+        row = {"instrument_id": iid, "sort_order": n,
+               "daily_ok": {"合": 1, "否": 0, 1: 1, 0: 0, "1": 1, "0": 0}.get(r.get("daily_ok")),
+               "zone": blank_to_none(r.get("zone")),
+               "min_display": _calib_num(r.get("min_display"), "最小表示", where),
+               "action_no": blank_to_none(norm(r.get("action_no") or "").strip())}
+        for f, label in (("ref_display", "基準温度計の表示"), ("ref_corrected", "基準温度計の補正温度"), ("inst_display", "庫内温度計の表示温度")):
+            row[f] = _calib_num(r.get(f), label, where)
+        if row["zone"] and row["zone"] not in form["zones"]:
+            abort(400, f"{where}: 検査温度は {'・'.join(form['zones'])} から選んでください")
+        if row["min_display"] is not None and row["min_display"] not in form["min_displays"]:
+            abort(400, f"{where}: 最小表示は 0.1・0.5・1.0 から選んでください")
+        if row["daily_ok"] is None and all(row[f] is None for f in calib_mod.NUM_FIELDS) and not row["action_no"]:
+            continue  # 何も書いていない行（検査しなかった機器）は残さない
+        out_rows.append(calib_mod.compute(row, form["limit"]))
+    return out_rows
+
+
+def calib_values(conn, d):
+    form_name = d.get("form")
+    form = calib_mod.FORMS.get(form_name)
+    if not form:
+        abort(400, "様式が正しくありません")
+    v = {f: blank_to_none(norm(d[f]).strip() if isinstance(d.get(f), str) else d.get(f)) for f in CALIB_FIELDS}
+    if not v["inspected_on"] or not ISO_DATE.fullmatch(v["inspected_on"]):
+        abort(400, "検査年月日を入れてください")
+    extra = d.get("extra") or {}
+    extra = {k: blank_to_none(norm(str(extra.get(k) or "")).strip()) for k, _ in form["extra_fields"]}
+    v["extra"] = json.dumps({k: x for k, x in extra.items() if x}, ensure_ascii=False) or None
+    if form.get("type", "temp") == "temp":
+        out_rows = calib_temp_rows(conn, form, d.get("rows"))
+        if not out_rows:
+            abort(400, "検査結果を 1 台以上入れてください")
+    else:
+        try:
+            out_rows = calib_mod.build_free_rows(form, d.get("rows"))
+        except ValueError as e:
+            abort(400, str(e))
+        if not out_rows:
+            abort(400, "測定結果を 1 行以上入れてください")
+    v["result"] = calib_mod.overall_result(form, out_rows)
+    return form_name, form, v, out_rows
+
+
+def calib_save(conn, cal_id, form, v, out_rows):
+    conn.execute("DELETE FROM calibration_rows WHERE calibration_id=?", (cal_id,))
+    conn.execute("DELETE FROM instrument_events WHERE calibration_id=?", (cal_id,))
+    temp = form.get("type", "temp") == "temp"
+    for r in out_rows:
+        r = {**r, "data": json.dumps(r["data"], ensure_ascii=False)} if "data" in r else r
+        conn.execute(f"INSERT INTO calibration_rows(calibration_id, {', '.join(r)}) VALUES (?, {', '.join('?' * len(r))})",
+                     (cal_id, *r.values()))
+        if temp:
+            conn.execute(  # 機器の履歴にも「校正」を残す（校正記録を直す・消すと一緒に変わる）
+                "INSERT INTO instrument_events(instrument_id, event_date, event, note, author, source, calibration_id) "
+                "VALUES (?, ?, '校正', ?, ?, 'calib', ?)",
+                (r["instrument_id"], v["inspected_on"], calib_mod.event_note(r), v["inspector"] or request_user(), cal_id))
+    ok = sum(r["result"] == "合" for r in out_rows)
+    ng = sum(r["result"] == "否" for r in out_rows)
+    unit = "台" if temp else "件"
+    if form.get("type") == "conveyor":
+        detail = f"判定 {v['result'] or '未判定'}（{len(out_rows)}回測定）"
+    else:
+        detail = "・".join(filter(None, [f"合 {ok}{unit}" if ok else "", f"否 {ng}{unit}" if ng else ""])) or None
+    note_activity(detail=detail, by=v["inspector"] or v["approved_staff"])
+
+
+@app.post("/api/calibrations")
+def calibration_create():
+    conn = db()
+    form_name, form, v, out_rows = calib_values(conn, body())
+    now = dt.datetime.now().isoformat(timespec="seconds")
+    cal_id = conn.execute(f"INSERT INTO calibrations(form, {', '.join(v)}, created_by, updated_at) VALUES (?, {', '.join('?' * len(v))}, ?, ?)",
+                          (form_name, *v.values(), request_user(), now)).lastrowid
+    calib_save(conn, cal_id, form, v, out_rows)
+    conn.commit()
+    return jsonify(id=cal_id)
+
+
+@app.put("/api/calibrations/<int:cal_id>")
+def calibration_update(cal_id):
+    conn = db()
+    if not conn.execute("SELECT 1 FROM calibrations WHERE id=?", (cal_id,)).fetchone():
+        abort(404, "校正記録が見つかりません")
+    form_name, form, v, out_rows = calib_values(conn, body())
+    conn.execute(f"UPDATE calibrations SET form=?, {', '.join(f + '=?' for f in v)}, updated_at=? WHERE id=?",
+                 (form_name, *v.values(), dt.datetime.now().isoformat(timespec="seconds"), cal_id))
+    calib_save(conn, cal_id, form, v, out_rows)
+    conn.commit()
+    return jsonify(id=cal_id)
+
+
+def calib_print_rows(conn, form, cal_id=None):
+    """印刷の行。温度計: 記録した機器 ＋ まだ検査していない機器（空欄）を機器の並び順で全台。それ以外: 記録した行（足りない分は空欄で印刷側が足す）。"""
+    saved = rows(conn.execute(
+        """SELECT r.*, i.no, i.plant, i.type, 1 AS recorded FROM calibration_rows r LEFT JOIN instruments i ON i.id = r.instrument_id
+           WHERE r.calibration_id=? ORDER BY r.sort_order, r.id""", (cal_id,))) if cal_id else []
+    if form.get("type", "temp") != "temp":
+        for r in saved:
+            r["data"] = _json(r.get("data"))
+        return saved
+    by_inst = {r["instrument_id"]: r for r in saved}
+    insts = rows(conn.execute(
+        "SELECT id AS instrument_id, no, plant, type FROM instruments WHERE kind=? AND status NOT IN ('廃棄','欠番') "
+        "ORDER BY sort_order IS NULL, sort_order, id", (form["kind"],)))
+    ordered = [by_inst.pop(i["instrument_id"], i) for i in insts]  # 機器の並び順（管理番号順）に
+    return ordered + list(by_inst.values())  # 記録のあとで廃棄にした機器などは最後に
+
+
+@app.get("/print/calibrations/<int:cal_id>")
+def calibration_print(cal_id):
+    conn = db()
+    c = conn.execute("SELECT * FROM calibrations WHERE id=?", (cal_id,)).fetchone()
+    if not c or c["form"] not in calib_mod.FORMS:
+        abort(404, "校正記録が見つかりません")
+    form = calib_mod.FORMS[c["form"]]
+    return Response(calib_mod.render_print(form, calib_out(c), calib_print_rows(conn, form, cal_id)), mimetype="text/html")
+
+
+@app.get("/print/calibrations/blank")
+def calibration_print_blank():
+    """白紙の記録書（紙で書くとき用）。"""
+    form = calib_mod.FORMS.get(request.args.get("form"))
+    if not form:
+        abort(404, "様式が見つかりません")
+    return Response(calib_mod.render_print(form, {}, calib_print_rows(db(), form)), mimetype="text/html")
+
+
+@app.delete("/api/calibrations/<int:cal_id>")
+def calibration_delete(cal_id):
+    conn = db()
+    conn.execute("DELETE FROM instrument_events WHERE calibration_id=?", (cal_id,))
+    conn.execute("DELETE FROM calibration_rows WHERE calibration_id=?", (cal_id,))
+    conn.execute("DELETE FROM calibrations WHERE id=?", (cal_id,))
     conn.commit()
     return jsonify(ok=True)
 

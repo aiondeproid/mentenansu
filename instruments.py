@@ -1,4 +1,4 @@
-"""測定機器毎の管理台帳.xls の各シート（秤量器・ノギス・温度計・加熱装置付属温度計）を測定機器（instruments）に取り込む。
+"""測定機器毎の管理台帳.xls の各シート（秤量器・ノギス・温度計・加熱装置付属温度計・庫内温度計）を測定機器（instruments）に取り込む。
 
     python instruments.py                          # 測定機器毎の管理台帳.xls の全シートを取り込む
     python instruments.py --kind ノギス            # 1 シートだけ
@@ -7,7 +7,7 @@
 
 - 1 行 = 1 台。エリアの決め方はシートごと（SHEETS の area）
   - 秤量器: № の頭が「前」→前処理、「後」→後処理。末尾の数字だけの番号は予備機（「予備1」など）
-  - ノギス・温度計・加熱装置付属温度計: 使用エリアの言葉で決める（area_by_place）
+  - ノギス・温度計・加熱装置付属温度計・庫内温度計: 使用エリアの言葉で決める（area_by_place）
 - 右側の欄（経緯メモ）は日付ごとに区切って履歴（instrument_events）にする。原文は xls_memo に残す
 - 何度流しても同じ（№で突き合わせて上書き。履歴は取り込み分だけ入れ直し、アプリで足した履歴は残す）
 """
@@ -108,6 +108,15 @@ SHEETS = {
         "area": lambda rec: area_by_place(rec.get("plant")),  # 「Aライン蒸煮」→前処理、「別添たれ」→タレ工程
         "post": dash_to_none,
         "labels": {"plant": "使用エリア", "type": "装置名", "model": "型式", "capacity": "使用範囲", "division": "最小表示"},
+    },
+    "庫内温度計": {  # 製品保管庫の庫内温度計。校正（検査記録書）の行になる（calibration.py）
+        "sheet": "26製品保管庫の庫内温度計", "header": "管理番号", "numeric_no": "{}",
+        "cols": {"no": 1, "plant": 2, "type": 3, "division": 4, "capacity": 5, "model": 6, "maker": 7, "purchased_raw": 8},
+        "remark": 9,
+        "memo_from": 10,
+        "area": lambda rec: area_by_place(rec.get("plant")),
+        "post": dash_to_none,
+        "labels": {"plant": "使用エリア", "type": "保管庫名", "model": "型式", "capacity": "使用範囲", "division": "最小表示"},
     },
 }
 SPEC_FIELDS = ["rank", "ledger_no", "plant", "process", "purpose", "maker", "type", "model", "serial_no",
