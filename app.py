@@ -1631,8 +1631,21 @@ def calibrations_meta():
     conn = db()
     out = {}
     for name, f in calib_mod.FORMS.items():
-        insts = []
-        if f.get("kind"):
+        insts, lines = [], None
+        if f.get("entries"):  # デジタル温度計: 様式で決めた行（1 台 2 行のものあり）
+            lines = calib_mod.resolve_lines(conn, f)
+            seen = {}
+            for ln in lines:
+                if ln["instrument_id"] and ln["instrument_id"] not in seen:
+                    seen[ln["instrument_id"]] = {"id": ln["instrument_id"], "no": ln["no"], "plant": ln.get("plant"), "type": ln.get("model")}
+            insts = list(seen.values())
+        elif f.get("type") == "scale":  # 秤: 測定機器の秤量器（No・プラント・型式・表示目盛は台帳から）＋ 分銅の初期値
+            insts = scale_instruments(conn, f)
+            presets = {r["instrument_id"]: _json(r["data"]) for r in conn.execute("SELECT instrument_id, data FROM calib_presets WHERE form=?", (name,))}
+            for i in insts:
+                i["ranges"] = [[float(c) if c is not None else None, float(dv)] for c, dv in calib_mod.parse_division(i["division"], i["capacity"])]
+                i["preset"] = presets.get(i["id"], {})
+        elif f.get("kind"):
             insts = rows(conn.execute(
                 "SELECT id, no, plant, type, division, area, status FROM instruments WHERE kind=? AND status NOT IN ('廃棄','欠番') "
                 "ORDER BY sort_order IS NULL, sort_order, id", (f["kind"],)))
@@ -1653,7 +1666,7 @@ def calibrations_meta():
                 if dev and dev not in suggest.setdefault("device", []):
                     suggest["device"].append(dev)
         out[name] = {**{k: v for k, v in f.items() if k != "seed"}, "type": f.get("type", "temp"),
-                     "instruments": insts, "references": refs, "suggest": suggest}
+                     "instruments": insts, "lines": lines, "references": refs, "suggest": suggest}
     return jsonify(forms=out, order=list(calib_mod.FORMS))  # jsonify はキーを並べ替えるので順番は別に渡す
 
 
@@ -1690,15 +1703,27 @@ def _calib_num(v, label, where):
         abort(400, str(e))
 
 
+def scale_instruments(conn, form):
+    return rows(conn.execute(
+        "SELECT id, no, plant, model, capacity, division, area, status FROM instruments WHERE kind=? AND status NOT IN ('廃棄','欠番') "
+        "ORDER BY sort_order IS NULL, sort_order, id", (form["kind"],)))
+
+
 def calib_temp_rows(conn, form, raw_rows):
-    """庫内温度計・室温計の行（1 行 = 測定機器 1 台）。"""
+    """温度計の行（庫内温度計・室温計: 1 行 = 1 台 / デジタル温度計: 様式の行。1 台 2 行のものあり）。"""
     kind_ids = {r[0]: r[1] for r in conn.execute("SELECT id, no FROM instruments WHERE kind=?", (form["kind"],))}
+    lines = calib_mod.resolve_lines(conn, form) if form.get("entries") else None
     out_rows = []
     for n, r in enumerate(raw_rows or [], 1):
         iid = r.get("instrument_id")
         if iid not in kind_ids:
             abort(400, f"{n}行目: {form['kind']}ではない機器です")
         where = f"{form['kind']} {kind_ids[iid]}"
+        line = None
+        if lines is not None:  # 画面は様式の行を順番どおりに送ってくる（n 行目 = 様式の n 行目）
+            if n > len(lines) or lines[n - 1]["instrument_id"] != iid:
+                abort(400, f"{n}行目: 様式の行と機器が合いません。画面を開き直してください")
+            line = lines[n - 1]
         row = {"instrument_id": iid, "sort_order": n,
                "daily_ok": {"合": 1, "否": 0, 1: 1, 0: 0, "1": 1, "0": 0}.get(r.get("daily_ok")),
                "zone": blank_to_none(r.get("zone")),
@@ -1710,9 +1735,16 @@ def calib_temp_rows(conn, form, raw_rows):
             abort(400, f"{where}: 検査温度は {'・'.join(form['zones'])} から選んでください")
         if row["min_display"] is not None and row["min_display"] not in form["min_displays"]:
             abort(400, f"{where}: 最小表示は 0.1・0.5・1.0 から選んでください")
+        if line is not None:
+            if len(line["zones"]) == 1:
+                row["zone"] = line["zones"][0]  # 検査温度が 1 つだけの行（-18℃区など）
+            elif row["zone"] and row["zone"] not in line["zones"]:
+                abort(400, f"{where}: 検査温度は {'・'.join(line['zones'])} から選んでください")
+            if not (form.get("rounding") == "low" and line["low"]):
+                row["min_display"] = 0.1  # 処理後温度の欄がない行は ａ をそのまま使う
         if row["daily_ok"] is None and all(row[f] is None for f in calib_mod.NUM_FIELDS) and not row["action_no"]:
             continue  # 何も書いていない行（検査しなかった機器）は残さない
-        out_rows.append(calib_mod.compute(row, form["limit"]))
+        out_rows.append(calib_mod.compute(row, form["limit"], form.get("limit_inclusive", False)))
     return out_rows
 
 
@@ -1727,8 +1759,16 @@ def calib_values(conn, d):
     extra = d.get("extra") or {}
     extra = {k: blank_to_none(norm(str(extra.get(k) or "")).strip()) for k, _ in form["extra_fields"]}
     v["extra"] = json.dumps({k: x for k, x in extra.items() if x}, ensure_ascii=False) or None
-    if form.get("type", "temp") == "temp":
+    if form.get("type", "temp") in ("temp", "dt"):
         out_rows = calib_temp_rows(conn, form, d.get("rows"))
+        if not out_rows:
+            abort(400, "検査結果を 1 台以上入れてください")
+    elif form.get("type") == "scale":
+        insts = {r["id"]: dict(r) for r in conn.execute("SELECT id, no, capacity, division FROM instruments WHERE kind=?", (form["kind"],))}
+        try:
+            out_rows = calib_mod.build_scale_rows(form, d.get("rows"), insts)
+        except ValueError as e:
+            abort(400, str(e))
         if not out_rows:
             abort(400, "検査結果を 1 台以上入れてください")
     else:
@@ -1742,11 +1782,24 @@ def calib_values(conn, d):
     return form_name, form, v, out_rows
 
 
+def v_form(form):
+    """様式の dict → FORMS のキー。"""
+    return next(k for k, f in calib_mod.FORMS.items() if f is form)
+
+
 def calib_save(conn, cal_id, form, v, out_rows):
     conn.execute("DELETE FROM calibration_rows WHERE calibration_id=?", (cal_id,))
     conn.execute("DELETE FROM instrument_events WHERE calibration_id=?", (cal_id,))
-    temp = form.get("type", "temp") == "temp"
+    temp = form.get("type", "temp") in ("temp", "dt", "scale")  # 測定機器につながる行（履歴に「校正」を残す）
+    scale = form.get("type") == "scale"
     for r in out_rows:
+        note = calib_mod.scale_event_note(r) if scale else calib_mod.event_note(r) if temp else None
+        if scale:  # 使った分銅を次の検査の初期値にする
+            w = {f"w{i}": r["data"].get(f"w{i}") for i in (1, 2, 3)}
+            if any(w.values()):
+                conn.execute("INSERT INTO calib_presets(form, instrument_id, data) VALUES (?,?,?) "
+                             "ON CONFLICT(form, instrument_id) DO UPDATE SET data=excluded.data",
+                             (v_form(form), r["instrument_id"], json.dumps(w, ensure_ascii=False)))
         r = {**r, "data": json.dumps(r["data"], ensure_ascii=False)} if "data" in r else r
         conn.execute(f"INSERT INTO calibration_rows(calibration_id, {', '.join(r)}) VALUES (?, {', '.join('?' * len(r))})",
                      (cal_id, *r.values()))
@@ -1754,10 +1807,10 @@ def calib_save(conn, cal_id, form, v, out_rows):
             conn.execute(  # 機器の履歴にも「校正」を残す（校正記録を直す・消すと一緒に変わる）
                 "INSERT INTO instrument_events(instrument_id, event_date, event, note, author, source, calibration_id) "
                 "VALUES (?, ?, '校正', ?, ?, 'calib', ?)",
-                (r["instrument_id"], v["inspected_on"], calib_mod.event_note(r), v["inspector"] or request_user(), cal_id))
+                (r["instrument_id"], v["inspected_on"], note, v["inspector"] or v["approved_staff"] or request_user(), cal_id))
     ok = sum(r["result"] == "合" for r in out_rows)
     ng = sum(r["result"] == "否" for r in out_rows)
-    unit = "台" if temp else "件"
+    unit = "件" if form.get("type") == "dt" else "台" if temp else "件"  # デジタル温度計は 1 台 2 行のものがあるので「件」
     if form.get("type") == "conveyor":
         detail = f"判定 {v['result'] or '未判定'}（{len(out_rows)}回測定）"
     else:
@@ -1793,8 +1846,23 @@ def calibration_update(cal_id):
 def calib_print_rows(conn, form, cal_id=None):
     """印刷の行。温度計: 記録した機器 ＋ まだ検査していない機器（空欄）を機器の並び順で全台。それ以外: 記録した行（足りない分は空欄で印刷側が足す）。"""
     saved = rows(conn.execute(
-        """SELECT r.*, i.no, i.plant, i.type, 1 AS recorded FROM calibration_rows r LEFT JOIN instruments i ON i.id = r.instrument_id
+        """SELECT r.*, i.no, i.plant, i.type, i.model, i.division, 1 AS recorded FROM calibration_rows r LEFT JOIN instruments i ON i.id = r.instrument_id
            WHERE r.calibration_id=? ORDER BY r.sort_order, r.id""", (cal_id,))) if cal_id else []
+    if form.get("type") == "scale":  # 秤: 全台（台帳の並び）に記録を重ねる。記録のない秤は分銅の初期値だけ出す
+        presets = {r["instrument_id"]: _json(r["data"]) for r in conn.execute("SELECT instrument_id, data FROM calib_presets WHERE form=?", (v_form(form),))}
+        by_inst = {r["instrument_id"]: r for r in saved}
+        out = []
+        for i in scale_instruments(conn, form):
+            r = by_inst.pop(i["id"], None)
+            data = _json(r["data"]) if r else dict(presets.get(i["id"], {}))
+            out.append({**i, "instrument_id": i["id"], "data": data, "result": r["result"] if r else None})
+        for r in by_inst.values():  # 記録のあとで廃棄にした秤など
+            out.append({**r, "data": _json(r["data"])})
+        return out
+    if form.get("type") == "dt":  # 様式の行に記録を重ねる（sort_order = 行の番号）
+        by_idx = {r["sort_order"]: r for r in saved}
+        return [{**ln, **({k: v for k, v in by_idx[ln["idx"]].items() if k not in ("no", "plant", "type")} if ln["idx"] in by_idx else {})}
+                for ln in calib_mod.resolve_lines(conn, form)]
     if form.get("type", "temp") != "temp":
         for r in saved:
             r["data"] = _json(r.get("data"))

@@ -725,3 +725,8 @@ dialog#modal.wide { width: min(1240px, calc(100vw - 24px)); }
 .cal-free input[name=remark] { width: 150px; }
 .cal-table .thick { border-left: 2px solid var(--text, #333); border-right: 2px solid var(--text, #333); }
 .cal-verdict { margin: 10px 0; font-size: 16px; }
+.cal-scale input.mini { width: 64px; }
+.cal-scale td.l { text-align: left; }
+.cal-scale .small { font-size: 11px; max-width: 110px; }
+.cal-sub { font-size: 11px; color: var(--muted); white-space: nowrap; }
+.cal-sub.ng-text { color: var(--lv-over); font-weight: 600; }

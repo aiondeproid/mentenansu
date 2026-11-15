@@ -338,6 +338,12 @@ CREATE TABLE IF NOT EXISTS calibration_rows (   -- 検査記録書の 1 行（1 
     action_no TEXT             -- 不合格時の処置記録の№
 );
 CREATE INDEX IF NOT EXISTS idx_calibration_rows_cal ON calibration_rows(calibration_id);
+CREATE TABLE IF NOT EXISTS calib_presets (   -- 校正の初期値（秤ごとの分銅など）。原紙から取り込み、検査で使った値で上書き
+    form TEXT NOT NULL,
+    instrument_id INTEGER NOT NULL REFERENCES instruments(id),
+    data TEXT,                 -- JSON（秤: {"w1": "10kg", "w2": "5kg", "w3": "2kg"}）
+    PRIMARY KEY (form, instrument_id)
+);
 
 CREATE INDEX IF NOT EXISTS idx_records_eq ON records(equipment_id);
 CREATE INDEX IF NOT EXISTS idx_records_date ON records(done_date);

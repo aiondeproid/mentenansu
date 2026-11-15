@@ -5,11 +5,17 @@
     様式（FORMS）。type で入力の表・計算・印刷が変わる
       - 庫内・室温計 … temp     「保管庫の庫内温度計、作業場室温計の検査記録書」（26.…【230627】.xls、11 台）
       - 庫内温度計   … temp     「製品保管庫の庫内温度計の検査記録書」（測定機器毎の管理台帳の「26」シートの 1 台）
+      - ランクA温度計 … dt      「ランクＡ デジタル温度計の検査記録書（ＣＣＰ用）」（08.デジタル温度計の検査記録書.xls、25/12/3 改訂版）
+      - ランクB温度計 … dt      「ランクＢ デジタル温度計の検査記録書」（同上）
+      - 秤           … scale    「秤の校正」（秤の校正 原紙.xls の原紙シート。行 = 測定機器「秤量器」、分銅の初期値は原紙から）
       - タイマー     … timer    「CCPモニタリングに用いるタイマーの校正記録」（NE-023-001）
       - 蒸煮コンベア … conveyor 「蒸煮コンベア速度校正記録」（NE-023-002）
-    temp は 1 行 = 測定機器 1 台（calibration_rows の列）。timer・conveyor は機器に結びつかない行で、中身は calibration_rows.data（JSON）。
+    temp は 1 行 = 測定機器 1 台（calibration_rows の列）。dt も同じ列を使うが、行は FORMS の entries で決め打ち
+    （1 台に高温側・低温側の 2 行があるものがある。sort_order = 行の番号で、保存した行と様式の行を突き合わせる）。timer・conveyor は機器に結びつかない行で、中身は calibration_rows.data（JSON）。
     様式を増やすときは FORMS に足す。印刷は render_print（紙の記録書と同じ並び）。
 
+    デジタル温度計（dt）: 器差 = ｂ − ａ（ランクB の低温側は四捨五入等の処理後のａ）。±1.0℃以下なら合、超えたら否
+      （庫内温度計の「±2.0℃未満なら合」とは境目の扱いが逆。limit_inclusive）
     タイマー: 差異 = 実測時間② − 設定時間①（秒）。±2.00 秒以内なら合
     蒸煮コンベア: 差異 = (実測通過時間② ÷ 基準通過時間① − 1) × 100（%、小数第 2 位で四捨五入）。
       5 回とも ±1% 以内なら全体で合、1 回でも外れたら否（ちょうど 1.00% は「±1%以内」として合）
@@ -27,6 +33,7 @@ import argparse
 import datetime as dt
 import html
 import os
+import re
 import sys
 from decimal import ROUND_FLOOR, ROUND_HALF_UP, Decimal
 
@@ -90,8 +97,72 @@ FORMS = {
         "approvals": [["approved_manager", "工場長"], ["approved_qc", "品管責任者"], ["approved_staff", "担当者"]],
     },
 }
+DT_DAILY = ["測定用センサー部(プローブ)と本体の接続部にゆるみ・ガタツキがないこと。",
+            "温度計の本体やセンサー部に性能を左右するような損傷がないこと。",
+            "電源をONにしたとき、表示に欠けがなく、室温が表示されていること。"]
+DT_REFS = ["デジタル標準温度計", "温度校正装置(Dry-Well Model-9140)", "温度校正装置(チノー Model-KT-H504S)"]
+HIGH, LOW, ZERO = ["70℃区", "100℃区"], ["-18℃区"], ["0℃区"]
+DT_COMMON = {
+    "type": "dt", "has_inspector": True, "kind": "温度計", "limit": 1.0, "limit_inclusive": True,
+    "min_displays": [0.1, 0.5, 1.0], "daily_items": DT_DAILY,
+    "reference_label": "使用基準器", "reference_options": DT_REFS, "note_label": "メモ",
+    "action_label": "デジタル温度計定期検査不合格時の処置記録の№",
+    "approvals": [["approved_manager", "工場長"], ["approved_qc", "品管"]],
+}
+FORMS["ランクA温度計"] = {
+    **DT_COMMON,
+    "title": "ランクＡ　デジタル温度計の検査記録書", "subtitle": "（ＣＣＰ用）",
+    "code": "NF-102-器-008-05", "created": "25/12/3改訂",
+    # 様式の行（管理番号 = 測定機器「温度計」の№。zones が 2 つ以上なら検査のときに選ぶ）
+    "entries": [{"no": "2", "lines": [HIGH]}, {"no": "9", "lines": [HIGH]}, {"no": "10", "lines": [HIGH]}, {"no": "14", "lines": [HIGH]},
+                {"no": "13", "lines": [HIGH, LOW]}, {"no": "19", "lines": [HIGH, LOW]}, {"no": "6", "lines": [LOW]}],
+    "rounding": None,  # 処理後温度の欄なし（ａをそのまま使う）
+    "notes": ["全て目量0.1℃の補正した標準温度計の温度を使用する。",
+              "ａは温度校正装置用標準温度計を使用した場合は補正した温度、高精度デジタル標準温度計を使用した場合は小数点第2位を四捨五入した温度を記入する。"],
+}
+FORMS["ランクB温度計"] = {
+    **DT_COMMON,
+    "title": "ランクＢ　デジタル温度計の検査記録書",
+    "code": "NF-102-器-008-06", "created": "25/12/3改訂",
+    "entries": [{"no": "1", "lines": [ZERO]}, {"no": "3", "lines": [LOW]}, {"no": "4", "lines": [HIGH]}, {"no": "5", "lines": [HIGH, LOW]},
+                {"no": "6", "lines": [LOW]}, {"no": "7", "lines": [LOW]}, {"no": "11", "lines": [LOW]}, {"no": "16", "lines": [ZERO]},
+                {"no": "23", "lines": [ZERO]}, {"no": "24", "lines": [HIGH, LOW]}],  # 24 = 記録書の「予備」（品質管理 予備 testo108）
+    "rounding": "low",  # 低温側だけ最小表示に合わせて四捨五入等（0.1 そのまま / 0.5 二捨三入 / 1.0 四捨五入）
+    "notes": ["検査温度（※１）　①冷蔵・常温・高温の測定に使用する場合：高温側、低温側の両方　②冷凍保管庫、凍結品などマイナス温度測定のみに使用する場合：低温側のみ"],
+}
+FORMS["秤"] = {
+    "type": "scale", "title": "秤の校正", "code": "76F10-01-001", "note_top": "※表示通り記入する事",
+    "kind": "秤量器",  # 行は測定機器の秤量器（No・プラント・型式・表示目盛は台帳から。廃棄・欠番は出さない）
+    "reference_label": "使用分銅", "reference_default": "ランクA",
+    "note_label": "メモ",
+    "approvals": [["approved_qc", "品管"], ["approved_staff", "実施者"]],
+    "preset_seed": {"file": "秤の校正 原紙.xls", "sheet": "原紙"},  # 秤ごとの分銅の初期値（python calibration.py で取り込む）
+}
+# 画面の並び（温度計の様式を先に）
+FORMS = {k: FORMS[k] for k in ["ランクA温度計", "ランクB温度計", "庫内・室温計", "庫内温度計", "秤", "タイマー", "蒸煮コンベア"]}
 for _f in FORMS.values():
     _f.setdefault("extra_fields", [])
+    if _f.get("entries"):
+        _f["zones"] = list(dict.fromkeys(z for e in _f["entries"] for line in e["lines"] for z in line))
+
+
+def is_low(zones):
+    """低温側の行か（-18℃区・0℃区）。"""
+    return all(not z.startswith(("70", "100")) for z in zones)
+
+
+def resolve_lines(conn, form):
+    """dt の様式の行を測定機器とつなげる。行ごとに idx（1 始まり = sort_order）・entry（№）・span（同じ機器の行数）を付ける。"""
+    out, idx = [], 0
+    for n, e in enumerate(form["entries"], 1):
+        i = conn.execute("SELECT id, no, rank, plant, model, maker, status FROM instruments WHERE kind=? AND no=?",
+                         (form["kind"], e["no"])).fetchone()
+        for k, zones in enumerate(e["lines"]):
+            idx += 1
+            out.append({"idx": idx, "entry": n, "first": k == 0, "span": len(e["lines"]), "zones": zones, "low": is_low(zones),
+                        "no": e["no"], "instrument_id": i["id"] if i else None,
+                        **({key: i[key] for key in ("rank", "plant", "model", "maker", "status")} if i else {})})
+    return out
 NUM_FIELDS = ["ref_display", "ref_corrected", "inst_display"]
 
 
@@ -119,8 +190,10 @@ def round_by_min(a, step):
     return float(r * sign) or 0.0  # -0.0 を 0.0 に
 
 
-def compute(row, limit=2.0):
-    """1 行分の 処理後の温度・器差・判定・補正温度 を計算して row に入れる。"""
+def compute(row, limit=2.0, inclusive=False):
+    """1 行分の 処理後の温度・器差・判定・補正温度 を計算して row に入れる。
+    inclusive=False: |器差| ≧ limit で否（庫内温度計「±2.0℃未満なら合」）
+    inclusive=True : |器差| ＞ limit で否（デジタル温度計「±1.0℃以下なら合」）"""
     rounded = round_by_min(row.get("ref_corrected"), row.get("min_display"))
     b = row.get("inst_display")
     error = float(_d(b) - _d(rounded)) if rounded is not None and b is not None else None
@@ -129,7 +202,8 @@ def compute(row, limit=2.0):
     elif error is None:
         result = None
     else:
-        result = "否" if abs(_d(error)) >= _d(limit) else "合"
+        over = abs(_d(error)) > _d(limit) if inclusive else abs(_d(error)) >= _d(limit)
+        result = "否" if over else "合"
     row.update(rounded=rounded, error=error, result=result,
                correction=(-error or 0.0) if error is not None else None)
     return row
@@ -320,7 +394,99 @@ def render_print(form, cal, rows):
         return render_print_timer(form, cal, rows)
     if form.get("type") == "conveyor":
         return render_print_conveyor(form, cal, rows)
+    if form.get("type") == "dt":
+        return render_print_dt(form, cal, rows)
+    if form.get("type") == "scale":
+        return render_print_scale(form, cal, rows)
     return render_print_temp(form, cal, rows)
+
+
+def render_print_dt(form, cal, rows):
+    """デジタル温度計（A4 横）。rows は様式の行（resolve_lines）に記録を重ねたもの。"""
+    e = lambda v: html.escape("" if v is None else str(v))
+    blank = not cal.get("id")
+    d = cal.get("inspected_on")
+    date = f"{int(d[:4])}年 {int(d[5:7])}月 {int(d[8:10])}日" if d else "　　　　年　　　月　　　日"
+    rounding = bool(form.get("rounding"))
+
+    def choice(options, cur):
+        return "・".join(f'<span class="opt{" on" if o == cur else ""}">{o}</span>' for o in options)
+
+    def num(v, sign=False):
+        return f"{e(fmt(v, sign))}℃" if v is not None else ""
+
+    body = []
+    for r in rows:
+        daily = {1: "合", 0: "否"}.get(r.get("daily_ok"))
+        zones = r["zones"]
+        zone = "<br>".join(f'{"■" if r.get("zone") == z else "□"}{z}' for z in zones) if len(zones) > 1 else e(zones[0])
+        head = ""
+        if r["first"]:
+            sp = f' rowspan="{r["span"]}"' if r["span"] > 1 else ""
+            head = (f'<td{sp}>{r["entry"]}</td><td{sp}>{e(r.get("no"))}</td><td{sp}>{e(r.get("rank"))}</td>'
+                    f'<td class="l"{sp}>{e(r.get("plant"))}</td><td class="l"{sp}>{e(r.get("model"))}</td><td class="ln"{sp}>{e(r.get("maker"))}</td>')
+        rounded = ""
+        if rounding:
+            show = r.get("low") and r.get("rounded") is not None and r.get("recorded")
+            md = r.get("min_display")
+            rounded = f'<td class="n">{num(r.get("rounded")) if show else ""}{f"<br><small>最小{md:.1f}</small>" if show and md else ""}</td>'
+        body.append(f"""<tr>{head}
+          <td>{choice(["合", "否"], daily)}</td><td class="zone">{zone}</td>
+          <td class="n">{num(r.get("ref_display"))}</td><td class="n">{num(r.get("ref_corrected"))}</td>{rounded}
+          <td class="n">{num(r.get("inst_display"))}</td><td class="n">{num(r.get("error"), True)}</td>
+          <td>{choice(["合", "否"], r.get("result"))}</td><td class="n">{num(r.get("correction"), True)}</td><td>{e(r.get("action_no"))}</td></tr>""")
+    stamps = "".join(f"<div><b>{e(label)}</b><span>{e(cal.get(key))}</span></div>" for key, label in form["approvals"])
+    daily_items = "".join(f"<p>({i}) {e(t)}</p>" for i, t in enumerate(form["daily_items"], 1))
+    refs = "".join(f'<div>{"■" if cal.get("reference") == o else "□"}{e(o)}</div>' for o in form["reference_options"])
+    if cal.get("reference") and cal["reference"] not in form["reference_options"]:
+        refs += f'<div>■{e(cal["reference"])}</div>'
+    lim = f"{form['limit']:.1f}"
+    notes = "".join(f"<p>※{e(t)}</p>" for t in form.get("notes", []))
+    low_rule = ""
+    if rounding:
+        low_rule = """<p style="margin-top:1mm"><b>【低温側：器差の求め方と補正の仕方】</b></p>
+      <table><tr><th style="width:26mm">検査する温度計の最小表示</th><th>方法</th></tr>
+        <tr><td>0.1℃の場合</td><td>標準温度計の補正後温度（ａ）と検査温度計の表示温度（ｂ）とそのまま比較する。器差分を補正する。</td></tr>
+        <tr><td>0.5℃の場合</td><td>標準温度計の補正後温度（ａ）を「二捨三入」し、検査温度計の表示温度（ｂ）と比較する。器差分を補正する。</td></tr>
+        <tr><td>1.0℃の場合</td><td>標準温度計の補正後温度（ａ）を「四捨五入」し、検査温度計の表示温度（ｂ）と比較する。器差分を補正する。</td></tr></table>"""
+    printed = dt.datetime.now().strftime("%Y/%m/%d %H:%M")
+    rounded_th = '<th rowspan="2">四捨五入等の<br>処理後温度(℃)</th>' if rounding else ""
+    sub = f'<div class="subtitle">{e(form["subtitle"])}</div>' if form.get("subtitle") else ""
+    return f"""<!doctype html><html lang="ja"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{e(form["title"])}{" " + e(d) if d else ""}</title><style>{PRINT_CSS}
+.subtitle {{ text-align: center; font-size: 11pt; }}
+.refs div {{ line-height: 1.2; font-size: 9pt; }}
+.head {{ margin: 1mm 0 1.5mm; }}
+.rules {{ font-size: 7.5pt; line-height: 1.2; }}
+table.main td {{ white-space: nowrap; }}
+table.main td.l {{ white-space: normal; }}
+table.main td.ln {{ text-align: left; }}
+table.main tbody tr {{ height: 6.6mm; }}
+small {{ font-size: 7pt; }}
+</style></head><body>
+<div class="bar"><button onclick="window.print()">印刷する</button><button onclick="window.close()">閉じる</button></div>
+<div class="sheet">
+  <div class="top"><div class="code">様式：{e(form["code"])}<br>{e(form.get("created"))}</div><div style="flex:1"><h1>{e(form["title"])}</h1>{sub}</div><div class="stamps">{stamps}</div></div>
+  <div class="head">
+    <div style="display:grid;gap:1.5mm"><div>検査年月日：<span class="u">{date}</span></div><div>検査者：<span class="u">{e(cal.get("inspector"))}</span></div></div>
+    <div style="display:flex;gap:2mm">使用基準器：<div class="refs">{refs}</div></div>
+  </div>
+  <div class="rules">
+    <div><p><b>日常点検項目</b></p>{daily_items}
+      <p style="margin-top:1.5mm"><b>合否判定基準</b></p>
+      <table><tr><td>器差：±{lim}℃以下</td><td>器差分を補正して使用可能</td></tr><tr><td>器差：±{lim}℃超</td><td>不合格とし、処置する</td></tr></table></div>
+    <div>{notes}{low_rule}</div>
+  </div>
+  <table class="main"><thead>
+    <tr><th rowspan="2">№</th><th colspan="5">検査温度計</th><th rowspan="2">日常点検<br>項目</th><th rowspan="2">検査温度</th>
+      <th rowspan="2">標準温度計<br>表示(℃)</th><th rowspan="2">標準温度計<br>補正後温度(℃)<br>ａ</th>{rounded_th}
+      <th rowspan="2">検査温度計<br>表示(℃)<br>ｂ</th><th rowspan="2">器差(℃)<br>ｂ－ａ</th><th rowspan="2">判定</th><th rowspan="2">補正温度<br>－（ｂ－ａ）</th>
+      <th rowspan="2" style="width:28mm">{e(form["action_label"])}</th></tr>
+    <tr><th>管理番号</th><th>ﾗﾝｸ</th><th>使用ｴﾘｱ</th><th>型式</th><th>ﾒｰｶｰ</th></tr>
+  </thead><tbody>{"".join(body)}</tbody></table>
+  <div class="foot"><span class="memo">{f"メモ：{e(cal.get('note'))}" if cal.get("note") else ""}</span><span>{"" if blank else "設備保全アプリで記録　"}印刷 {printed}</span></div>
+</div></body></html>"""
 
 
 def render_print_temp(form, cal, rows):
@@ -522,6 +688,243 @@ def render_print_conveyor(form, cal, rows):
     return _page(form, cal, inner)
 
 
+
+# ---------------------------------------------------------------- 秤の校正（type: scale）
+# 行 = 測定機器「秤量器」（No・プラント・型式・表示目盛は台帳から）。分銅 3 つの表示を見て、許容差は 表示目盛 × 倍率（Sheet3 の定期検査）
+SCALE_FACTORS = [(100, 1), (12000, 2), (None, 3)]  # 分銅の重さ（g）まで → 倍率（100g以下 ×1、12kg以下 ×2、12kg超 ×3）
+_MASS_RE = re.compile(r"^\s*([0-9]*\.?[0-9]+)\s*(kg|k|g)?\s*$", re.I)
+
+
+def _mass_norm(text):
+    from db import norm
+    return norm(str(text)).replace("㎏", "kg").replace("ｇ", "g").replace("ｋ", "k").replace(" ", "").lower()
+
+
+def parse_mass(text, default_unit="kg"):
+    """「10」「2000g」「1.5k」「0.002㎏」→ (グラム, 単位の倍率 1 か 1000)。数字だけは kg（原紙の見出しが「分銅k」）。読めなければ (None, None)。"""
+    if text in (None, ""):
+        return None, None
+    if isinstance(text, (int, float)):
+        text = f"{text:g}"
+    m = _MASS_RE.match(_mass_norm(text))
+    if not m:
+        return None, None
+    unit = (m.group(2) or default_unit).lower()
+    factor = 1 if unit == "g" else 1000
+    return _d(m.group(1)) * factor, factor
+
+
+def mass_text(text):
+    """分銅の表記をそろえる（10 → 10kg、2000ｇ → 2000g）。"""
+    g, factor = parse_mass(text)
+    if g is None:
+        return str(text).strip() if text not in (None, "") else None
+    v = g / factor
+    return f"{v.normalize():f}{'g' if factor == 1 else 'kg'}"
+
+
+def parse_division(division, capacity=None):
+    """表示目盛 → [(上限 g または None, 目盛 g), ...]。読めなければ []。
+    「5g」「0.002㎏」/「6/15/30、2g/5g/10g」「300/600/1500.0.1/0.2/0.5」「3/6/15.1/2/5」（上限/上限/上限 区切り 目盛/目盛/目盛）"""
+    if not division:
+        return []
+    t = _mass_norm(division)
+    single = parse_mass(t, default_unit="g")[0]
+    if single is not None:
+        return [(None, single)]
+    m = re.fullmatch(r"(\d+(?:/\d+)+)[、,.](.+)", t)
+    if not m:
+        return []
+    caps = [_d(x) for x in m.group(1).split("/")]
+    divs_txt = [x for x in m.group(2).split("/") if x]
+    unit_tail = "kg" if m.group(2).endswith("kg") else "g"
+    divs = [parse_mass(x if re.search(r"[a-z]$", x) else x + unit_tail, default_unit="g")[0] for x in divs_txt]
+    if len(caps) != len(divs) or None in divs:
+        return []
+    cap_g = parse_mass(capacity, default_unit="kg")[0] if capacity else None
+    top = caps[-1]
+    if cap_g is not None and top * 1000 == cap_g:
+        mult = 1000
+    elif cap_g is not None and top == cap_g:
+        mult = 1
+    else:
+        mult = 1 if top >= 100 else 1000  # 300/600/1500 は g、6/15/30 は kg
+    return [(c * mult, dv) for c, dv in zip(caps, divs)]
+
+
+def scale_tolerance(ranges, weight_g):
+    """分銅の重さに対する (目盛 g, 倍率, 許容差 g)。表示目盛が読めなければ None。"""
+    if not ranges or weight_g is None:
+        return None
+    div = next((dv for cap, dv in ranges if cap is None or weight_g <= cap), ranges[-1][1])
+    factor = next(f for lim, f in SCALE_FACTORS if lim is None or weight_g <= lim)
+    return div, factor, div * factor
+
+
+def compute_scale(row, ranges):
+    """秤 1 台分。data の w1..w3（分銅）・r1..r3（表示）から差と判定を入れる。result_manual があればそれを判定にする。"""
+    d = row["data"]
+    checks = []
+    for i in (1, 2, 3):
+        w, r = d.get(f"w{i}"), d.get(f"r{i}")
+        wg, factor = parse_mass(w)
+        d.pop(f"diff{i}", None), d.pop(f"tol{i}", None), d.pop(f"ok{i}", None)
+        if wg is None or r is None:
+            continue
+        diff = _d(r) * factor - wg
+        d[f"diff{i}"] = float(diff)
+        tol = scale_tolerance(ranges, wg)
+        if tol:
+            d[f"tol{i}"] = float(tol[2])
+            ok = abs(diff) <= tol[2]
+            d[f"ok{i}"] = ok
+            checks.append(ok)
+        else:
+            checks.append(None)  # 表示目盛が読めない（判定は手で）
+    visual = [d.get("appearance"), d.get("level")]
+    if "否" in visual or False in checks:
+        auto = "否"
+    elif checks and all(c is True for c in checks):
+        auto = "合"
+    else:
+        auto = None
+    d["result_auto"] = auto
+    row["result"] = d.get("result_manual") or auto
+    return row
+
+
+def build_scale_rows(form, raw_rows, instruments):
+    """画面の行 → 保存する行。instruments = {id: 測定機器の dict}。空の行は捨てる。"""
+    from db import norm
+    out = []
+    for n, r in enumerate(raw_rows or [], 1):
+        iid = r.get("instrument_id")
+        inst = instruments.get(iid)
+        if not inst:
+            raise ValueError(f"{n}行目: {form['kind']}ではない機器です")
+        where = f"{form['kind']} {inst['no']}"
+        d = {"appearance": r.get("appearance") or None, "level": r.get("level") or None,
+             "result_manual": r.get("result_manual") or None, "remark": (norm(str(r.get("remark") or "")).strip() or None)}
+        for k in ("appearance", "level", "result_manual"):
+            if d[k] not in (None, "合", "否"):
+                raise ValueError(f"{where}: 合・否 から選んでください")
+        for i in (1, 2, 3):
+            d[f"w{i}"] = mass_text(r.get(f"w{i}"))
+            if d[f"w{i}"] and parse_mass(d[f"w{i}"])[0] is None:
+                raise ValueError(f"{where}: 分銅{i}「{r.get(f'w{i}')}」が読めません（10kg・2000g のように）")
+            d[f"r{i}"] = to_num(r.get(f"r{i}"), f"表示{i}", where)
+        entered = any(d[k] for k in ("appearance", "level", "result_manual", "remark")) or any(d[f"r{i}"] is not None for i in (1, 2, 3))
+        if not entered:
+            continue  # 何も書いていない秤（検査しなかった）は残さない
+        row = {"instrument_id": iid, "sort_order": n, "data": d}
+        out.append(compute_scale(row, parse_division(inst.get("division"), inst.get("capacity"))))
+    return out
+
+
+def scale_event_note(row):
+    d = row["data"]
+    parts = [f"外観{d['appearance']}" if d.get("appearance") else "", f"水平器{d['level']}" if d.get("level") else ""]
+    for i in (1, 2, 3):
+        if d.get(f"w{i}") and d.get(f"r{i}") is not None:
+            diff = d.get(f"diff{i}")
+            parts.append(f"{d[f'w{i}']}→{_num_text(d[f'r{i}'])}" + (f"（{diff:+g}g）" if diff else ""))
+    if row.get("result"):
+        parts.append(row["result"] + ("（手入力）" if d.get("result_manual") and d.get("result_manual") != d.get("result_auto") else ""))
+    if d.get("remark"):
+        parts.append(d["remark"])
+    return " ".join(p for p in parts if p) or None
+
+
+def read_scale_presets(form):
+    """原紙シートの分銅（No ごと）。数字だけは kg。"""
+    import xlrd
+    from db import norm
+    cfg = form["preset_seed"]
+    sh = xlrd.open_workbook(os.path.join(HERE, cfg["file"])).sheet_by_name(cfg["sheet"])
+    out = {}
+    for r in range(sh.nrows):
+        no = sh.cell_value(r, 0)
+        if not isinstance(no, str) or not re.fullmatch(r"[前後]\d+", norm(no).strip()):
+            continue
+        ws = [mass_text(sh.cell_value(r, c)) for c in (5, 7, 9)]
+        if any(ws):
+            out[norm(no).strip()] = {f"w{i}": w for i, w in enumerate(ws, 1)}
+    return out
+
+
+def seed_scale_presets(conn):
+    """原紙の分銅を秤ごとの初期値（calib_presets）に入れる。検査で使った分銅で上書きされていればそのまま。"""
+    import json
+    result = {}
+    for name, form in FORMS.items():
+        if form.get("type") != "scale" or "preset_seed" not in form:
+            continue
+        added = 0
+        for no, data in read_scale_presets(form).items():
+            i = conn.execute("SELECT id FROM instruments WHERE kind=? AND no=?", (form["kind"], no)).fetchone()
+            if not i:
+                continue
+            cur = conn.execute("INSERT OR IGNORE INTO calib_presets(form, instrument_id, data) VALUES (?,?,?)",
+                               (name, i[0], json.dumps(data, ensure_ascii=False)))
+            added += cur.rowcount
+        result[name] = added
+    conn.commit()
+    return result
+
+
+def render_print_scale(form, cal, rows):
+    """秤の校正（A4 縦、行が多いので複数ページ。見出しは各ページに出る）。"""
+    e = lambda v: html.escape("" if v is None else str(v))
+    d = cal.get("inspected_on")
+    date = f"{int(d[:4])}年 {int(d[5:7])}月 {int(d[8:10])}日" if d else "　　　　年　　　月　　　日"
+    stamps = "".join(f"<div><b>{e(label)}</b><span>{e(cal.get(key))}</span></div>" for key, label in form["approvals"])
+    body = []
+    for r in rows:
+        x = r.get("data") or {}
+        cells = ""
+        for i in (1, 2, 3):
+            ok = x.get(f"ok{i}")
+            mark = ' class="n ng"' if ok is False else ' class="n"'
+            cells += f'<td class="w">{e(x.get(f"w{i}"))}</td><td{mark}>{e(_num_text(x.get(f"r{i}")))}</td>'
+        body.append(f"""<tr><td class="no">{e(r.get("no"))}</td><td class="l">{e(r.get("plant"))}</td><td class="l">{e(r.get("model"))}</td>
+          <td>{_choice(["合", "否"], x.get("appearance"))}</td><td>{_choice(["合", "否"], x.get("level"))}</td>{cells}
+          <td>{_choice(["合", "否"], r.get("result"))}</td><td class="l small">{e(r.get("division"))}</td><td class="l small">{e(x.get("remark"))}</td></tr>""")
+    printed = dt.datetime.now().strftime("%Y/%m/%d %H:%M")
+    rule = "　".join(f"{lab}：±表示目盛{'×' + str(f) if f > 1 else ''}" for lab, f in (("100g以下", 1), ("100g超え～12kg以下", 2), ("12kg超え～", 3)))
+    return f"""<!doctype html><html lang="ja"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{e(form["title"])}{" " + e(d) if d else ""}</title><style>{PRINT_CSS.replace("size: A4 landscape; margin: 7mm 9mm;", "size: A4 portrait; margin: 9mm 9mm;")}
+.sheet {{ width: 192mm; }}
+table.main {{ font-size: 8.5pt; table-layout: fixed; }}
+table.main td {{ overflow: hidden; }}
+table.main thead {{ display: table-header-group; }}
+table.main tbody tr {{ height: 6.4mm; }}
+table.main td {{ white-space: nowrap; }}
+table.main td.l {{ white-space: normal; text-align: left; }}
+table.main td.w {{ font-size: 7.5pt; color: #333; }}
+table.main td.ng {{ font-weight: bold; text-decoration: underline; }}
+table.main td.small {{ font-size: 6.5pt; word-break: break-all; }}
+table.main td.no {{ font-weight: bold; }}
+.opt {{ min-width: 3.5mm; padding: 0; }}
+.stamps div {{ width: 18mm; }}
+.stamps span {{ height: 11mm; }}
+.lines {{ display: flex; gap: 10mm; margin: 2mm 0; font-size: 10pt; }}
+.lines .u {{ border-bottom: 1px solid #000; display: inline-block; min-width: 45mm; padding: 0 2mm; }}
+.rule {{ font-size: 8pt; margin-bottom: 1.5mm; }}
+</style></head><body>
+<div class="bar"><button onclick="window.print()">印刷する</button><button onclick="window.close()">閉じる</button></div>
+<div class="sheet">
+  <div class="top"><div class="code">{e(form["code"])}</div><div style="flex:1;text-align:center"><h1>{e(form["title"])}</h1><div style="font-size:9pt">{e(form.get("note_top"))}</div></div><div class="stamps">{stamps}</div></div>
+  <div class="lines"><div>実施日：<span class="u">{date}</span></div><div>{e(form["reference_label"])}：<span class="u">{e(cal.get("reference"))}</span></div></div>
+  <div class="rule">許容差（定期検査）　{rule}</div>
+  <table class="main"><thead>
+    <tr><th rowspan="2" style="width:10mm">No</th><th rowspan="2" style="width:24mm">プラント</th><th rowspan="2" style="width:21mm">型式</th><th colspan="2">目視点検</th><th colspan="7">分銅点検</th><th rowspan="2" style="width:20mm">表示目盛</th><th rowspan="2" style="width:18mm">備考</th></tr>
+    <tr><th style="width:12.5mm">外観</th><th style="width:12.5mm">水平器</th><th>分銅</th><th>表示</th><th>分銅</th><th>表示</th><th>分銅</th><th>表示</th><th style="width:12.5mm">判定</th></tr>
+  </thead><tbody>{"".join(body)}</tbody></table>
+  <div class="foot"><span class="memo">{f"メモ：{e(cal.get('note'))}" if cal.get("note") else ""}</span><span>{"" if not cal.get("id") else "設備保全アプリで記録　"}印刷 {printed}</span></div>
+</div></body></html>"""
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.parse_args()
@@ -533,6 +936,9 @@ def main():
     for name, added in seed(conn).items():
         n = conn.execute("SELECT COUNT(*) FROM instruments WHERE kind=?", (FORMS[name]["kind"],)).fetchone()[0]
         print(f"{name}: 追加 {added} 台（登録済み {n} 台）")
+    for name, added in seed_scale_presets(conn).items():
+        n = conn.execute("SELECT COUNT(*) FROM calib_presets WHERE form=?", (name,)).fetchone()[0]
+        print(f"{name}: 分銅の初期値 追加 {added} 台（登録済み {n} 台）")
 
 
 if __name__ == "__main__":

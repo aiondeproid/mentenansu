@@ -1566,10 +1566,11 @@ function calRound(a, step) {
   else return null;
   return (sign * tenths) / 10 || 0;
 }
-function calCompute(r, limit) {
+function calCompute(r, limit, inclusive = false) {  // inclusive: ±limit 以下なら合（デジタル温度計）。false: ±limit 未満なら合（庫内温度計）
   const rounded = calRound(r.ref_corrected, r.min_display);
   const error = rounded != null && r.inst_display != null ? Math.round((r.inst_display - rounded) * 10) / 10 || 0 : null;
-  const result = r.daily_ok === "否" ? "否" : error == null ? null : Math.abs(error) >= limit - 1e-9 ? "否" : "合";
+  const over = error != null && (inclusive ? Math.abs(error) > limit + 1e-9 : Math.abs(error) >= limit - 1e-9);
+  const result = r.daily_ok === "否" ? "否" : error == null ? null : over ? "否" : "合";
   return { rounded, error, result, correction: error == null ? null : -error || 0 };
 }
 const calResult = r => (r ? `<span class="lv ${r === "合" ? "ok" : "over"}">${r}</span>` : "");
@@ -1595,6 +1596,7 @@ function calSummary(f, c) {
   const x = c.extra || {};
   if (f.type === "timer") return [x.line_name, x.process_name].filter(Boolean).join("・");
   if (f.type === "conveyor") return [x.ccp_no && `CCP№${x.ccp_no}`, x.product_name || x.product_code].filter(Boolean).join("　");
+  if (f.type === "scale") return c.approved_staff || "";
   return c.inspector || "";
 }
 
@@ -1603,10 +1605,10 @@ async function drawCalibrations(el) {
   const forms = calMeta.order || Object.keys(calMeta.forms);
   if (!forms.includes(calibState.form)) calibState.form = forms[0];
   const f = calMeta.forms[calibState.form];
-  const temp = f.type === "temp";
+  const temp = f.type === "temp" || f.type === "dt" || f.type === "scale";  // 測定機器ごとの行がある様式
   const list = await api("/calibrations?form=" + encodeURIComponent(calibState.form));
-  const col2 = { temp: "検査者", timer: "ライン名・工程名", conveyor: "CCP№・品名" }[f.type];
-  const unit = { temp: "台", timer: "件", conveyor: "回" }[f.type];
+  const col2 = { temp: "検査者", dt: "検査者", scale: "実施者", timer: "ライン名・工程名", conveyor: "CCP№・品名" }[f.type];
+  const unit = { temp: "台", dt: "件", scale: "台", timer: "件", conveyor: "回" }[f.type];
   const verdict = c => f.type === "conveyor"
     ? (c.result ? calResult(c.result) : '<span class="muted">未判定</span>')
     : `${c.ng_count ? `<span class="lv over">否 ${c.ng_count}${unit}</span> ` : ""}${c.ok_count ? `<span class="lv ok">合 ${c.ok_count}${unit}</span>` : ""}`;
@@ -1620,7 +1622,8 @@ async function drawCalibrations(el) {
       <a class="btn" href="/print/calibrations/blank?form=${encodeURIComponent(calibState.form)}" target="_blank" rel="noopener">白紙を印刷</a>
       <button class="btn primary lg" id="new-cal" ${!temp || f.instruments.length ? "" : "disabled"}>${temp ? "検査を記録" : "校正を記録"}</button>
     </div>
-    ${!temp ? "" : f.instruments.length ? `<p class="muted cal-targets">対象：${f.instruments.map(i => h(`${f.kind} ${i.no}（${[i.plant, i.type].filter(Boolean).join(" ")}）`)).join("、")}</p>`
+    ${f.type === "scale" ? `<p class="muted cal-targets">対象：測定機器の${h(f.kind)} ${f.instruments.length}台（廃棄・欠番は除く。No・プラント・型式・表示目盛は${h(f.kind)}の台帳から）</p>`
+      : !temp ? "" : f.instruments.length ? `<p class="muted cal-targets">対象：${f.instruments.map(i => h(`${f.kind} ${i.no}（${[i.plant, i.type].filter(Boolean).join(" ")}）`)).join("、")}</p>`
       : `<p class="err">${h(f.kind)}が測定機器に登録されていません。先に「${h(f.kind)}」タブで追加してください。</p>`}
     <div class="table-wrap"><table class="list responsive"><thead><tr>
       <th>検査年月日</th><th>${col2}</th><th>${h(temp ? "使用基準器" : f.reference_label)}</th><th>${temp ? "台数" : "測定"}</th><th>判定</th><th>確認</th><th></th>
@@ -1628,7 +1631,7 @@ async function drawCalibrations(el) {
       <tr data-cal="${c.id}">
         <td class="nowrap" data-label="検査年月日"><strong>${fmtDate(c.inspected_on)}</strong>${c.extra?.inspected_time ? ` <span class="muted">${h(c.extra.inspected_time)}</span>` : ""}</td>
         <td data-label="${col2}">${h(calSummary(f, c))}</td>
-        <td data-label="${h(temp ? "使用基準器" : f.reference_label)}">${c.reference ? (temp ? `デジタル温度計 台帳№${h(c.reference)}` : h(c.reference)) : ""}</td>
+        <td data-label="${h(temp ? "使用基準器" : f.reference_label)}">${c.reference ? (f.type === "temp" ? `デジタル温度計 台帳№${h(c.reference)}` : h(c.reference)) : ""}</td>
         <td data-label="${temp ? "台数" : "測定"}">${c.row_count}${unit}</td>
         <td data-label="判定">${verdict(c)}</td>
         <td data-label="確認">${h(f.approvals.filter(([k]) => c[k]).map(([k, l]) => `${l} ${c[k]}`).join("・"))}</td>
@@ -1691,6 +1694,132 @@ function calTempBody(f, c) {
   };
 }
 
+/* デジタル温度計（ランクA・B）: 様式で決めた行（1 台に高温側・低温側の 2 行があるものあり）。保存した行は sort_order（= 行の番号）で突き合わせる */
+function calDtBody(f, c) {
+  const byIdx = new Map(c.rows.map(r => [r.sort_order, r]));
+  const lines = (f.lines || []).filter(l => l.instrument_id).map(l => {
+    const r = byIdx.get(l.idx) || {};
+    return { ...l, ...r, no: l.no, daily_ok: r.daily_ok === 1 ? "合" : r.daily_ok === 0 ? "否" : "", zone: r.zone || (l.zones.length === 1 ? l.zones[0] : ""),
+      min_display: r.min_display ?? 0.1, canRound: f.rounding === "low" && l.low };
+  });
+  const missing = (f.lines || []).filter(l => !l.instrument_id).map(l => l.no);
+  const num = (name, v) => `<input name="${name}" type="number" step="any" inputmode="decimal" value="${v ?? ""}">`;
+  const rounding = !!f.rounding;
+  return {
+    help: `<summary>日常点検項目・合否判定基準${rounding ? "・低温側の器差の求め方" : ""}</summary>
+      <p><strong>日常点検項目</strong></p><ol>${f.daily_items.map(t => `<li>${h(t)}</li>`).join("")}</ol>
+      <p><strong>合否判定基準</strong>　器差 ±${f.limit.toFixed(1)}℃以下 … 合（器差分を補正して使用可能）／ ±${f.limit.toFixed(1)}℃超 … 否（不合格とし、処置する）</p>
+      ${(f.notes || []).map(t => `<p>※${h(t)}</p>`).join("")}
+      ${rounding ? `<p><strong>低温側：器差の求め方</strong>（検査する温度計の最小表示ごと）　0.1℃ … ａをそのまま／0.5℃ … ａを「二捨三入」／1.0℃ … ａを「四捨五入」してｂと比べる</p>` : ""}
+      <p class="muted">器差 ＝ ｂ − ａ${rounding ? "（低温側は処理後の温度）" : ""}。補正温度 ＝ −（ｂ − ａ）。${rounding ? "処理後の温度・" : ""}器差・判定・補正温度は自動で計算します。</p>`,
+    html: `${missing.length ? `<p class="err">測定機器の温度計に ${missing.map(h).join("・")} がないため、その行は出していません。</p>` : ""}
+      <table class="cal-table"><thead><tr>
+      <th>№</th><th>管理番号</th><th>ﾗﾝｸ</th><th>使用エリア</th><th>型式</th><th>日常点検</th><th>検査温度</th>
+      <th>標準温度計<br>表示(℃)</th><th>標準温度計<br>補正後温度(℃)<br>ａ</th>${rounding ? "<th>最小表示</th><th>処理後<br>温度(℃)</th>" : ""}
+      <th>検査温度計<br>表示(℃)<br>ｂ</th><th>器差(℃)<br>ｂ−ａ</th><th>判定</th><th>補正温度<br>−(ｂ−ａ)</th><th>不合格時の<br>処置記録№</th>
+    </tr></thead><tbody>${lines.map((r, n) => `
+      <tr data-n="${n}" class="${r.first ? "" : "dt-sub"}">
+        ${r.first ? `<td rowspan="${r.span}">${r.entry}</td><td class="code" rowspan="${r.span}"><strong>${h(r.no)}</strong></td><td rowspan="${r.span}">${h(r.rank || "")}</td>
+          <td rowspan="${r.span}">${h(r.plant || "")}</td><td rowspan="${r.span}">${h(r.model || "")}</td>` : ""}
+        <td><select name="daily_ok">${calOpt(["合", "否"], r.daily_ok)}</select></td>
+        <td>${r.zones.length > 1 ? `<select name="zone">${calOpt(r.zones, r.zone)}</select>` : `<input type="hidden" name="zone" value="${h(r.zones[0])}">${h(r.zones[0])}`}</td>
+        <td>${num("ref_display", r.ref_display)}</td><td>${num("ref_corrected", r.ref_corrected)}</td>
+        ${rounding ? `<td>${r.canRound ? `<select name="min_display">${f.min_displays.map(v => `<option value="${v}" ${+r.min_display === v ? "selected" : ""}>${v.toFixed(1)}℃</option>`).join("")}</select>` : '<input type="hidden" name="min_display" value="0.1"><span class="muted">—</span>'}</td>
+          <td class="calc" data-out="rounded"></td>` : ""}
+        <td>${rounding ? "" : '<input type="hidden" name="min_display" value="0.1">'}${num("inst_display", r.inst_display)}</td>
+        <td class="calc" data-out="error"></td><td data-out="result"></td><td class="calc" data-out="correction"></td>
+        <td><input name="action_no" value="${h(r.action_no || "")}" class="short"></td>
+      </tr>`).join("")}</tbody></table>
+      <p class="hint">検査しなかった行は空欄のままにすると残りません。</p>`,
+    read: tr => {
+      const g = name => $(`[name=${name}]`, tr)?.value ?? "";
+      return { instrument_id: lines[+tr.dataset.n].instrument_id, min_display: calNum(g("min_display")), daily_ok: g("daily_ok"), zone: g("zone"),
+        ref_display: calNum(g("ref_display")), ref_corrected: calNum(g("ref_corrected")), inst_display: calNum(g("inst_display")), action_no: g("action_no") };
+    },
+    update(tr) {
+      const line = lines[+tr.dataset.n];
+      const out = calCompute(this.read(tr), f.limit, true);
+      const rc = $("[data-out=rounded]", tr);
+      if (rc) rc.textContent = line.canRound ? calFmt(out.rounded) : "";
+      $("[data-out=error]", tr).textContent = calFmt(out.error, true);
+      $("[data-out=correction]", tr).textContent = calFmt(out.correction, true);
+      $("[data-out=result]", tr).innerHTML = calResult(out.result);
+      return out.result;
+    },
+  };
+}
+
+/* 秤の校正: 行 = 測定機器の秤量器（No・プラント・型式・表示目盛は台帳から）。分銅 3 つの表示が 許容差（表示目盛 × 倍率）以内か見る。
+   表示目盛の読み取り（ranges）はサーバー（calibration.parse_division）が済ませて渡す */
+function calParseMass(t) {
+  const m = norm(t).replace(/㎏/g, "kg").replace(/\s/g, "").toLowerCase().match(/^([0-9]*\.?[0-9]+)(kg|k|g)?$/);
+  if (!m) return [null, null];
+  const factor = m[2] === "g" ? 1 : 1000;  // 数字だけは kg（原紙の見出しが「分銅k」）
+  return [+m[1] * factor, factor];
+}
+function calScaleTol(ranges, wg) {
+  if (!ranges?.length || wg == null) return null;
+  const hit = ranges.find(([cap]) => cap == null || wg <= cap) || ranges[ranges.length - 1];
+  return hit[1] * (wg <= 100 ? 1 : wg <= 12000 ? 2 : 3);
+}
+const calG = v => `${v > 0 ? "+" : ""}${+v.toFixed(3)}g`;
+function calScaleBody(f, c) {
+  const saved = new Map(c.rows.map(r => [r.instrument_id, r]));
+  const lines = f.instruments.map(i => ({ inst: i, d: saved.get(i.id)?.data || { ...i.preset } }));
+  for (const r of c.rows) if (!f.instruments.some(i => i.id === r.instrument_id))  // 記録のあとで廃棄にした秤など
+    lines.push({ inst: { id: r.instrument_id, no: r.no, plant: r.plant, model: r.model, division: r.division, ranges: [] }, d: r.data || {} });
+  const areas = [...new Set(f.instruments.map(i => i.area).filter(Boolean))];
+  const pick = (name, cur) => `<select name="${name}">${calOpt(["合", "否"], cur)}</select>`;
+  const w = (i, d) => `<td class="w"><input name="w${i}" value="${h(d[`w${i}`] || "")}" class="mini" placeholder="10kg"></td>
+    <td><input name="r${i}" type="number" step="any" inputmode="decimal" class="short" value="${d[`r${i}`] ?? ""}"><div class="cal-sub" data-out="d${i}"></div></td>`;
+  return {
+    help: `<summary>許容差と判定のしかた</summary>
+      <p>許容差（定期検査・使用分銅ランクA）：100g以下 … ±表示目盛　100g超え～12kg以下 … ±表示目盛×2　12kg超え～ … ±表示目盛×3</p>
+      <p>表示目盛が「6/15/30、2g/5g/10g」のように範囲で変わる秤は、分銅の重さが入る範囲の目盛を使います。表示は分銅と同じ単位で入れてください（10kg の分銅なら 10.005）。</p>
+      <p class="muted">外観・水平器が否、または分銅の表示が許容差を超えたら自動で否。判定の欄で合・否を選ぶと、そちらを優先します。分銅は台数ごとに前回の値が入ります（初めは原紙の値）。</p>`,
+    html: `${areas.length > 1 ? `<p><label>エリア <select id="cal-area"><option value="">すべて</option>${areas.map(a => `<option>${h(a)}</option>`).join("")}</select></label>
+      <span class="hint">絞り込んでも、入れた値はすべて保存されます。</span></p>` : ""}
+      <table class="cal-table cal-scale"><thead>
+      <tr><th rowspan="2">No</th><th rowspan="2">プラント</th><th rowspan="2">型式</th><th rowspan="2">表示目盛</th><th colspan="2">目視点検</th>
+        <th colspan="6">分銅点検</th><th rowspan="2">判定</th><th rowspan="2">備考</th></tr>
+      <tr><th>外観</th><th>水平器</th><th>分銅</th><th>表示</th><th>分銅</th><th>表示</th><th>分銅</th><th>表示</th></tr>
+    </thead><tbody>${lines.map(({ inst: i, d }, n) => `
+      <tr data-n="${n}" data-area="${h(i.area || "")}">
+        <td class="code"><strong>${h(i.no)}</strong></td><td class="l">${h(i.plant || "")}</td><td>${h(i.model || "")}</td>
+        <td class="l small">${h(i.division || "")}${i.ranges?.length ? "" : '<div class="cal-sub">判定は手で</div>'}</td>
+        <td>${pick("appearance", d.appearance)}</td><td>${pick("level", d.level)}</td>
+        ${w(1, d)}${w(2, d)}${w(3, d)}
+        <td><span data-out="result"></span><select name="result_manual" title="選ぶと自動の判定より優先">${calOpt(["合", "否"], d.result_manual, "自動")}</select></td>
+        <td><input name="remark" value="${h(d.remark || "")}" class="short"></td>
+      </tr>`).join("")}</tbody></table>
+      <p class="hint">検査しなかった秤は空欄のままにすると残りません（分銅の欄だけでは残りません）。</p>`,
+    read: tr => {
+      const g = name => $(`[name=${name}]`, tr).value;
+      return { instrument_id: lines[+tr.dataset.n].inst.id, appearance: g("appearance"), level: g("level"), result_manual: g("result_manual"), remark: g("remark"),
+        w1: g("w1"), w2: g("w2"), w3: g("w3"), r1: calNum(g("r1")), r2: calNum(g("r2")), r3: calNum(g("r3")) };
+    },
+    update(tr) {
+      const r = this.read(tr), ranges = lines[+tr.dataset.n].inst.ranges;
+      const checks = [];
+      for (const i of [1, 2, 3]) {
+        const [wg, factor] = calParseMass(r[`w${i}`]);
+        const out = $(`[data-out=d${i}]`, tr);
+        out.textContent = ""; out.className = "cal-sub";
+        if (wg == null || r[`r${i}`] == null) continue;
+        const diff = Math.round((r[`r${i}`] * factor - wg) * 1e6) / 1e6;
+        const tol = calScaleTol(ranges, wg);
+        const ok = tol == null ? null : Math.abs(diff) <= tol + 1e-9;
+        checks.push(ok);
+        out.textContent = `${calG(diff)}${tol != null ? ` / ±${+tol.toFixed(3)}g` : ""}`;
+        if (ok === false) out.classList.add("ng-text");
+      }
+      const auto = r.appearance === "否" || r.level === "否" || checks.includes(false) ? "否" : checks.length && checks.every(x => x === true) ? "合" : null;
+      $("[data-out=result]", tr).innerHTML = auto ? `${calResult(auto)}<br>` : "";
+      return r.result_manual || auto;
+    },
+  };
+}
+
 const CAL_FREE_NUMS = { timer: ["set_min", "set_sec", "act_min", "act_sec"], conveyor: ["freq", "ref_min", "ref_sec", "act_min", "act_sec"] };
 function calFreeBody(f, c) {
   const rows = c.rows.map(r => r.data || {});
@@ -1741,22 +1870,25 @@ async function openCalibration(id) {
   const c = id ? await api(`/calibrations/${id}`) : { form: calibState.form, inspected_on: state.meta.today, inspector: currentUser(), rows: [], extra: {} };
   const f = calMeta.forms[c.form];
   if (!f) { toast("様式が見つかりません"); return; }
-  const temp = f.type === "temp";
-  const body = temp ? calTempBody(f, c) : calFreeBody(f, c);
+  const temp = f.type === "temp" || f.type === "dt" || f.type === "scale";  // 測定機器ごとの行がある様式
+  const body = f.type === "dt" ? calDtBody(f, c) : f.type === "scale" ? calScaleBody(f, c) : temp ? calTempBody(f, c) : calFreeBody(f, c);
   const sug = f.suggest || {};
   const refs = [...new Set([...f.references.map(r => r.no), ...(sug.reference || [])])];
   const list = (key, vals) => vals?.length ? `list="cal-sug-${key}"` : "";
   const datalist = (key, vals) => vals?.length ? `<datalist id="cal-sug-${key}">${vals.map(v => `<option value="${h(v)}">`).join("")}</datalist>` : "";
   const extra = c.extra || {};
-  if (!id && !temp) c.approved_staff = currentUser();  // 担当者は右上の記入者
+  if (!id && !f.has_inspector) c.approved_staff = currentUser();  // 担当者・実施者は右上の記入者
+  if (!id && f.reference_default) c.reference = f.reference_default;
   openModal(`${f.title}${id ? "" : "（新規）"}`, `
     <div class="form-grid" id="cal-head">
       <label class="field"><span>検査年月日<em class="req">*</em></span><input type="date" name="inspected_on" value="${h(c.inspected_on || "")}" required></label>
       ${f.extra_fields.filter(([k]) => k === "inspected_time").map(([k, l]) => `<label class="field"><span>${h(l)}</span><input type="time" data-extra name="${k}" value="${h(extra[k] || "")}"></label>`).join("")}
       ${f.has_inspector ? `<label class="field"><span>検査者</span><input name="inspector" list="author-list" value="${h(c.inspector || "")}"></label>` : ""}
       ${f.extra_fields.filter(([k]) => k !== "inspected_time").map(([k, l]) => `<label class="field"><span>${h(l)}</span><input data-extra name="${k}" ${list(k, sug[k])} value="${h(extra[k] || "")}">${datalist(k, sug[k])}</label>`).join("")}
-      <label class="field"><span>${h(f.reference_label)}</span><input name="reference" ${list("reference", refs)} value="${h(c.reference || "")}">${datalist("reference", refs)}</label>
-      ${f.approvals.map(([k, l]) => `<label class="field"><span>${temp ? `確認（${h(l)}）` : h(l)}</span><input name="${k}" ${k === "approved_staff" ? 'list="author-list"' : ""} value="${h(c[k] || "")}"></label>`).join("")}
+      <label class="field"><span>${h(f.reference_label)}</span>${f.reference_options
+        ? `<select name="reference">${calOpt([...new Set([...f.reference_options, ...(c.reference ? [c.reference] : [])])], c.reference)}</select>`
+        : `<input name="reference" ${list("reference", refs)} value="${h(c.reference || "")}">${datalist("reference", refs)}`}</label>
+      ${f.approvals.map(([k, l]) => `<label class="field"><span>${f.has_inspector ? `確認（${h(l)}）` : h(l)}</span><input name="${k}" ${k === "approved_staff" ? 'list="author-list"' : ""} value="${h(c[k] || "")}"></label>`).join("")}
       <label class="field full"><span>${h(f.note_label)}</span>${temp ? `<input name="note" value="${h(c.note || "")}">` : `<textarea name="note" rows="3">${h(c.note || "")}</textarea>`}</label>
     </div>
     <details class="cal-help">${body.help}</details>
@@ -1775,6 +1907,7 @@ async function openCalibration(id) {
   tbody.addEventListener("input", refresh);
   tbody.addEventListener("change", refresh);
   refresh();
+  $("#cal-area")?.addEventListener("change", e => rowsEl().forEach(tr => { tr.hidden = !!e.target.value && tr.dataset.area !== e.target.value; }));
   $("#cal-add-row")?.addEventListener("click", () => { tbody.insertAdjacentHTML("beforeend", body.timerRow()); refresh(); });
   $("#cal-copy-first")?.addEventListener("click", () => {
     const [first, ...rest] = rowsEl();
