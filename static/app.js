@@ -71,6 +71,25 @@ function timeRange(r) {
 function currentUser() {
   return $("#current-user").value.trim();
 }
+/* モーダル下部（キャンセルの横）に置く記入者の欄。右上の記入者と同じ値で、保存時に右上へ書き戻す */
+function footAuthorField() {
+  return `<label class="left foot-author"><span>記入者 *</span><input id="foot-author" list="author-list" value="${h(currentUser())}" placeholder="名前を入力" autocomplete="off"></label>`;
+}
+/* 記入者の欄を確かめて右上に反映する。空なら false（エラーを出して欄にフォーカス） */
+function takeFootAuthor(errEl) {
+  const inp = $("#foot-author");
+  const name = inp.value.replace(/\s+/g, " ").trim();
+  if (!name) {
+    inp.classList.add("invalid");
+    inp.focus();
+    if (errEl) { errEl.textContent = "記入者を入力してください（変更履歴に残ります）"; errEl.hidden = false; }
+    return false;
+  }
+  inp.classList.remove("invalid");
+  $("#current-user").value = name;
+  rememberUser(name);
+  return true;
+}
 
 /* ツールチップ */
 const tip = $("#tip");
@@ -89,6 +108,7 @@ document.addEventListener("mousemove", e => {
 const routes = {
   dashboard: ["ダッシュボード", renderDashboard],
   records: ["作業計画/履歴", renderRecords],
+  losses: ["ロス調査", renderLosses],
   calendar: ["工事点検計画", renderCalendar],
   plans: ["交換アラート", renderPlans],
   equipment: ["設備台帳", renderEquipment],
@@ -97,6 +117,7 @@ const routes = {
   analytics: ["分析", renderAnalytics],
   vendors: ["取引業者", renderVendors],
   notify: ["通知設定", renderNotify],
+  staff: ["記入者名簿", renderStaff],
   pla: ["プラ点検", renderPla],
 };
 
@@ -122,6 +143,7 @@ async function refreshBadges() {
     const d = await api("/dashboard" + areaQS());
     setBadge("#badge-plans", d.rules_over.length + d.rules_soon.length);
     setBadge("#badge-parts", d.parts_alert.length);
+    setBadge("#badge-losses", d.losses_pending);
     setBadge("#badge-news", unreadNews(d.news).length);
   } catch { /* バッジは補助表示なので無視 */ }
 }
@@ -146,7 +168,7 @@ function markNewsSeen(at) {
 const isUnread = (n, seen) => n.at > seen && !(n.by && n.by === currentUser());
 const unreadNews = news => { const seen = newsSeen(news); return (news || []).filter(n => isUnread(n, seen)); };
 
-const NEWS_KIND_CLASS = { 作業記録: "record", 設備台帳: "equipment", 交換アラート: "rule", 部品: "part", プラ点検: "pla", 取引業者: "vendor", 通知: "notify", 測定機器: "instrument" };
+const NEWS_KIND_CLASS = { 作業記録: "record", 設備台帳: "equipment", 交換アラート: "rule", 部品: "part", プラ点検: "pla", 取引業者: "vendor", 通知: "notify", 測定機器: "instrument", ロス調査: "loss" };
 const NEWS_PAGE = { catalog: "#/parts/catalog", pla: "#/pla", vendor: "#/vendors", notify: "#/notify" };
 
 function newsWhen(at) {
@@ -162,6 +184,7 @@ function newsLink(n) {
   if (!n.ref_id) return "";
   if (n.ref_type === "instrument") return `data-href="#/instruments${n.ref_id ? `/${n.ref_id}` : ""}"`;
   if (n.ref_type === "calibration") return `data-href="#/instruments/c${n.ref_id}"`;
+  if (n.ref_type === "loss") return `data-href="#/losses/${n.ref_id}"`;
   return { record: `data-record="${n.ref_id}"`, equipment: `data-eq="${n.ref_id}"`, rule: `data-rule="${n.ref_id}"`, part: `data-part="${n.ref_id}"` }[n.ref_type] || "";
 }
 
@@ -418,6 +441,372 @@ async function renderRecords() {
   await reload();
 }
 
+/* ================================================================ ロス調査（ロス調査シート。列は losses.py の XLS_COLS） */
+const lossState = { tab: "list", month: "", q: "", type: "", cause: "", line: "", from: "", to: "" };
+let lossMeta = null;
+async function loadLossMeta(force) { if (force || !lossMeta) lossMeta = await api("/losses/meta"); return lossMeta; }
+const LOSS_TYPE_CLASS = { ライン停止: "over", "検品・手直し": "soon", 配合ミス: "unknown", 廃棄ロス: "none" };
+const lossTypeBadge = t => (t ? `<span class="lv ${LOSS_TYPE_CLASS[t] || "unknown"}">${h(t)}</span>` : "");
+const shiftMonth = (s, n) => { const [y, m] = s.split("-").map(Number); const d = new Date(y, m - 1 + n, 1); return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}`; };
+const fmtMonth = s => `${+s.slice(0, 4)}年${+s.slice(5, 7)}月`;
+const lossFyStart = s => { const [y, m] = s.split("-").map(Number); return `${m >= 3 ? y : y - 1}-03`; };  // ロス調査シートは 3 月から
+const hrs = v => (v == null ? "" : Number(v).toLocaleString("ja-JP", { maximumFractionDigits: 2 }));
+const sum = (list, key) => list.reduce((a, x) => a + (+x[key] || 0), 0);
+const optList = (vals, cur) => vals.map(v => `<option ${v === cur ? "selected" : ""}>${h(v)}</option>`).join("");
+const unconfirmedChip = x => (x.equipment_confirmed ? "" : `<span class="chip-uncertain" title="取り込んだときの候補です。「設備の確認」で確定してください">未確定</span>`);
+function lossEqCell(x) {
+  if (x.equipment_id) return `${h(x.equipment_name)}${unconfirmedChip(x)}${x.equipment_text && norm(x.equipment_text) !== norm(x.equipment_name) ? `<div class="muted small">${h(x.equipment_text)}</div>` : ""}`;
+  return x.equipment_text ? `<span class="muted">${h(x.equipment_text)}</span>${unconfirmedChip(x)}` : "";
+}
+
+async function renderLosses(id) {
+  if (["list", "confirm", "summary"].includes(id)) { lossState.tab = id; id = null; }  // #/losses/confirm などでタブを開く
+  await Promise.all([loadLossMeta(true), loadEquipment()]);
+  const thisMonth = state.meta.today.slice(0, 7);
+  if (!lossState.month) lossState.month = lossMeta.months.includes(thisMonth) || !lossMeta.months.length ? thisMonth : lossMeta.months[0];
+  const tabs = [["list", "一覧"], ["confirm", `設備の確認${lossMeta.pending ? ` <span class="tab-count">${lossMeta.pending}</span>` : ""}`], ["summary", "集計"]];
+  view.innerHTML = `
+    <div class="tabs-row">
+      <nav class="tabs">${tabs.map(([k, l]) => `<a href="#/losses" data-tab="${k}" class="${k === lossState.tab ? "on" : ""}">${l}</a>`).join("")}</nav>
+      <div class="tabs-actions">
+        <button class="btn" id="loss-rate" title="ロス金額 =（ライン停止ロス時間 + 検品ロス時間）× 時間単価">単価 ${fmtNum(lossMeta.hourly_rate)}円/h</button>
+        <button class="btn" id="loss-export">Excel出力</button>
+      </div>
+    </div>
+    <div id="loss-body"></div>`;
+  $$(".tabs [data-tab]").forEach(a => a.addEventListener("click", e => { e.preventDefault(); lossState.tab = a.dataset.tab; renderLosses(); }));
+  $("#loss-rate").addEventListener("click", openLossRate);
+  $("#loss-export").addEventListener("click", openLossExport);
+  const el = $("#loss-body");
+  if (lossState.tab === "confirm") await drawLossConfirm(el);
+  else if (lossState.tab === "summary") await drawLossSummary(el);
+  else await drawLossList(el);
+  if (id) openLossForm(+id);  // 新着から #/losses/<id> で開いたとき
+}
+
+async function drawLossList(el) {
+  const list = await api(`/losses?month=${lossState.month}` + areaQS("&"));
+  const lines = [...new Set(list.map(x => x.line).filter(Boolean))].sort();
+  el.innerHTML = `
+    <div class="toolbar">
+      <div class="month-nav"><button class="btn" id="lm-prev" aria-label="前の月">‹</button>
+        <input type="month" id="lm" value="${h(lossState.month)}" aria-label="月"><button class="btn" id="lm-next" aria-label="次の月">›</button></div>
+      <div class="search"><span>🔍</span><input id="l-q" type="search" placeholder="品名・設備・発生状況・原因・対策・担当者で絞り込み" value="${h(lossState.q)}"></div>
+      <button class="btn primary lg" id="new-loss">ロスを登録</button>
+    </div>
+    <div class="filters">
+      <label>ロス分類 <select id="l-type"><option value="">すべて</option>${optList(lossMeta.loss_types, lossState.type)}</select></label>
+      <label>ロス原因 <select id="l-cause"><option value="">すべて</option>${optList(lossMeta.causes, lossState.cause)}</select></label>
+      <label>ライン <select id="l-line"><option value="">すべて</option>${optList(lines, lossState.line)}</select></label>
+    </div>
+    <div class="grid kpi" id="l-kpi"></div>
+    <div id="l-table"></div>`;
+  const no = new Map(list.map((x, i) => [x.id, i + 1]));  // Excel の№（月の中の順番）
+  const draw = () => {
+    const words = norm(lossState.q).toLowerCase().split(/\s+/).filter(Boolean);
+    const hit = list.filter(x => (!lossState.type || x.loss_type === lossState.type) && (!lossState.cause || x.cause_type === lossState.cause) &&
+      (!lossState.line || x.line === lossState.line) &&
+      (!words.length || (t => words.every(w => t.includes(w)))(norm([x.product_code, x.product_name, x.equipment_name, x.equipment_text, x.line, x.process,
+        x.situation, x.direct_cause, x.temp_action, x.perm_action, x.responsible, x.confirmer, x.note].filter(Boolean).join(" ")).toLowerCase())));
+    const stop = sum(hit, "stop_min");
+    $("#l-kpi").innerHTML = `
+      <div class="kpi-tile"><div class="kpi-label">件数</div><div class="kpi-value">${hit.length}<small>件</small></div></div>
+      <div class="kpi-tile"><div class="kpi-label">ライン停止</div><div class="kpi-value">${fmtNum(stop)}<small>分</small></div></div>
+      <div class="kpi-tile"><div class="kpi-label">ロス金額</div><div class="kpi-value">${fmtNum(sum(hit, "loss_amount"))}<small>円</small></div></div>
+      <div class="kpi-tile"><div class="kpi-label">廃棄・差損額</div><div class="kpi-value">${fmtNum(sum(hit, "waste_amount"))}<small>円</small></div></div>`;
+    $("#l-table").innerHTML = hit.length ? `<div class="table-wrap"><table class="list responsive loss-table"><thead><tr>
+        <th>№</th><th>製造日</th><th>ロス</th><th>ライン・工程</th><th>対象設備</th><th>品名</th><th>発生状況・原因</th><th class="num">停止</th><th class="num">ロス金額</th><th class="num">廃棄・差損</th>
+      </tr></thead><tbody>${hit.map(x => `
+        <tr data-loss="${x.id}">
+          <td class="num" data-label="№">${no.get(x.id)}</td>
+          <td class="nowrap" data-label="製造日">${fmtDate(x.occurred_date).slice(5) || h(x.occurred_date || "")}${x.occurred_time ? ` <span class="time">${h(x.occurred_time.replace(/^0/, ""))}</span>` : ""}</td>
+          <td data-label="ロス">${lossTypeBadge(x.loss_type)}<div class="muted small">${h(x.cause_type || "")}${x.recurrence === "再発" ? ' ・<strong class="recur">再発</strong>' : x.recurrence ? `・${h(x.recurrence)}` : ""}</div></td>
+          <td data-label="ライン・工程">${h(x.line || "")}<div class="muted small">${h(x.process || "")}</div></td>
+          <td data-label="対象設備">${lossEqCell(x)}</td>
+          <td data-label="品名">${h(x.product_name || "")}</td>
+          <td class="clip" data-label="発生状況・原因">${h(x.situation || "")}${x.direct_cause ? `<div class="muted small">原因: ${h(x.direct_cause)}</div>` : ""}</td>
+          <td class="num nowrap" data-label="停止">${x.stop_min != null ? `${fmtNum(x.stop_min)}分` : ""}${x.stop_people != null ? `<div class="muted small">${fmtNum(x.stop_people)}人</div>` : ""}</td>
+          <td class="num nowrap" data-label="ロス金額">${yen(x.loss_amount)}</td>
+          <td class="num nowrap" data-label="廃棄・差損">${yen(x.waste_amount)}</td>
+        </tr>`).join("")}</tbody></table></div>` : `<p class="empty">${list.length ? "該当するロスはありません" : `${fmtMonth(lossState.month)}のロスは登録されていません`}</p>`;
+    $$("#l-table [data-loss]").forEach(tr => tr.addEventListener("click", () => openLossForm(+tr.dataset.loss)));
+  };
+  const go = m => { if (m) { lossState.month = m; drawLossList(el); } };
+  $("#lm-prev").addEventListener("click", () => go(shiftMonth(lossState.month, -1)));
+  $("#lm-next").addEventListener("click", () => go(shiftMonth(lossState.month, 1)));
+  $("#lm").addEventListener("change", e => go(e.target.value));
+  let timer;
+  $("#l-q").addEventListener("input", e => { clearTimeout(timer); timer = setTimeout(() => { lossState.q = e.target.value; draw(); }, 200); });
+  [["#l-type", "type"], ["#l-cause", "cause"], ["#l-line", "line"]].forEach(([sel, key]) =>
+    $(sel).addEventListener("change", e => { lossState[key] = e.target.value; draw(); }));
+  $("#new-loss").addEventListener("click", () => openLossForm(null));
+  draw();
+}
+
+/* 取り込んだロスの設備を確定する（候補は対象設備名とラインから推定したもの） */
+async function drawLossConfirm(el) {
+  const list = await api("/losses?pending=1");
+  const allEq = state.equipment.filter(e => e.status !== "廃止")
+    .map(e => `<option value="${e.id}">${h([e.area, e.code, eqTitle(e)].filter(Boolean).join(" ／ "))}</option>`).join("");
+  el.innerHTML = `
+    <p class="lc-help">Excel から取り込んだロスの「対象設備名」とラインから、設備台帳の設備を推定しました。正しい設備を選んで<strong>確定</strong>してください（設備と関係ないもの・台帳にないものは「設備なし」）。<br>
+      「作業記録」にチェックがあると、確定したときにその設備の作業記録（不定期）を作ります。設備の作業履歴・分析に現場のトラブルが入ります。</p>
+    ${list.length ? `<div class="toolbar"><button class="btn primary" id="lc-all">表示中の ${list.length} 件を選んだ内容で確定</button></div>
+    <div class="table-wrap"><table class="list responsive plain lc-table"><thead><tr>
+      <th>製造日</th><th>ロス</th><th>ライン</th><th>対象設備名（シート）</th><th>発生状況・原因</th><th>設備台帳の設備</th><th>作業記録</th><th></th>
+    </tr></thead><tbody>${list.map(x => `
+      <tr data-lc="${x.id}">
+        <td class="nowrap" data-label="製造日">${fmtDate(x.occurred_date)}</td>
+        <td data-label="ロス">${lossTypeBadge(x.loss_type)}<div class="muted small">${h(x.cause_type || "")}</div></td>
+        <td class="nowrap" data-label="ライン">${h(x.line || "")}</td>
+        <td data-label="対象設備名"><strong>${h(x.equipment_text || "（空欄）")}</strong></td>
+        <td class="clip" data-label="発生状況" title="${h([x.situation, x.direct_cause].filter(Boolean).join("\n"))}">${h(x.situation || "")}${x.direct_cause ? `<div class="muted small">原因: ${h(x.direct_cause)}</div>` : ""}</td>
+        <td data-label="設備"><select class="lc-eq"><option value="">設備なし</option>
+          ${x.candidates.length ? `<optgroup label="候補（近い順）">${x.candidates.map(c => `<option value="${c.id}" ${c.id === x.equipment_id ? "selected" : ""}>${h(c.label)}${c.status === "廃止" ? "（廃止）" : ""}　${Math.round(c.score * 100)}%</option>`).join("")}</optgroup>` : ""}
+          <optgroup label="すべての設備">${allEq}</optgroup></select></td>
+        <td data-label="作業記録"><label class="nowrap"><input type="checkbox" class="lc-rec" ${x.cause_type === "設備由来" ? "checked" : ""}> 作る</label></td>
+        <td class="nowrap"><button class="btn small primary lc-ok">確定</button> <button class="btn small lc-open">詳細</button></td>
+      </tr>`).join("")}</tbody></table></div>` : `<p class="empty">確認待ちのロスはありません</p>`}`;
+  const sync = tr => { const rec = $(".lc-rec", tr); rec.disabled = !$(".lc-eq", tr).value; };
+  const confirmRow = async tr => {
+    const eqId = $(".lc-eq", tr).value;
+    await api(`/losses/${tr.dataset.lc}/confirm`, { method: "POST", body: { equipment_id: eqId || null, make_record: !!eqId && $(".lc-rec", tr).checked } });
+    tr.remove();
+  };
+  $$("[data-lc]", el).forEach(tr => {
+    sync(tr);
+    $(".lc-eq", tr).addEventListener("change", () => sync(tr));
+    $(".lc-ok", tr).addEventListener("click", async () => {
+      try { await confirmRow(tr); toast("確定しました"); refreshBadges(); if (!$("[data-lc]", el)) renderLosses(); }
+      catch (ex) { toast(ex.message); }
+    });
+    $(".lc-open", tr).addEventListener("click", () => openLossForm(+tr.dataset.lc));
+  });
+  $("#lc-all")?.addEventListener("click", async () => {
+    const rowsLeft = $$("[data-lc]", el);
+    const recs = rowsLeft.filter(tr => $(".lc-eq", tr).value && $(".lc-rec", tr).checked).length;
+    if (!confirm(`${rowsLeft.length} 件を確定します（作業記録を作るもの ${recs} 件）。よろしいですか？`)) return;
+    try { for (const tr of rowsLeft) await confirmRow(tr); toast(`${rowsLeft.length} 件を確定しました`); }
+    catch (ex) { toast(ex.message); }
+    renderLosses();
+  });
+}
+
+async function drawLossSummary(el) {
+  const thisMonth = state.meta.today.slice(0, 7);
+  lossState.to ||= thisMonth;
+  lossState.from ||= lossFyStart(thisMonth);
+  const list = await api(`/losses?from=${lossState.from}&to=${lossState.to}` + areaQS("&"));
+  const total = sum(list, "loss_amount") + sum(list, "waste_amount");
+  const months = [];
+  for (let m = lossState.from; m <= lossState.to && months.length < 60; m = shiftMonth(m, 1)) months.push(m);
+  const row = (label, l, attrs = "") => `<tr ${attrs}><td class="nowrap">${label}</td><td class="num">${l.length}</td>
+    <td class="num">${l.filter(x => x.cause_type === "設備由来").length}</td><td class="num">${l.filter(x => x.recurrence === "再発").length}</td>
+    <td class="num">${fmtNum(sum(l, "stop_min"))}</td><td class="num">${hrs(sum(l, "stop_hours") + sum(l, "inspect_hours"))}</td>
+    <td class="num">${fmtNum(sum(l, "loss_amount"))}</td><td class="num">${fmtNum(sum(l, "waste_amount"))}</td>
+    <td class="num"><strong>${fmtNum(sum(l, "loss_amount") + sum(l, "waste_amount"))}</strong></td></tr>`;
+  const head = first => `<thead><tr><th>${first}</th><th class="num">件数</th><th class="num">設備由来</th><th class="num">再発</th><th class="num">停止(分)</th><th class="num">ロス時間(h)</th><th class="num">ロス金額</th><th class="num">廃棄・差損</th><th class="num">合計(円)</th></tr></thead>`;
+  const bar = v => `<span class="ls-bar"><span style="width:${total ? Math.round(v / total * 100) : 0}%"></span></span>`;
+  const byCause = groupBy(list, x => x.cause_type || "（未記入）", lossMeta.causes);
+  const byEq = groupBy(list.filter(x => x.equipment_id && x.equipment_confirmed), x => x.equipment_id)
+    .map(([, l]) => l).sort((a, b) => sum(b, "loss_amount") - sum(a, "loss_amount") || b.length - a.length).slice(0, 15);
+  el.innerHTML = `
+    <div class="toolbar"><label class="month-nav">期間 <input type="month" id="ls-from" value="${h(lossState.from)}"> 〜 <input type="month" id="ls-to" value="${h(lossState.to)}"></label>
+      <span class="muted">金額は円。ロス時間 = 停止・検品の時間 × 人数</span></div>
+    <div class="section-title"><h2>月別</h2></div>
+    <div class="table-wrap"><table class="list plain">${head("月")}<tbody>
+      ${months.map(m => row(fmtMonth(m), list.filter(x => (x.occurred_date || "").startsWith(m)))).join("")}
+      ${row("<strong>合計</strong>", list, 'class="ls-total"')}</tbody></table></div>
+    <div class="section-title"><h2>ロス原因別</h2></div>
+    <div class="table-wrap"><table class="list plain">${head("ロス原因").replace("</tr>", '<th>構成比</th></tr>')}<tbody>
+      ${byCause.map(([c, l]) => row(h(c), l).replace(/<\/tr>$/, `<td>${bar(sum(l, "loss_amount") + sum(l, "waste_amount"))}</td></tr>`)).join("")}</tbody></table></div>
+    <div class="section-title"><h2>設備別（ロス金額の多い順 ${byEq.length}台）</h2></div>
+    ${byEq.length ? `<div class="table-wrap"><table class="list">${head("設備")}<tbody>
+      ${byEq.map(l => row(`${h(l[0].equipment_code ? l[0].equipment_code + " " : "")}${h(l[0].equipment_name)}`, l, `data-eq="${l[0].equipment_id}"`)).join("")}</tbody></table></div>`
+      : `<p class="muted">設備が確定したロスはありません</p>`}`;
+  const go = () => { const f = $("#ls-from").value, t = $("#ls-to").value; if (f && t && f <= t) { lossState.from = f; lossState.to = t; drawLossSummary(el); } };
+  $("#ls-from").addEventListener("change", go);
+  $("#ls-to").addEventListener("change", go);
+  bindRowClicks(el);
+}
+
+function openLossRate() {
+  openModal("ロス金額の時間単価", `
+    <div class="form-grid">
+      <label class="field"><span>時間単価（円/h）</span><input type="number" min="1" step="1" name="hourly_rate" value="${h(lossMeta.hourly_rate)}" inputmode="numeric"></label>
+      <p class="hint full">ロス金額 =（ライン停止ロス時間 + 検品ロス時間）× 時間単価。変えた単価は、これから登録するロスと、停止時間・人数を直したロスに使います（今までの金額はそのまま）。</p>
+    </div><p class="err" id="form-err" hidden></p>`, `
+    <button type="button" class="btn" data-close>キャンセル</button><button type="submit" class="btn primary">保存</button>`);
+  $("#modal-form").onsubmit = async e => {
+    e.preventDefault();
+    try {
+      await api("/losses/rate", { method: "PUT", body: { hourly_rate: $("#modal-form").hourly_rate.value } });
+      closeModal(); toast("時間単価を変更しました"); router();
+    } catch (ex) { $("#form-err").textContent = ex.message; $("#form-err").hidden = false; }
+  };
+}
+
+function openLossExport() {
+  const to = lossState.tab === "summary" && lossState.to ? lossState.to : lossState.month || state.meta.today.slice(0, 7);
+  const from = lossState.tab === "summary" && lossState.from ? lossState.from : lossFyStart(to);
+  openModal("ロス調査シートを Excel で出力", `
+    <div class="form-grid">
+      <label class="field"><span>から</span><input type="month" id="lx-from" value="${h(from)}"></label>
+      <label class="field"><span>まで</span><input type="month" id="lx-to" value="${h(to)}"></label>
+      <p class="hint full">今のロス調査シートと同じ並び（1 か月 1 シート、新しい月が左）の .xlsx を作ります。提出用にそのまま使えます。</p>
+    </div>`, `
+    <button type="button" class="btn" data-close>閉じる</button><a class="btn primary" id="lx-go" download>出力</a>`);
+  const upd = () => { $("#lx-go").href = `/api/losses/export.xlsx?from=${$("#lx-from").value}&to=${$("#lx-to").value}`; };
+  $("#lx-from").addEventListener("change", upd);
+  $("#lx-to").addEventListener("change", upd);
+  $("#lx-go").addEventListener("click", () => setTimeout(closeModal, 300));
+  upd();
+}
+
+/* ロスの登録・編集。preset.record_id があれば、その作業記録から開いた（保存するとつなぐ） */
+async function openLossForm(id, preset = {}) {
+  await Promise.all([loadEquipment(), loadLossMeta()]);
+  const x = id ? await api(`/losses/${id}`)
+    : { plant: lossMeta.plant, occurred_date: state.meta.today, recurrence: "初発", product_class: lossMeta.product_classes[0] || "", ...preset };
+  const linkRec = !id && preset.record_id;
+  const dl = (dlId, vals) => `<datalist id="${dlId}">${vals.map(v => `<option value="${h(v)}">`).join("")}</datalist>`;
+  const txt = (name, label, attrs = "") => `<label class="field"><span>${label}</span><input name="${name}" value="${h(x[name] ?? "")}" ${attrs}></label>`;
+  const area = (name, label, rows = 2) => `<label class="field full"><span>${label}</span><textarea name="${name}" rows="${rows}">${h(x[name] ?? "")}</textarea></label>`;
+  const sel = (name, label, vals, req) => `<label class="field"><span>${label}${req ? '<em class="req">*</em>' : ""}</span><select name="${name}"><option value="">—</option>${optList(vals, x[name])}${x[name] && !vals.includes(x[name]) ? `<option selected>${h(x[name])}</option>` : ""}</select></label>`;
+  const num = (name, label) => `<label class="field"><span>${label}</span><input type="number" min="0" step="any" name="${name}" value="${h(x[name] ?? "")}" inputmode="decimal"></label>`;
+  const isoOrBlank = v => (/^\d{4}-\d\d-\d\d$/.test(v || "") ? v : "");
+  const date = (name, label) => `<label class="field"><span>${label}</span><input type="date" name="${name}" value="${h(isoOrBlank(x[name]))}">${x[name] && !isoOrBlank(x[name]) ? `<span class="hint">シートの表記: ${h(x[name])}</span>` : ""}</label>`;
+  const calc = (cid, label, v) => `<div class="field"><span>${label}</span><output id="${cid}" class="calc-out">${v}</output></div>`;
+  const cands = (x.candidates || []).filter(c => c.id !== x.equipment_id).slice(0, 4);
+  const sheetFollow = (pre, label) => `
+    <fieldset class="full sub-fs"><legend>${label}</legend><div class="form-grid four">
+      ${sel(pre + "_sheet", "有無", lossMeta.yes_no)}${date(pre + "_issued", "発行日")}${date(pre + "_valid", "妥当性確認日")}${date(pre + "_effective", "有効性確認日")}
+    </div></fieldset>`;
+  const hasFollow = ["gd_sheet", "gd_issued", "ct_sheet", "ct_issued"].some(k => x[k]);
+  openModal(id ? `ロスの編集（${fmtDate(x.occurred_date)} ${x.loss_type || ""}）` : "ロスを登録", `
+    <div class="form-grid">
+      <h3 class="form-sec full">発生</h3>
+      ${date("occurred_date", '製造日<em class="req">*</em>')}
+      <label class="field"><span>発生時刻</span><input type="time" name="occurred_time" value="${h(x.occurred_time || "")}"></label>
+      ${sel("loss_type", "ロス分類", lossMeta.loss_types, true)}${sel("cause_type", "ロス原因", lossMeta.causes, true)}
+      ${sel("recurrence", "初発・再発", lossMeta.recurrences)}${txt("plant", "工場")}
+
+      <h3 class="form-sec full">不具合の発生場所</h3>
+      ${txt("product_class", "分類", 'list="ls-class" placeholder="HB など"')}${txt("line", "ライン", 'list="ls-line" placeholder="Aライン など"')}
+      ${txt("process", "工程", 'list="ls-process" placeholder="前工程・後工程 など"')}${txt("equipment_text", "対象設備名（シートの表記）", 'placeholder="空欄なら設備台帳の名前を使います"')}
+      <div class="field full"><span>設備台帳の設備<em class="hint" style="font-weight:400">（設備と関係ないロスは空欄）</em></span>
+        <select name="equipment_id"><option value="">なし</option>${equipmentOptions(e => e.status !== "廃止" || e.id == x.equipment_id, x.equipment_id)}</select>
+        ${cands.length ? `<div class="lf-cands"><span class="hint">候補:</span>${cands.map(c => `<button type="button" class="chip" data-cand="${c.id}">${h(c.label)} <b>${Math.round(c.score * 100)}%</b></button>`).join("")}</div>` : ""}
+        ${id && !x.equipment_confirmed ? `<span class="hint">⚠ 取り込んだときの候補です。保存すると確定します</span>` : ""}</div>
+      <div class="field full" id="lf-rec">
+        ${x.record_id ? `<span>作業記録</span><div><button type="button" class="btn small" id="lf-open-rec">つながっている作業記録を開く</button> <span class="hint">発生状況・対策などを直すと作業記録にも反映します</span></div>`
+          : linkRec ? `<span>作業記録</span><div class="hint">保存すると、元の作業記録とつなぎます</div>`
+          : `<label class="check"><input type="checkbox" name="make_record"> この設備の作業記録（不定期）も作る</label>`}
+      </div>
+
+      <h3 class="form-sec full">対象製品</h3>
+      ${txt("product_code", "コード", 'inputmode="numeric"')}${txt("product_name", "品名", 'list="ls-product"')}
+
+      <h3 class="form-sec full">不具合の内容</h3>
+      ${area("situation", "発生状況")}${area("direct_cause", "直接の原因")}${area("temp_action", "暫定対策")}${area("perm_action", "恒久対策（再発防止対策）")}
+      ${txt("responsible", "実施責任者", 'list="ls-people"')}${txt("confirmer", "確認者（L・課長）", 'list="ls-people"')}
+
+      <h3 class="form-sec full">ロス時間 <span class="hint" style="font-weight:400">時間単価 ${fmtNum(x.hourly_rate || lossMeta.hourly_rate)}円/h</span></h3>
+      <div class="form-grid three full">
+        ${num("stop_min", "ライン停止時間（分）")}${num("stop_people", "ライン配置人数（人）")}${calc("lf-stop-h", "ライン停止ロス時間（h）", hrs(x.stop_hours))}
+        ${num("inspect_min", "検品時間（分）")}${num("inspect_people", "検品配置人数（人）")}${calc("lf-insp-h", "検品ロス時間（h）", hrs(x.inspect_hours))}
+      </div>
+      ${calc("lf-amount", "ロス金額", yen(x.loss_amount) || "—")}
+
+      <h3 class="form-sec full">廃棄または差損</h3>
+      ${txt("waste_code", "コード（廃棄）")}${txt("waste_name", "品名（廃棄）", 'list="ls-product"')}
+      ${num("waste_qty", "廃棄または処分数量")}${num("waste_unit_cost", "原価＠または差損＠（円）")}
+      ${calc("lf-waste", "廃棄または差損額", yen(x.waste_amount) || "—")}
+      ${area("note", "備考")}
+
+      <details class="full lf-follow" ${hasFollow ? "open" : ""}><summary>GDシート・出荷停止／トラブル是正処置</summary>
+        ${sheetFollow("gd", "GDシート")}${sheetFollow("ct", "出荷停止・トラブル是正処置")}
+      </details>
+    </div>
+    ${dl("ls-class", lossMeta.product_classes)}${dl("ls-line", lossMeta.lines)}${dl("ls-process", lossMeta.processes)}${dl("ls-people", lossMeta.people)}
+    <datalist id="ls-product">${lossMeta.products.map(p => `<option value="${h(p.name)}">${h(p.code || "")}</option>`).join("")}</datalist>
+    <p class="err" id="form-err" hidden></p>`, `
+    ${id ? `<button type="button" class="btn danger left" id="lf-del">削除</button>` : ""}
+    <button type="button" class="btn" data-close>キャンセル</button><button type="submit" class="btn primary">保存</button>`);
+  modal.classList.add("wide");
+  const form = $("#modal-form");
+  const rate = x.hourly_rate || lossMeta.hourly_rate;
+  const val = n => (form[n].value === "" ? null : +form[n].value);
+  const recalc = () => {
+    const hh = (m, p) => (val(m) != null && val(p) != null ? val(m) * val(p) / 60 : null);
+    const sh = hh("stop_min", "stop_people"), ih = hh("inspect_min", "inspect_people");
+    $("#lf-stop-h").textContent = hrs(sh);
+    $("#lf-insp-h").textContent = hrs(ih);
+    $("#lf-amount").textContent = sh != null || ih != null ? yen(Math.round(((sh || 0) + (ih || 0)) * rate)) || "¥0" : "—";
+  };
+  const recalcWaste = () => {
+    $("#lf-waste").textContent = val("waste_qty") != null && val("waste_unit_cost") != null ? yen(Math.round(val("waste_qty") * val("waste_unit_cost"))) || "¥0" : "—";
+  };
+  ["stop_min", "stop_people", "inspect_min", "inspect_people"].forEach(n => form[n].addEventListener("input", recalc));
+  ["waste_qty", "waste_unit_cost"].forEach(n => form[n].addEventListener("input", recalcWaste));
+  /* 作業記録を作るかのチェック: 設備を選んでいるときだけ。設備由来なら最初からチェック */
+  const mk = form.make_record;
+  const syncMk = () => {
+    if (!mk) return;
+    mk.closest("label").hidden = !form.equipment_id.value;
+    if (!mk.dataset.touched) mk.checked = !!form.equipment_id.value && form.cause_type.value === "設備由来";
+  };
+  mk?.addEventListener("change", () => (mk.dataset.touched = "1"));
+  form.equipment_id.addEventListener("change", syncMk);
+  form.cause_type.addEventListener("change", syncMk);
+  syncMk();
+  $$(".lf-cands [data-cand]").forEach(b => b.addEventListener("click", () => { form.equipment_id.value = b.dataset.cand; syncMk(); }));
+  /* 品名を選んだらコードも入れる */
+  const byName = new Map(lossMeta.products.map(p => [p.name, p.code]));
+  form.product_name.addEventListener("change", () => { if (!form.product_code.value && byName.get(form.product_name.value)) form.product_code.value = byName.get(form.product_name.value); });
+  form.waste_name.addEventListener("change", () => { if (!form.waste_code.value && byName.get(form.waste_name.value)) form.waste_code.value = byName.get(form.waste_name.value); });
+  $("#lf-open-rec")?.addEventListener("click", () => openRecordForm(x.record_id));
+  form.onsubmit = async e => {
+    e.preventDefault();
+    const data = Object.fromEntries(new FormData(form));
+    data.make_record = !!mk?.checked && !mk.closest("label").hidden;
+    if (linkRec) data.record_id = preset.record_id;
+    const err = $("#form-err");
+    const missing = [["occurred_date", "製造日"], ["loss_type", "ロス分類"], ["cause_type", "ロス原因"]].filter(([k]) => !data[k]).map(([, l]) => l);
+    if (missing.length) { err.textContent = `${missing.join("・")} は必須です`; err.hidden = false; return; }
+    try {
+      if (id) await api(`/losses/${id}`, { method: "PUT", body: data });
+      else await api("/losses", { method: "POST", body: data });
+      if (data.occurred_date && location.hash.startsWith("#/losses")) lossState.month = data.occurred_date.slice(0, 7);
+      closeModal();
+      toast(data.make_record ? "保存しました（作業記録も作りました）" : "保存しました");
+      router();
+    } catch (ex) { err.textContent = ex.message; err.hidden = false; }
+  };
+  $("#lf-del")?.addEventListener("click", async () => {
+    if (!confirm(`このロスを削除しますか？${x.record_id ? "\n（一緒に作った作業記録は設備の履歴として残ります）" : ""}`)) return;
+    try { await api(`/losses/${id}`, { method: "DELETE" }); closeModal(); toast("削除しました"); router(); }
+    catch (ex) { toast(ex.message); }
+  });
+}
+
+/* 作業記録（不定期・停止15分以上）を保存したあと、ロス調査にも登録するか聞く */
+const LOSS_SUGGEST_MIN = 15;
+function suggestLoss(recId, d) {
+  const eq = state.equipment.find(e => e.id == d.equipment_id);
+  const letter = eq && (/^([A-D])(?![A-Za-z])/.exec(norm(eq.nickname || eq.name)) || [])[1];
+  const preset = {
+    record_id: recId, equipment_id: eq ? eq.id : null, equipment_text: eq ? eqTitle(eq) : "", occurred_date: d.done_date || state.meta.today,
+    loss_type: "ライン停止", cause_type: "設備由来", line: letter ? `${letter}ライン` : "", stop_min: d.downtime_min,
+    situation: d.reason, temp_action: d.content, perm_action: d.countermeasure, responsible: d.author,
+  };
+  openModal("ロス調査にも登録しますか？", `
+    <p>停止 <strong>${h(d.downtime_min)}分</strong> のトラブルです。ロス調査シートは「原因を問わず15分以上のライン停止」を記載することになっています。</p>
+    <p class="muted">設備・日付・停止時間・内容を入れた状態でロスの入力画面を開きます。配置人数・品名などを足して保存してください。</p>`, `
+    <button type="button" class="btn" data-close>登録しない</button><button type="submit" class="btn primary">ロスに登録</button>`);
+  $("#modal-form").onsubmit = e => { e.preventDefault(); openLossForm(null, preset); };
+}
+
 /* ================================================================ 作業記録フォーム */
 async function openRecordForm(id, preset = {}) {
   await loadEquipment();
@@ -455,6 +844,8 @@ async function openRecordForm(id, preset = {}) {
       <label class="field"><span>関連する定期項目</span><select name="rule_id"><option value="">なし</option></select><span class="hint">完了で保存すると前回実施日が更新されます</span></label>
       <label class="field"><span>部品シリアル</span><input name="part_serial" list="serial-list" value="${h(rec.part_serial || "")}" placeholder="例: M1005.1"><datalist id="serial-list"></datalist></label>
       <label class="field"><span>費用（円）</span><input type="number" min="0" name="cost" value="${h(rec.cost ?? "")}" inputmode="numeric"></label>
+      ${rec.loss ? `<div class="field full"><span>ロス調査</span><div>${fmtDate(rec.loss.occurred_date)} ${lossTypeBadge(rec.loss.loss_type)} ${yen(rec.loss.loss_amount)}
+        <button type="button" class="btn small" id="open-loss">ロスを開く</button></div></div>` : ""}
       ${fileAttachField("報告書・見積書・現場写真など")}
     </div>
     <p class="err" id="form-err" hidden></p>`;
@@ -531,11 +922,14 @@ async function openRecordForm(id, preset = {}) {
       closeModal();
       toast(pending.length ? `保存しました（ファイル ${pending.length} 件を添付）` : "保存しました");
       router();
+      // 故障で15分以上止まったときは、ロス調査にも登録するか聞く（まだつながっていない記録だけ）
+      if (!isKoji && data.kind === "不定期" && +data.downtime_min >= LOSS_SUGGEST_MIN && !rec.loss) suggestLoss(recId, data);
     } catch (ex) {
       err.textContent = ex.message;
       err.hidden = false;
     }
   };
+  $("#open-loss")?.addEventListener("click", () => openLossForm(rec.loss.id));
   if (id) $("#del").addEventListener("click", async () => {
     if (!confirm("この作業記録を削除しますか？")) return;
     await api(`/records/${id}`, { method: "DELETE" });
@@ -1276,6 +1670,16 @@ async function renderEquipmentDetail(id) {
 
     ${eqHistory(eq.history)}
 
+    ${eq.losses.length ? `<div class="section-title"><h2>ロス（${eq.losses.length}件・ロス金額 ${yen(sum(eq.losses, "loss_amount")) || "¥0"}）</h2><a class="btn small" href="#/losses">ロス調査へ</a></div>
+    <div class="table-wrap"><table class="list responsive"><thead><tr><th>製造日</th><th>ロス</th><th>発生状況・原因</th><th class="num">停止</th><th class="num">ロス金額</th></tr></thead><tbody>
+      ${eq.losses.map(l => `<tr data-loss="${l.id}">
+        <td class="nowrap" data-label="製造日">${fmtDate(l.occurred_date)}${unconfirmedChip(l)}</td>
+        <td data-label="ロス">${lossTypeBadge(l.loss_type)} <span class="muted small">${h(l.cause_type || "")}${l.recurrence === "再発" ? ' ・<strong class="recur">再発</strong>' : ""}</span></td>
+        <td class="clip" data-label="発生状況・原因">${h(l.situation || "")}${l.direct_cause ? ` <span class="muted">／${h(l.direct_cause)}</span>` : ""}</td>
+        <td class="num nowrap" data-label="停止">${l.stop_min != null ? `${fmtNum(l.stop_min)}分` : ""}</td>
+        <td class="num nowrap" data-label="ロス金額">${yen(l.loss_amount)}</td></tr>`).join("")}
+    </tbody></table></div>` : ""}
+
     <div class="section-title"><h2 id="rec-count">作業履歴（${recs.length}件）</h2><button class="btn primary" id="add-rec">作業を記録</button></div>
     ${recs.length ? `<div class="search" style="margin-bottom:8px"><span>🔍</span><input id="rec-q" type="search" placeholder="作業内容・原因・結果・対策・作業者・日付で絞り込み"></div>` : ""}
     <div class="card"><ul class="timeline" id="rec-list"></ul></div>`;
@@ -1299,6 +1703,7 @@ async function renderEquipmentDetail(id) {
   $("#copy-eq").addEventListener("click", () => openEquipmentForm(null, eq));
   $("#add-rule").addEventListener("click", () => openRuleForm(null, { equipment_id: id }));
   $("#add-rec").addEventListener("click", () => openRecordForm(null, { equipment_id: id }));
+  $$("[data-loss]").forEach(tr => tr.addEventListener("click", () => openLossForm(+tr.dataset.loss)));
   $("#hours-form").addEventListener("submit", async e => {
     e.preventDefault();
     try {
@@ -1338,11 +1743,13 @@ async function openEquipmentForm(eq, src) {
       ${fileAttachField("取扱説明書・図面・銘板や設備の写真など")}
       ${copyRules}
     </div><p class="err" id="form-err" hidden></p>`, `
-    <button type="button" class="btn" data-close>キャンセル</button><button type="submit" class="btn primary">保存</button>`);
+    ${footAuthorField()}<button type="button" class="btn" data-close>キャンセル</button><button type="submit" class="btn primary">保存</button>`);
   const pending = bindFileAttach(eq?.files || [], "/equipment-files");  // コピーのときは元の設備のファイルを引き継がない
   const form = $("#modal-form");
+  $("#foot-author").addEventListener("input", e => e.target.classList.remove("invalid"));
   form.onsubmit = async ev => {
     ev.preventDefault();
+    if (!takeFootAuthor($("#form-err"))) return;
     const data = Object.fromEntries(new FormData(form));
     try {
       let eqId = eq?.id;
@@ -2850,9 +3257,23 @@ function openPlaItemForm(it, items, preset = {}) {
 
 /* ================================================================ 分析 */
 async function renderAnalytics() {
-  const years = state.analyticsYears || 5;
-  const a = await api(`/analytics?years=${years}${areaQS("&")}`);
-  const byYear = a.by_year.filter(y => y.year >= a.since.slice(0, 4));
+  const iso = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  const now = new Date();
+  const todayStr = iso(now);
+  const thisYear = now.getFullYear();
+  // 期間プリセット（「直近N年」は N 年前の 1 月 1 日から今日まで）
+  const presets = [
+    ["今年", `${thisYear}-01-01`, todayStr],
+    ["昨年", `${thisYear - 1}-01-01`, `${thisYear - 1}-12-31`],
+    ...[3, 5, 10].map(n => [`直近${n}年`, `${thisYear - n + 1}-01-01`, todayStr]),
+    ["全期間", "", todayStr],
+  ];
+  const range = state.analyticsRange || { from: `${thisYear - 4}-01-01`, to: todayStr };
+  const qs = new URLSearchParams();
+  if (range.from) qs.set("from", range.from);
+  if (range.to) qs.set("to", range.to);
+  const a = await api(`/analytics?${qs}${areaQS("&")}`);
+  const byYear = a.by_year;
   const eqs = a.by_equipment.filter(e => e.downtime > 0 || e.futeiki > 0);
   const kw = a.keywords.filter(k => k.count > 0);
   const totalDown = eqs.reduce((s, e) => s + e.downtime, 0);
@@ -2862,7 +3283,9 @@ async function renderAnalytics() {
   view.innerHTML = `
     <div class="toolbar">
       <div class="filters" style="margin:0">
-        <label>集計期間 <select id="a-years">${[3, 5, 10].map(n => `<option value="${n}" ${n === years ? "selected" : ""}>直近${n}年（${new Date().getFullYear() - n + 1}年〜）</option>`).join("")}</select></label>
+        <label>集計期間 <input type="date" id="a-from" value="${h(range.from || "")}" max="${h(range.to || todayStr)}">〜<input type="date" id="a-to" value="${h(range.to || "")}" min="${h(range.from || "")}"></label>
+        <span class="a-presets" style="display:inline-flex;gap:4px;flex-wrap:wrap">${presets.map(([label, f, t], i) =>
+          `<button type="button" class="btn${(range.from || "") === f && (range.to || "") === t ? " primary" : ""}" data-preset="${i}" style="padding:4px 10px;font-size:12px">${label}</button>`).join("")}</span>
       </div>
     </div>
     <div class="grid kpi">
@@ -2892,7 +3315,16 @@ async function renderAnalytics() {
         ${hbarChart(eqs.filter(e => e.futeiki > 0).sort((x, y) => y.futeiki - x.futeiki).slice(0, 10).map(e => ({ label: e.name, value: e.futeiki, tip: `<div class='tip-title'>${h(e.name)}</div>故障 ${e.futeiki}件 / 全${e.count}件` })), v => `${v}件`)}
       </div>
     </div>`;
-  $("#a-years").addEventListener("change", e => { state.analyticsYears = +e.target.value; renderAnalytics(); });
+  const applyRange = (from, to) => {
+    if (from && to && from > to) [from, to] = [to, from];  // 逆に選ばれたら入れ替える
+    state.analyticsRange = { from, to };
+    renderAnalytics();
+  };
+  ["#a-from", "#a-to"].forEach(sel => $(sel).addEventListener("change", () => applyRange($("#a-from").value, $("#a-to").value)));
+  $$("[data-preset]").forEach(b => b.addEventListener("click", () => {
+    const [, f, t] = presets[+b.dataset.preset];
+    applyRange(f, t);
+  }));
   $$(".hrow[data-kw]").forEach(r => r.addEventListener("click", () => {
     state.recordQuery = { q: r.dataset.kw.split("・")[0], sort: "done_date", dir: "desc", kind: "不定期" };
     location.hash = "#/records";
@@ -2940,6 +3372,101 @@ function tableView(head, body) {
   return `<details class="table-view"><summary>表で見る</summary>
     <table class="list plain"><thead><tr>${head.map(x => `<th>${h(x)}</th>`).join("")}</tr></thead>
     <tbody>${body.map(r => `<tr>${r.map((c, i) => `<td class="${i ? "num" : ""}">${h(c ?? "")}</td>`).join("")}</tr>`).join("")}</tbody></table></details>`;
+}
+
+/* ================================================================ 記入者名簿 */
+async function renderStaff() {
+  const d = await api("/staff");
+  let list = d.staff.slice();
+  let dirty = false;
+  const others = d.others;
+
+  view.innerHTML = `
+    <div class="grid cols-2">
+      <div class="card">
+        <h3>名簿 <span class="sub" id="st-count"></span></h3>
+        <p class="muted" style="font-size:13px">右上の「記入者」や作業記録の記入者の候補に、この順で出ます。名前を直接書き換えることもできます。</p>
+        <form id="st-add" style="display:flex;gap:8px;margin:8px 0">
+          <input name="name" placeholder="追加する名前（例: 山田 太郎）" autocomplete="off" style="flex:1;padding:8px;border:1px solid #cfcec9;border-radius:6px">
+          <button class="btn">追加</button>
+        </form>
+        <div id="st-list"></div>
+        <div style="display:flex;gap:8px;align-items:center;margin-top:12px">
+          <button class="btn primary" id="st-save">名簿を保存</button>
+          <button class="btn" id="st-reset">元に戻す</button>
+          <span class="muted" id="st-dirty" hidden>未保存の変更があります</span>
+          <span class="err" id="st-err" hidden></span>
+        </div>
+      </div>
+      <div class="card">
+        <h3>名簿にない記入者 <span class="sub">過去の作業記録の記入者。クリックで名簿に追加</span></h3>
+        <div id="st-others"></div>
+      </div>
+    </div>`;
+
+  const setDirty = v => { dirty = v; $("#st-dirty").hidden = !v; };
+  const draw = () => {
+    $("#st-count").textContent = `${list.length}人`;
+    $("#st-list").innerHTML = list.length ? `<table class="list plain"><tbody>${list.map((n, i) => `
+      <tr data-i="${i}">
+        <td class="num muted" style="width:2.5em">${i + 1}</td>
+        <td><input class="st-name" value="${h(n)}" style="width:100%;padding:4px 6px;border:1px solid #cfcec9;border-radius:4px"></td>
+        <td class="nowrap" style="width:1%">
+          <button type="button" class="icon-btn" data-act="up" title="上へ" ${i === 0 ? "disabled" : ""}>▲</button>
+          <button type="button" class="icon-btn" data-act="down" title="下へ" ${i === list.length - 1 ? "disabled" : ""}>▼</button>
+          <button type="button" class="icon-btn" data-act="del" title="名簿から外す">✕</button>
+        </td>
+      </tr>`).join("")}</tbody></table>` : `<p class="empty">名簿が空です</p>`;
+    const inList = new Set(list);
+    const rest = others.filter(o => !inList.has(o.name));
+    $("#st-others").innerHTML = rest.length
+      ? `<div style="display:flex;flex-wrap:wrap;gap:6px">${rest.map(o => `<button type="button" class="btn" data-add="${h(o.name)}" style="padding:4px 10px;font-size:13px">＋ ${h(o.name)} <span class="muted">${o.count}件</span></button>`).join("")}</div>`
+      : `<p class="empty">ありません</p>`;
+  };
+  const add = name => {
+    name = name.replace(/\s+/g, " ").trim();
+    if (!name) return;
+    if (list.includes(name)) { toast(`「${name}」はもう名簿にあります`); return; }
+    list.push(name);
+    setDirty(true);
+    draw();
+  };
+  draw();
+
+  $("#st-add").addEventListener("submit", e => { e.preventDefault(); add(e.target.name.value); e.target.name.value = ""; e.target.name.focus(); });
+  $("#st-others").addEventListener("click", e => { const b = e.target.closest("[data-add]"); if (b) add(b.dataset.add); });
+  $("#st-list").addEventListener("input", e => {
+    if (!e.target.classList.contains("st-name")) return;
+    list[+e.target.closest("tr").dataset.i] = e.target.value;
+    setDirty(true);
+  });
+  $("#st-list").addEventListener("click", e => {
+    const b = e.target.closest("[data-act]");
+    if (!b) return;
+    const i = +b.closest("tr").dataset.i;
+    if (b.dataset.act === "del") list.splice(i, 1);
+    else {
+      const j = b.dataset.act === "up" ? i - 1 : i + 1;
+      [list[i], list[j]] = [list[j], list[i]];
+    }
+    setDirty(true);
+    draw();
+  });
+  $("#st-reset").addEventListener("click", () => { list = d.staff.slice(); setDirty(false); draw(); });
+  $("#st-save").addEventListener("click", async () => {
+    try {
+      const r = await api("/staff", { method: "PUT", body: { staff: list } });
+      d.staff = r.staff;
+      list = r.staff.slice();
+      $("#st-err").hidden = true;
+      setDirty(false);
+      draw();
+      // 記入者の候補（datalist）も更新する
+      state.meta = await api("/meta");
+      $("#author-list").innerHTML = state.meta.authors.map(a => `<option value="${h(a)}">`).join("");
+      toast(`名簿を保存しました（${r.staff.length}人）`);
+    } catch (ex) { $("#st-err").textContent = ex.message; $("#st-err").hidden = false; }
+  });
 }
 
 /* ================================================================ 取引業者 */

@@ -21,6 +21,7 @@ import equipment_xlsx
 import calibration as calib_mod
 import instruments as inst_mod
 import instruments_xlsx
+import losses as loss_mod
 import pla
 import pla_sheets
 import parts_catalog
@@ -36,16 +37,6 @@ PART_EVENT_STATUS = {
 }
 FAILURE_KEYWORDS = ["ベアリング", "モーター", "オイルシール", "ベルト", "端子台|配線|漏電|ショート",
                     "リミット|センサー|スイッチ", "シャフト|軸", "チェーン|キー", "グリス|オイル漏"]
-# 記入者の選択肢（この順で上に出す。過去の記録にある名前はこの後ろに並ぶ）
-STAFF = [
-    "矢代 顕久", "矢野 新悟", "塚本 雅行", "小森 吉貞", "髙橋 和也", "川東 忠司", "山本 浩善", "西村 憲弘",
-    "筒井 祐司", "米林 威作人", "中村 徳秀", "大家 輝彦", "中野 翔吾", "浅野 冬弥", "杉本 陸", "冨永 悠士",
-    "辻 隼正", "原田 翔太", "碇 大稀", "山嵜 悠", "北林 陸", "林 佑耶", "中野 倖多", "清原 憲",
-    "藤本 昌樹", "大南 正人", "山本 剛",
-    "秋葉 裕樹", "梶田 博幸", "山下 隆雄", "鈴川 剛史", "松本 憲二", "若井 春孝", "橋本 政幸", "中野 健志",
-    "今宿 伸吾", "橋本 慎吾", "木村 真人", "木場田 智武", "西中 寿", "脇坂 翼", "大籠 恭二", "宮川 明",
-    "長田 豊貴",
-]
 SOON_DAYS = 14
 SOON_HOURS_RATIO = 0.2
 
@@ -167,7 +158,21 @@ def _act_calib(conn, cal_id, d=None):
             "ref_type": "calibration", "ref_id": cal_id}
 
 
+def _act_loss(conn, loss_id, d):
+    x = _row(conn, "SELECT occurred_date, loss_type, line, equipment_id, equipment_text, situation FROM losses WHERE id=?", loss_id)
+    x |= {k: d[k] for k in ("occurred_date", "loss_type", "line", "equipment_id", "equipment_text", "situation") if d.get(k)}
+    name, area = _eq_target(conn, x.get("equipment_id"))
+    return {"target": " ".join(filter(None, [(x.get("occurred_date") or "").replace("-", "/"), x.get("loss_type"),
+                                             name or x.get("equipment_text") or x.get("line")])),
+            "area": area, "detail": x.get("situation"), "ref_type": "loss", "ref_id": loss_id}
+
+
 ACTIVITY = {  # API の関数名: (分類, 操作, 何に対してかを返す関数(conn, URL の引数, JSON))
+    "loss_create": ("ロス調査", "登録", lambda c, a, d: _act_loss(c, None, d)),
+    "loss_update": ("ロス調査", "変更", lambda c, a, d: _act_loss(c, a["loss_id"], d)),
+    "loss_confirm": ("ロス調査", "設備を確定", lambda c, a, d: _act_loss(c, a["loss_id"], {"equipment_id": d.get("equipment_id")})),
+    "loss_delete": ("ロス調査", "削除", lambda c, a, d: _act_loss(c, a["loss_id"], d)),
+    "loss_rate_update": ("ロス調査", "時間単価を変更", lambda c, a, d: {"detail": f"{d.get('hourly_rate')}円/h", "ref_type": "loss"}),
     "equipment_create": ("設備台帳", "登録", lambda c, a, d: {"target": d.get("name"), "area": d.get("area"), "ref_type": "equipment"}),
     "equipment_update": ("設備台帳", "変更", lambda c, a, d: dict(zip(("target", "area"), _eq_target(c, a["eq_id"])), ref_type="equipment", ref_id=a["eq_id"])),
     "equipment_hours": ("設備台帳", "アワーメーター更新", lambda c, a, d: dict(zip(("target", "area"), _eq_target(c, a["eq_id"])), detail=f"{d.get('current_hours')}h", ref_type="equipment", ref_id=a["eq_id"])),
@@ -343,8 +348,9 @@ def index():
 def meta():
     conn = db()
     # 名簿の人を先に。過去の記録の名前は、名簿と同じ名前・名簿の人の姓だけのもの（例: 中村）を除いて後ろに
-    staff_names = set(STAFF) | {s.split()[0] for s in STAFF}
-    authors = STAFF + [r[0] for r in conn.execute(
+    staff = staff_list(conn)
+    staff_names = set(staff) | {s.split()[0] for s in staff}
+    authors = staff + [r[0] for r in conn.execute(
         "SELECT author FROM records WHERE author IS NOT NULL GROUP BY author ORDER BY COUNT(*) DESC")
         if r[0] not in staff_names]
     return jsonify(
@@ -361,6 +367,45 @@ def meta():
                WHERE location IS NOT NULL GROUP BY location ORDER BY COUNT(*) DESC, location""")],
         today=today().isoformat(),
     )
+
+
+# ---------------------------------------------------------------- 記入者名簿
+def staff_list(conn):
+    return [r[0] for r in conn.execute("SELECT name FROM staff ORDER BY sort_order, id")]
+
+
+@app.get("/api/staff")
+def staff_get():
+    conn = db()
+    staff = staff_list(conn)
+    # 名簿にない名前で書かれた過去の記録（名簿に足す候補として見せる）。/api/meta と同じく、名簿の人の姓だけのものは除く
+    known = set(staff) | {s.split()[0] for s in staff}
+    others = [x for x in rows(conn.execute(
+        """SELECT author AS name, COUNT(*) AS count FROM records
+           WHERE author IS NOT NULL AND author != '' GROUP BY author ORDER BY count DESC, author"""))
+        if x["name"] not in known][:50]
+    return jsonify(staff=staff, others=others)
+
+
+@app.put("/api/staff")
+def staff_update():
+    names = body().get("staff")
+    if not isinstance(names, list):
+        abort(400, "staff（名前の一覧）が必要です")
+    cleaned, seen = [], set()
+    for n in names:
+        n = re.sub(r"\s+", " ", str(n or "")).strip()  # 全角スペースもそろえる
+        if not n or n in seen:
+            continue
+        if len(n) > 40:
+            abort(400, f"名前が長すぎます: {n[:20]}…")
+        seen.add(n)
+        cleaned.append(n)
+    conn = db()
+    conn.execute("DELETE FROM staff")
+    conn.executemany("INSERT INTO staff(name, sort_order) VALUES (?, ?)", [(n, i) for i, n in enumerate(cleaned)])
+    conn.commit()
+    return jsonify(ok=True, staff=cleaned)
 
 
 # ---------------------------------------------------------------- 設備
@@ -404,6 +449,10 @@ def equipment_detail(eq_id):
     eq["files"] = rows(conn.execute("SELECT * FROM equipment_files WHERE equipment_id = ? ORDER BY id", (eq_id,)))
     eq["history"] = rows(conn.execute(
         "SELECT * FROM equipment_history WHERE equipment_id = ? ORDER BY changed_at DESC, id", (eq_id,)))
+    eq["losses"] = rows(conn.execute(
+        """SELECT id, occurred_date, occurred_time, loss_type, cause_type, recurrence, line, situation, direct_cause,
+                  stop_min, loss_amount, waste_amount, record_id, equipment_confirmed
+           FROM losses WHERE equipment_id = ? ORDER BY occurred_date DESC, occurred_time DESC, id DESC""", (eq_id,)))
     return jsonify(eq)
 
 
@@ -584,7 +633,8 @@ def record_get(rec_id):
     if not r:
         abort(404)
     files = rows(conn.execute("SELECT * FROM record_files WHERE record_id=? ORDER BY id", (rec_id,)))
-    return jsonify(dict(r) | {"files": files})
+    loss = conn.execute("SELECT id, occurred_date, loss_type, loss_amount FROM losses WHERE record_id=?", (rec_id,)).fetchone()
+    return jsonify(dict(r) | {"files": files, "loss": dict(loss) if loss else None})
 
 
 REC_FIELDS = ["equipment_id", "kind", "status", "done_date", "downtime_min", "hour_meter", "content",
@@ -685,6 +735,7 @@ def record_delete(rec_id):
     conn = db()
     conn.execute("DELETE FROM part_events WHERE record_id=?", (rec_id,))
     conn.execute("DELETE FROM record_files WHERE record_id=?", (rec_id,))  # ファイル本体はバックアップから戻せるよう残す
+    conn.execute("UPDATE losses SET record_id=NULL WHERE record_id=?", (rec_id,))  # ロスは残す（つながりだけ外す）
     conn.execute("DELETE FROM records WHERE id=?", (rec_id,))
     conn.commit()
     return jsonify(ok=True)
@@ -1982,40 +2033,53 @@ def dashboard():
         recent=recent,
         uncertain_count=uncertain,
         equipment_count=conn.execute("SELECT COUNT(*) FROM equipment e WHERE status!='廃止'" + cond, args).fetchone()[0],
+        losses_pending=conn.execute("SELECT COUNT(*) FROM losses WHERE equipment_confirmed = 0").fetchone()[0],
     )
 
 
 @app.get("/api/analytics")
 def analytics():
     conn = db()
-    years = request.args.get("years", type=int) or 5
-    since = f"{today().year - years + 1}-01-01"
+    # 集計期間は from / to（YYYY-MM-DD、両端を含む）。どちらも無ければ years（直近 N 年、既定 5 年）
+    try:
+        if request.args.get("from") or request.args.get("to"):
+            start = dt.date.fromisoformat(request.args["from"]) if request.args.get("from") else dt.date(1900, 1, 1)
+            end = dt.date.fromisoformat(request.args["to"]) if request.args.get("to") else today()
+        else:
+            years = request.args.get("years", type=int) or 5
+            start, end = dt.date(today().year - years + 1, 1, 1), today()
+    except ValueError:
+        abort(400, "期間の日付は YYYY-MM-DD 形式で指定してください")
+    if start > end:
+        abort(400, "期間の開始日が終了日より後になっています")
+    since, until = start.isoformat(), end.isoformat()
+    period = " AND r.done_date >= ? AND substr(r.done_date,1,10) <= ?"
     cond, args = area_filter()
+    pargs = [since, until] + args
     by_year = rows(conn.execute(
-        """SELECT substr(done_date,1,4) AS year,
-                  SUM(CASE WHEN kind='定期' THEN 1 ELSE 0 END) AS teiki,
-                  SUM(CASE WHEN kind='不定期' THEN 1 ELSE 0 END) AS futeiki,
-                  SUM(CASE WHEN kind IS NULL THEN 1 ELSE 0 END) AS other,
-                  COALESCE(SUM(downtime_min),0) AS downtime, COALESCE(SUM(cost),0) AS cost
+        """SELECT substr(r.done_date,1,4) AS year,
+                  SUM(CASE WHEN r.kind='定期' THEN 1 ELSE 0 END) AS teiki,
+                  SUM(CASE WHEN r.kind='不定期' THEN 1 ELSE 0 END) AS futeiki,
+                  SUM(CASE WHEN r.kind IS NULL THEN 1 ELSE 0 END) AS other,
+                  COALESCE(SUM(r.downtime_min),0) AS downtime, COALESCE(SUM(r.cost),0) AS cost
            FROM records r JOIN equipment e ON e.id = r.equipment_id
-           WHERE done_date IS NOT NULL""" + cond + " GROUP BY year ORDER BY year", args))
+           WHERE r.done_date IS NOT NULL""" + period + cond + " GROUP BY year ORDER BY year", pargs))
     by_equipment = rows(conn.execute(
         """SELECT e.id, e.code, e.name, COUNT(r.id) AS count,
                   SUM(CASE WHEN r.kind='不定期' THEN 1 ELSE 0 END) AS futeiki,
                   COALESCE(SUM(r.downtime_min),0) AS downtime,
                   COALESCE(SUM(r.cost),0) AS cost
            FROM equipment e JOIN records r ON r.equipment_id = e.id
-           WHERE r.done_date >= ?""" + cond + " GROUP BY e.id ORDER BY downtime DESC, futeiki DESC",
-        [since] + args))
+           WHERE 1=1""" + period + cond + " GROUP BY e.id ORDER BY downtime DESC, futeiki DESC", pargs))
     texts =[f"{r['content'] or ''} {r['reason'] or ''}" for r in conn.execute(
-        """SELECT content, reason FROM records r JOIN equipment e ON e.id = r.equipment_id
-           WHERE done_date >= ? AND (kind='不定期' OR kind IS NULL)""" + cond, [since] + args)]
+        """SELECT r.content, r.reason FROM records r JOIN equipment e ON e.id = r.equipment_id
+           WHERE (r.kind='不定期' OR r.kind IS NULL)""" + period + cond, pargs)]
     keywords = []
     for kw in FAILURE_KEYWORDS:
         pat = re.compile(kw)
         keywords.append({"keyword": kw.replace("|", "・"), "count": sum(1 for t in texts if pat.search(t))})
     keywords.sort(key=lambda k: -k["count"])
-    return jsonify(since=since, by_year=by_year, by_equipment=by_equipment, keywords=keywords)
+    return jsonify(since=since, until=until, by_year=by_year, by_equipment=by_equipment, keywords=keywords)
 
 
 # ---------------------------------------------------------------- 通知設定
@@ -2072,6 +2136,217 @@ def notify_test():
     except Exception as e:
         abort(400, f"送信できませんでした: {e}")
     return jsonify(ok=True)
+
+
+# ---------------------------------------------------------------- ロス調査（ロス調査シート。列は losses.XLS_COLS）
+LOSS_SELECT = """SELECT l.*, e.code AS equipment_code, COALESCE(e.nickname, e.name) AS equipment_name, e.area AS equipment_area,
+                        e.status AS equipment_status
+                 FROM losses l LEFT JOIN equipment e ON e.id = l.equipment_id"""
+LOSS_CALC_INPUTS = ["stop_min", "stop_people", "inspect_min", "inspect_people", "waste_qty", "waste_unit_cost"]
+
+
+def loss_equipment(conn):
+    return [dict(e) for e in conn.execute("SELECT id, code, name, nickname, area, status FROM equipment")]
+
+
+def loss_candidates(equipment, loss):
+    return [{"id": e["id"], "label": " ".join(filter(None, [e["code"], e["nickname"] or e["name"]])), "area": e["area"],
+             "status": e["status"], "score": s}
+            for s, e in loss_mod.candidates(equipment, loss.get("equipment_text"), loss.get("line"))]
+
+
+@app.get("/api/losses/meta")
+def losses_meta():
+    conn = db()
+
+    def used(col):
+        return [r[0] for r in conn.execute(
+            f"SELECT {col} FROM losses WHERE COALESCE({col}, '') != '' GROUP BY {col} ORDER BY COUNT(*) DESC, {col} LIMIT 80")]
+    return jsonify(
+        loss_types=loss_mod.LOSS_TYPES, causes=loss_mod.CAUSES, recurrences=loss_mod.RECURRENCES, yes_no=loss_mod.YES_NO,
+        plant=loss_mod.PLANT, hourly_rate=loss_mod.get_rate(conn),
+        months=[r[0] for r in conn.execute(
+            "SELECT DISTINCT substr(occurred_date, 1, 7) FROM losses WHERE occurred_date GLOB '[0-9][0-9][0-9][0-9]-*' ORDER BY 1 DESC")],
+        lines=used("line"), processes=used("process"), product_classes=used("product_class"),
+        people=[r[0] for r in conn.execute(
+            """SELECT p FROM (SELECT responsible AS p FROM losses UNION ALL SELECT confirmer FROM losses)
+               WHERE COALESCE(p, '') != '' GROUP BY p ORDER BY COUNT(*) DESC LIMIT 80""")],
+        products=rows(conn.execute(
+            """SELECT product_code AS code, product_name AS name FROM losses WHERE product_name IS NOT NULL
+               GROUP BY product_code, product_name ORDER BY MAX(occurred_date) DESC LIMIT 300""")),
+        pending=conn.execute("SELECT COUNT(*) FROM losses WHERE equipment_confirmed = 0").fetchone()[0],
+    )
+
+
+@app.get("/api/losses")
+def losses_list():
+    a, conn = request.args, db()
+    sql, params = LOSS_SELECT + " WHERE 1=1", []
+    if a.get("month"):
+        sql += " AND substr(l.occurred_date, 1, 7) = ?"
+        params.append(a["month"])
+    if a.get("from"):
+        sql += " AND substr(l.occurred_date, 1, 7) >= ?"
+        params.append(a["from"])
+    if a.get("to"):
+        sql += " AND substr(l.occurred_date, 1, 7) <= ?"
+        params.append(a["to"])
+    if a.get("equipment_id"):
+        sql += " AND l.equipment_id = ?"
+        params.append(a["equipment_id"])
+    if a.get("pending") == "1":
+        sql += " AND l.equipment_confirmed = 0"
+    if a.get("area"):  # 設備のないロス（人手不足など）はどのエリアでも出す
+        sql += " AND (e.area = ? OR l.equipment_id IS NULL)"
+        params.append(a["area"])
+    sql += " ORDER BY l.occurred_date IS NULL, l.occurred_date, l.occurred_time IS NULL, l.occurred_time, l.id"
+    out = rows(conn.execute(sql, params))
+    if a.get("pending") == "1":
+        equipment = loss_equipment(conn)
+        for x in out:
+            x["candidates"] = loss_candidates(equipment, x)
+    return jsonify(out)
+
+
+@app.get("/api/losses/<int:loss_id>")
+def loss_get(loss_id):
+    conn = db()
+    x = conn.execute(LOSS_SELECT + " WHERE l.id = ?", (loss_id,)).fetchone()
+    if not x:
+        abort(404)
+    x = dict(x)
+    x["candidates"] = loss_candidates(loss_equipment(conn), x) if x.get("equipment_text") else []
+    return jsonify(x)
+
+
+def loss_values(d):
+    v = {}
+    for f in loss_mod.FIELDS + ["equipment_id"]:
+        if f in d:
+            val = d[f]
+            v[f] = blank_to_none(val.strip() if isinstance(val, str) else val)
+    try:
+        for f in loss_mod.NUM_FIELDS:
+            if v.get(f) is not None:
+                v[f] = float(norm(str(v[f])).replace(",", ""))
+        if v.get("equipment_id") is not None:
+            v["equipment_id"] = int(v["equipment_id"])
+        for f in loss_mod.DATE_FIELDS:
+            if v.get(f):
+                dt.date.fromisoformat(v[f])
+        if v.get("occurred_time"):
+            v["occurred_time"] = dt.time.fromisoformat(v["occurred_time"]).strftime("%H:%M")
+    except ValueError as e:
+        abort(400, f"入力値が不正です: {e}")
+    return v
+
+
+def check_loss(v):
+    missing = [label for f, label in (("occurred_date", "製造日"), ("loss_type", "ロス分類"), ("cause_type", "ロス原因")) if not v.get(f)]
+    if missing:
+        abort(400, "・".join(missing) + " は必須です")
+
+
+def loss_link_record(conn, loss_id, d):
+    """作業記録をつなぐ（作業記録から開いたとき）か、新しく作る（「作業記録も作る」にチェック）。"""
+    x = dict(conn.execute("SELECT * FROM losses WHERE id=?", (loss_id,)).fetchone())
+    if x["record_id"]:
+        return
+    if d.get("record_id"):
+        if not conn.execute("SELECT 1 FROM records WHERE id=?", (d["record_id"],)).fetchone():
+            abort(400, "つなぐ作業記録が見つかりません")
+        conn.execute("UPDATE losses SET record_id=? WHERE id=?", (int(d["record_id"]), loss_id))
+    elif d.get("make_record") and x["equipment_id"]:
+        loss_mod.create_record(conn, x)
+
+
+@app.post("/api/losses")
+def loss_create():
+    d, conn = body(), db()
+    v = loss_values(d)
+    check_loss(v)
+    loss_mod.compute(v, loss_mod.get_rate(conn))
+    now = dt.datetime.now().isoformat(timespec="seconds")
+    v |= {"plant": v.get("plant") or loss_mod.PLANT, "equipment_confirmed": 1, "source": "app",
+          "author": request_user(), "created_at": now}
+    loss_id = conn.execute(f"INSERT INTO losses({','.join(v)}) VALUES ({','.join('?' * len(v))})", list(v.values())).lastrowid
+    loss_link_record(conn, loss_id, d)
+    conn.commit()
+    return jsonify(id=loss_id), 201
+
+
+@app.put("/api/losses/<int:loss_id>")
+def loss_update(loss_id):
+    d, conn = body(), db()
+    old = conn.execute("SELECT * FROM losses WHERE id=?", (loss_id,)).fetchone()
+    if not old:
+        abort(404)
+    old = dict(old)
+    v = loss_values(d)
+    merged = old | v
+    check_loss(merged)
+    # 停止時間・人数などを変えたときだけ計算し直す（取り込んだ行の手入力の値は、触らなければそのまま）
+    if old["source"] != "xls" or any(f in v and v[f] != old[f] for f in LOSS_CALC_INPUTS):
+        calc = loss_mod.compute(dict(merged), old["hourly_rate"] or loss_mod.get_rate(conn))
+        v |= {k: calc[k] for k in ("stop_hours", "inspect_hours", "loss_amount", "hourly_rate", "waste_amount")}
+    if "equipment_id" in v:
+        v["equipment_confirmed"] = 1
+    v["updated_at"] = dt.datetime.now().isoformat(timespec="seconds")
+    conn.execute(f"UPDATE losses SET {', '.join(k + '=?' for k in v)} WHERE id=?", [*v.values(), loss_id])
+    loss_mod.sync_record(conn, old, old | v)
+    loss_link_record(conn, loss_id, d)
+    conn.commit()
+    return jsonify(ok=True)
+
+
+@app.post("/api/losses/<int:loss_id>/confirm")
+def loss_confirm(loss_id):
+    """設備の確認（取り込んだ候補を確定する。equipment_id が空なら「設備なし」で確定）。"""
+    d, conn = body(), db()
+    old = conn.execute("SELECT * FROM losses WHERE id=?", (loss_id,)).fetchone()
+    if not old:
+        abort(404)
+    eq_id = int(d["equipment_id"]) if d.get("equipment_id") else None
+    conn.execute("UPDATE losses SET equipment_id=?, equipment_confirmed=1, updated_at=? WHERE id=?",
+                 (eq_id, dt.datetime.now().isoformat(timespec="seconds"), loss_id))
+    loss_mod.sync_record(conn, dict(old), dict(old) | {"equipment_id": eq_id})
+    loss_link_record(conn, loss_id, {"make_record": d.get("make_record")})
+    conn.commit()
+    return jsonify(ok=True)
+
+
+@app.delete("/api/losses/<int:loss_id>")
+def loss_delete(loss_id):
+    conn = db()
+    conn.execute("DELETE FROM losses WHERE id=?", (loss_id,))  # 一緒に作った作業記録は設備の履歴として残す
+    conn.commit()
+    return jsonify(ok=True)
+
+
+@app.put("/api/losses/rate")
+def loss_rate_update():
+    rate = body().get("hourly_rate")
+    try:
+        rate = int(rate)
+    except (TypeError, ValueError):
+        abort(400, "時間単価は数字で入れてください")
+    if rate <= 0:
+        abort(400, "時間単価は 1 円以上にしてください")
+    conn = db()
+    loss_mod.set_rate(conn, rate)
+    conn.commit()
+    return jsonify(ok=True, hourly_rate=rate)
+
+
+@app.get("/api/losses/export.xlsx")
+def losses_export():
+    a = request.args
+    if not (re.fullmatch(r"\d{4}-\d{2}", a.get("from", "")) and re.fullmatch(r"\d{4}-\d{2}", a.get("to", ""))):
+        abort(400, "出力する月（from・to）を YYYY-MM で指定してください")
+    name = f"ロス調査シート（{loss_mod.PLANT}）_{a['from']}〜{a['to']}.xlsx"
+    return Response(loss_mod.export_workbook(db(), a["from"], a["to"]).getvalue(),
+                    mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    headers={"Content-Disposition": f"attachment; filename=losses.xlsx; filename*=UTF-8''{quote(name)}"})
 
 
 @app.errorhandler(400)

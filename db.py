@@ -8,6 +8,17 @@ import unicodedata
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.environ.get("MAINT_DB", os.path.join(BASE_DIR, "data", "maintenance.db"))
 
+# 記入者の名簿の初期値（staff テーブルを作ったときに 1 回だけ入れる。以降は画面の「記入者名簿」で編集）
+DEFAULT_STAFF = [
+    "矢代 顕久", "矢野 新悟", "塚本 雅行", "小森 吉貞", "髙橋 和也", "川東 忠司", "山本 浩善", "西村 憲弘",
+    "筒井 祐司", "米林 威作人", "中村 徳秀", "大家 輝彦", "中野 翔吾", "浅野 冬弥", "杉本 陸", "冨永 悠士",
+    "辻 隼正", "原田 翔太", "碇 大稀", "山嵜 悠", "北林 陸", "林 佑耶", "中野 倖多", "清原 憲",
+    "藤本 昌樹", "大南 正人", "山本 剛",
+    "秋葉 裕樹", "梶田 博幸", "山下 隆雄", "鈴川 剛史", "松本 憲二", "若井 春孝", "橋本 政幸", "中野 健志",
+    "今宿 伸吾", "橋本 慎吾", "木村 真人", "木場田 智武", "西中 寿", "脇坂 翼", "大籠 恭二", "宮川 明",
+    "長田 豊貴",
+]
+
 # 作業履歴（Excel の 1 行 = 1 レコード）。工事は設備なしで場所だけのこともある
 RECORDS_COLUMNS = """(
     id INTEGER PRIMARY KEY,
@@ -108,6 +119,13 @@ CREATE TABLE IF NOT EXISTS notify_recipients (
     area TEXT NOT NULL,
     email TEXT NOT NULL,
     UNIQUE(area, email)
+);
+
+-- 記入者の名簿（右上の記入者・作業記録の記入者などの選択肢。sort_order の順で上に出す）
+CREATE TABLE IF NOT EXISTS staff (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    sort_order INTEGER NOT NULL DEFAULT 0
 );
 
 -- 通知済みの記録（同じ内容を毎朝送らないため）
@@ -345,6 +363,45 @@ CREATE TABLE IF NOT EXISTS calib_presets (   -- 校正の初期値（秤ごと�
     PRIMARY KEY (form, instrument_id)
 );
 
+-- ロス調査（ロス調査シートの 1 行）。列の意味・Excel の並びは losses.XLS_COLS
+CREATE TABLE IF NOT EXISTS losses (
+    id INTEGER PRIMARY KEY,
+    plant TEXT,                -- 工場
+    occurred_date TEXT,        -- 製造日（YYYY-MM-DD）
+    occurred_time TEXT,        -- 発生時刻（HH:MM）
+    loss_type TEXT,            -- ロス分類（ライン停止 / 検品・手直し / 配合ミス / 廃棄ロス）
+    cause_type TEXT,           -- ロス原因（設備由来 / 原材料由来 / 作業者由来 / 方法・手順由来 / その他）
+    recurrence TEXT,           -- 初発 / 再発
+    product_class TEXT, line TEXT, process TEXT,
+    equipment_text TEXT,       -- 対象設備名（シートに書かれたまま）
+    equipment_id INTEGER REFERENCES equipment(id),
+    equipment_confirmed INTEGER DEFAULT 1,  -- 0 = 取り込んだときの候補のまま（画面で確定する）
+    record_id INTEGER REFERENCES records(id),  -- 一緒に作った・つないだ作業記録
+    product_code TEXT, product_name TEXT,
+    situation TEXT, direct_cause TEXT, temp_action TEXT, perm_action TEXT,
+    responsible TEXT, confirmer TEXT,
+    stop_min REAL, stop_people REAL, stop_hours REAL,
+    inspect_min REAL, inspect_people REAL, inspect_hours REAL,
+    loss_amount INTEGER,       -- ロス金額（円）=（停止ロス時間 + 検品ロス時間）× hourly_rate
+    hourly_rate INTEGER,       -- 計算に使った時間単価（取り込み分は空）
+    waste_code TEXT, waste_name TEXT, waste_qty REAL, waste_unit_cost REAL, waste_amount INTEGER,
+    note TEXT,
+    gd_sheet TEXT, gd_issued TEXT, gd_valid TEXT, gd_effective TEXT,  -- GDシート
+    ct_sheet TEXT, ct_issued TEXT, ct_valid TEXT, ct_effective TEXT,  -- 出荷停止・トラブル是正処置
+    author TEXT,
+    source TEXT,               -- 'xls' / 'app'
+    source_file TEXT, source_sheet TEXT, source_no INTEGER, source_row INTEGER,
+    created_at TEXT, updated_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_losses_date ON losses(occurred_date);
+CREATE INDEX IF NOT EXISTS idx_losses_eq ON losses(equipment_id);
+
+-- 画面で変えられる設定（ロスの時間単価など）
+CREATE TABLE IF NOT EXISTS app_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_records_eq ON records(equipment_id);
 CREATE INDEX IF NOT EXISTS idx_records_date ON records(done_date);
 CREATE INDEX IF NOT EXISTS idx_part_events_part ON part_events(part_id);
@@ -498,7 +555,11 @@ def seed_activity(conn):
 
 def init_db(conn):
     new_activity = not conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'activity'").fetchone()
+    new_staff = not conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'staff'").fetchone()
     conn.executescript(SCHEMA)
+    if new_staff:  # 名簿を作ったときだけ初期の名簿を入れる（あとで全員消しても戻さない）
+        conn.executemany("INSERT OR IGNORE INTO staff(name, sort_order) VALUES (?, ?)",
+                         [(n, i) for i, n in enumerate(DEFAULT_STAFF)])
     migrate_records(conn)
     # 既存 DB への列追加（取り込み済みデータは残したまま）
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(records)")}
