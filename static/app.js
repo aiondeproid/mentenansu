@@ -3262,7 +3262,10 @@ async function renderAnalytics() {
   const todayStr = iso(now);
   const thisYear = now.getFullYear();
   // 期間プリセット（「直近N年」は N 年前の 1 月 1 日から今日まで）
+  const monthStart = (y, m) => iso(new Date(y, m, 1));
   const presets = [
+    ["今月", monthStart(thisYear, now.getMonth()), todayStr],
+    ["先月", monthStart(thisYear, now.getMonth() - 1), iso(new Date(thisYear, now.getMonth(), 0))],
     ["今年", `${thisYear}-01-01`, todayStr],
     ["昨年", `${thisYear - 1}-01-01`, `${thisYear - 1}-12-31`],
     ...[3, 5, 10].map(n => [`直近${n}年`, `${thisYear - n + 1}-01-01`, todayStr]),
@@ -3279,6 +3282,7 @@ async function renderAnalytics() {
   const totalDown = eqs.reduce((s, e) => s + e.downtime, 0);
   const totalCost = byYear.reduce((s, y) => s + y.cost, 0);
   const totalFail = byYear.reduce((s, y) => s + (y.futeiki || 0), 0);
+  const L = a.losses;
 
   view.innerHTML = `
     <div class="toolbar">
@@ -3292,7 +3296,11 @@ async function renderAnalytics() {
       <div class="kpi-tile"><div class="kpi-label">故障（不定期）件数</div><div class="kpi-value">${totalFail}<small>件</small></div></div>
       <div class="kpi-tile"><div class="kpi-label">停止・修理時間（記録分）</div><div class="kpi-value">${fmtNum(Math.round(totalDown / 60 * 10) / 10)}<small>時間</small></div></div>
       <div class="kpi-tile"><div class="kpi-label">修繕費用（記録分）</div><div class="kpi-value">${totalCost ? fmtNum(Math.round(totalCost / 10000)) : 0}<small>万円</small></div></div>
+      <a class="kpi-tile" href="#/losses/summary" style="color:inherit;text-decoration:none"><div class="kpi-label">ロス金額（ロス調査 ${L.count}件）</div><div class="kpi-value">${L.amount ? fmtNum(Math.round(L.amount / 10000)) : 0}<small>万円</small></div></a>
     </div>
+    ${L.pending || L.no_record ? `<p class="muted" style="font-size:13px;margin:0 0 12px">
+      ${L.pending ? `ロス調査のうち <a href="#/losses/confirm">${L.pending}件は設備の確認待ち</a>です。確認すると設備の作業記録（不定期）になり、上の故障件数・停止時間にも入ります。` : ""}
+      ${L.no_record ? `設備が決まっていても作業記録を作っていないロスが ${L.no_record}件あります（ロスの編集で作れます）。` : ""}</p>` : ""}
     <div class="grid cols-2">
       <div class="card chart-card">
         <h3>年別の作業件数</h3>
@@ -3302,7 +3310,7 @@ async function renderAnalytics() {
       </div>
       <div class="card chart-card">
         <h3>設備別の停止・修理時間 <span class="sub">分・時間の記載がある履歴のみ</span></h3>
-        ${hbarChart(eqs.filter(e => e.downtime > 0).slice(0, 10).map(e => ({ label: e.name, value: e.downtime, tip: `<div class='tip-title'>${h(e.name)}</div>停止・修理 ${fmtNum(e.downtime)}分 / 故障 ${e.futeiki}件` })), v => `${fmtNum(v)}分`)}
+        ${hbarChart(eqs.filter(e => e.downtime > 0).slice(0, 10).map(e => ({ label: e.name, eq: e.id, value: e.downtime, tip: `<div class='tip-title'>${h(e.name)}</div>停止・修理 ${fmtNum(e.downtime)}分 / 故障 ${e.futeiki}件` })), v => `${fmtNum(v)}分`)}
         ${tableView(["設備", "停止・修理(分)", "故障件数", "費用"], eqs.map(e => [e.name, e.downtime, e.futeiki, yen(e.cost)]))}
       </div>
       <div class="card chart-card">
@@ -3312,7 +3320,17 @@ async function renderAnalytics() {
       </div>
       <div class="card chart-card">
         <h3>設備別の故障件数</h3>
-        ${hbarChart(eqs.filter(e => e.futeiki > 0).sort((x, y) => y.futeiki - x.futeiki).slice(0, 10).map(e => ({ label: e.name, value: e.futeiki, tip: `<div class='tip-title'>${h(e.name)}</div>故障 ${e.futeiki}件 / 全${e.count}件` })), v => `${v}件`)}
+        ${hbarChart(eqs.filter(e => e.futeiki > 0).sort((x, y) => y.futeiki - x.futeiki).slice(0, 10).map(e => ({ label: e.name, eq: e.id, value: e.futeiki, tip: `<div class='tip-title'>${h(e.name)}</div>故障 ${e.futeiki}件 / 全${e.count}件` })), v => `${v}件`)}
+      </div>
+      <div class="card chart-card">
+        <h3>ロス原因別のロス金額 <span class="sub">ロス調査（設備なし・確認待ちも含む）</span></h3>
+        ${hbarChart(L.by_cause.filter(c => c.amount > 0).map(c => ({ label: c.cause, value: c.amount, tip: `<div class='tip-title'>${h(c.cause)}</div>${c.count}件 / 停止 ${fmtNum(c.stop_min)}分 / ${fmtNum(c.amount)}円` })), v => `${fmtNum(Math.round(v / 1000) / 10)}万円`)}
+        ${tableView(["ロス原因", "件数", "停止(分)", "金額(円)"], L.by_cause.map(c => [c.cause, c.count, fmtNum(c.stop_min), fmtNum(c.amount)]))}
+        <p style="font-size:12px;margin-top:8px"><a href="#/losses/summary">ロス調査の集計を開く</a></p>
+      </div>
+      <div class="card chart-card">
+        <h3>設備別のロス金額 <span class="sub">設備を確定したロスのみ</span></h3>
+        ${hbarChart(L.by_equipment.filter(e => e.amount > 0).map(e => ({ label: e.name, eq: e.id, value: e.amount, tip: `<div class='tip-title'>${h(e.name)}</div>${e.count}件 / 停止 ${fmtNum(e.stop_min)}分 / ${fmtNum(e.amount)}円` })), v => `${fmtNum(Math.round(v / 1000) / 10)}万円`)}
       </div>
     </div>`;
   const applyRange = (from, to) => {
@@ -3329,6 +3347,7 @@ async function renderAnalytics() {
     state.recordQuery = { q: r.dataset.kw.split("・")[0], sort: "done_date", dir: "desc", kind: "不定期" };
     location.hash = "#/records";
   }));
+  $$(".hrow[data-eq]").forEach(r => r.addEventListener("click", () => (location.hash = `#/equipment/${r.dataset.eq}`)));
 }
 
 function niceMax(v) {
@@ -3362,7 +3381,7 @@ function hbarChart(items, fmt) {
   if (!items.length) return `<p class="empty">データなし</p>`;
   const max = Math.max(...items.map(i => i.value));
   return `<div class="hbars">${items.map(i => `
-    <div class="hrow" data-tip="${h(i.tip)}" ${i.kw ? `data-kw="${h(i.kw)}" style="cursor:pointer"` : ""}>
+    <div class="hrow" data-tip="${h(i.tip)}" ${i.kw ? `data-kw="${h(i.kw)}" style="cursor:pointer"` : i.eq ? `data-eq="${h(i.eq)}" style="cursor:pointer"` : ""}>
       <span class="hname" title="${h(i.label)}">${h(i.label)}</span>
       <span class="htrack"><span class="hfill" style="width:${(i.value / max) * 85}%"></span><span class="hval">${fmt(i.value)}</span></span>
     </div>`).join("")}</div>`;

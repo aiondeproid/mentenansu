@@ -2079,7 +2079,24 @@ def analytics():
         pat = re.compile(kw)
         keywords.append({"keyword": kw.replace("|", "・"), "count": sum(1 for t in texts if pat.search(t))})
     keywords.sort(key=lambda k: -k["count"])
-    return jsonify(since=since, until=until, by_year=by_year, by_equipment=by_equipment, keywords=keywords)
+    # ロス調査（作業記録になっていない分＝設備なし・設備の確認待ちも含めて、ロスそのものを集計する）
+    lcond, largs = area_filter(keep_no_equipment=True)
+    lperiod = " AND l.occurred_date >= ? AND substr(l.occurred_date,1,10) <= ?"
+    lfrom = " FROM losses l LEFT JOIN equipment e ON e.id = l.equipment_id WHERE 1=1" + lperiod + lcond
+    lsum = """COUNT(*) AS count, COALESCE(SUM(l.stop_min),0) AS stop_min,
+              COALESCE(SUM(l.loss_amount),0) + COALESCE(SUM(l.waste_amount),0) AS amount"""
+    largs = [since, until] + largs
+    loss_total = dict(conn.execute(
+        "SELECT " + lsum + """, SUM(CASE WHEN l.equipment_confirmed = 0 THEN 1 ELSE 0 END) AS pending,
+                  SUM(CASE WHEN l.equipment_id IS NOT NULL AND l.equipment_confirmed = 1 AND l.record_id IS NULL THEN 1 ELSE 0 END) AS no_record"""
+        + lfrom, largs).fetchone())
+    loss_by_cause = rows(conn.execute(
+        "SELECT COALESCE(l.cause_type, '（未記入）') AS cause, " + lsum + lfrom + " GROUP BY 1 ORDER BY amount DESC, count DESC", largs))
+    loss_by_equipment = rows(conn.execute(
+        "SELECT e.id, e.code, COALESCE(e.nickname, e.name) AS name, " + lsum + lfrom
+        + " AND l.equipment_id IS NOT NULL AND l.equipment_confirmed = 1 GROUP BY e.id ORDER BY amount DESC, count DESC LIMIT 10", largs))
+    return jsonify(since=since, until=until, by_year=by_year, by_equipment=by_equipment, keywords=keywords,
+                   losses=dict(loss_total, by_cause=loss_by_cause, by_equipment=loss_by_equipment))
 
 
 # ---------------------------------------------------------------- 通知設定
