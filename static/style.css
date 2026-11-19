@@ -749,6 +749,10 @@ dialog#modal.wide { width: min(1240px, calc(100vw - 24px)); }
 .ls-total td { background: var(--surface-2); font-weight: 700; }
 .ls-bar { display: inline-block; width: 120px; height: 8px; background: var(--surface-2); border-radius: 4px; overflow: hidden; vertical-align: middle; }
 .ls-bar span { display: block; height: 100%; background: var(--brand); }
+.ls-kinds td:first-child { min-width: 260px; max-width: 420px; }
+.ls-rule { white-space: normal; line-height: 1.4; margin-top: 2px; }
+.ls-issues { margin: 8px 0 4px; }
+.ls-issues > summary { cursor: pointer; padding: 6px 0; }
 .form-sec { margin: 8px 0 -4px; font-size: 14px; color: var(--text); border-bottom: 1px solid var(--line); padding-bottom: 4px; }
 .form-grid.three { grid-template-columns: repeat(3, 1fr); }
 .form-grid.four { grid-template-columns: repeat(4, 1fr); }

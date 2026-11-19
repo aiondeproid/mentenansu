@@ -2180,8 +2180,8 @@ def losses_meta():
         return [r[0] for r in conn.execute(
             f"SELECT {col} FROM losses WHERE COALESCE({col}, '') != '' GROUP BY {col} ORDER BY COUNT(*) DESC, {col} LIMIT 80")]
     return jsonify(
-        loss_types=loss_mod.LOSS_TYPES, causes=loss_mod.CAUSES, recurrences=loss_mod.RECURRENCES, yes_no=loss_mod.YES_NO,
-        plant=loss_mod.PLANT, hourly_rate=loss_mod.get_rate(conn),
+        loss_types=loss_mod.LOSS_TYPES, loss_guide=loss_mod.LOSS_GUIDE, causes=loss_mod.CAUSES, recurrences=loss_mod.RECURRENCES, yes_no=loss_mod.YES_NO,
+        plant=loss_mod.PLANT, hourly_rate=loss_mod.get_rate(conn), autosave=loss_mod.export_status(),
         months=[r[0] for r in conn.execute(
             "SELECT DISTINCT substr(occurred_date, 1, 7) FROM losses WHERE occurred_date GLOB '[0-9][0-9][0-9][0-9]-*' ORDER BY 1 DESC")],
         lines=used("line"), processes=used("process"), product_classes=used("product_class"),
@@ -2289,6 +2289,7 @@ def loss_create():
     loss_id = conn.execute(f"INSERT INTO losses({','.join(v)}) VALUES ({','.join('?' * len(v))})", list(v.values())).lastrowid
     loss_link_record(conn, loss_id, d)
     conn.commit()
+    loss_mod.schedule_export(v.get("occurred_date"))
     return jsonify(id=loss_id), 201
 
 
@@ -2313,6 +2314,7 @@ def loss_update(loss_id):
     loss_mod.sync_record(conn, old, old | v)
     loss_link_record(conn, loss_id, d)
     conn.commit()
+    loss_mod.schedule_export(old.get("occurred_date"), merged.get("occurred_date"))  # 年度をまたいで直したら両方
     return jsonify(ok=True)
 
 
@@ -2329,14 +2331,18 @@ def loss_confirm(loss_id):
     loss_mod.sync_record(conn, dict(old), dict(old) | {"equipment_id": eq_id})
     loss_link_record(conn, loss_id, {"make_record": d.get("make_record")})
     conn.commit()
+    loss_mod.schedule_export(old["occurred_date"])
     return jsonify(ok=True)
 
 
 @app.delete("/api/losses/<int:loss_id>")
 def loss_delete(loss_id):
     conn = db()
+    old = conn.execute("SELECT occurred_date FROM losses WHERE id=?", (loss_id,)).fetchone()
     conn.execute("DELETE FROM losses WHERE id=?", (loss_id,))  # 一緒に作った作業記録は設備の履歴として残す
     conn.commit()
+    if old:
+        loss_mod.schedule_export(old["occurred_date"])
     return jsonify(ok=True)
 
 
@@ -2353,6 +2359,23 @@ def loss_rate_update():
     loss_mod.set_rate(conn, rate)
     conn.commit()
     return jsonify(ok=True, hourly_rate=rate)
+
+
+@app.get("/api/losses/autosave")
+def losses_autosave_status():
+    return jsonify(loss_mod.export_status())
+
+
+@app.post("/api/losses/autosave")
+def losses_autosave_now():
+    """共有フォルダへ今すぐ保存（month の年度。なければ今の年度）。"""
+    if not loss_mod.EXPORT_DIR:
+        abort(400, "保存先（MAINT_LOSS_EXPORT_DIR）が設定されていません")
+    fy = loss_mod.fiscal_year(body().get("month") or dt.date.today().isoformat())
+    st = loss_mod.export_now({fy})[fy]
+    if not st["ok"]:
+        abort(400, f"保存できませんでした: {st['error']}")
+    return jsonify(st)
 
 
 @app.get("/api/losses/export.xlsx")

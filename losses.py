@@ -18,6 +18,7 @@ import io
 import os
 import re
 import sys
+import threading
 
 import xlrd
 from openpyxl import Workbook
@@ -31,7 +32,24 @@ DEFAULT_GLOB = "076- ロス調査シート*.xls"
 
 PLANT = "関西"
 DEFAULT_RATE = 1800  # ロス金額の時間単価（円/h）。シートの式「ロス時間 × 1800」
-LOSS_TYPES = ["ライン停止", "検品・手直し", "配合ミス", "廃棄ロス"]
+LOSS_TYPES = ["ライン停止", "検品・手直し", "配合ミス", "廃棄ロス", "評価減"]
+# シート「記載すべきロス」の決まり。集計画面で分類ごとに基準と記入もれを示す
+#   rule: 記載の基準 / need: 書くこと（[項目, 見出し]。どれかが空なら記入もれ）
+#   min: [項目, 値] … この値より小さいものは基準に届かない（記載が要らないかもしれない）
+LOSS_GUIDE = [
+    {"type": "ライン停止", "rule": "原因は問わず、15分以上のライン停止。設備トラブルも記載（二重管理になっても書く）",
+     "need": [["line", "ライン"], ["product_name", "品名"], ["direct_cause", "原因"], ["stop_min", "停止時間"], ["stop_people", "配置人数"]],
+     "min": ["stop_min", 15], "min_label": "15分未満"},
+    {"type": "検品・手直し", "rule": "原因は問わず、検品・手直し作業。他工場への依頼、本社のミスなど他責も記載",
+     "need": [["line", "ライン"], ["product_name", "品名"], ["direct_cause", "原因"], ["inspect_min", "検品時間"], ["inspect_people", "配置人数"]]},
+    {"type": "配合ミス", "rule": "工程内不適合（人的ミス）",
+     "need": [["line", "ライン"], ["product_name", "品名"], ["direct_cause", "原因"]]},
+    {"type": "廃棄ロス", "rule": "上記以外の製品・原材料の廃棄（不適合品の廃棄、賞味期限切れ原材料、使い切れない派生品など）。およそ3万円以上。終売連絡書に関連するものは除く",
+     "need": [["waste_name", "廃棄品名"], ["waste_amount", "廃棄額"]],
+     "min": ["waste_amount", 30000], "min_label": "3万円未満"},
+    {"type": "評価減", "rule": "不適合品を原料に再生利用した差損、社販・営業に依頼した処分販売の差損",
+     "need": [["waste_name", "品名"], ["waste_amount", "差損額"]]},
+]
 CAUSES = ["設備由来", "原材料由来", "作業者由来", "方法・手順由来", "その他"]
 RECURRENCES = ["初発", "再発"]
 YES_NO = ["有", "無"]
@@ -398,6 +416,125 @@ def _write_month(ws, rows):
         ws.cell(2, c + 1).font = Font(bold=True)
     ws.row_dimensions[4].height = 48
     ws.freeze_panes = "D5"
+
+
+# ---------------------------------------------------------------- 共有フォルダへの自動保存
+# ロスを登録・変更・削除・設備確定したら、その年度（3 月〜翌 2 月）のシートを共有フォルダへ書き出す。
+#   保存先: <EXPORT_DIR>\<年度>年度\076- ロス調査シート（関西2026）アプリ出力.xlsx
+#   - 手で作っている「076- ロス調査シート（関西2026） - コピー.xls」とは別のファイル（上書きしない）
+#   - Excel で開かれていて書けないときは、1 分おきに書けるまでやり直す
+#   - 環境変数 MAINT_LOSS_EXPORT_DIR で保存先を変えられる（空にすると自動保存しない）
+EXPORT_DIR = os.environ.get(
+    "MAINT_LOSS_EXPORT_DIR",
+    "\\\\SV-NAR\\KANSAIBF_DATA\\000共有\\001　ロス時間調査シート\\ロス調査シート　関西ベスト（21年度）")  # = I: ドライブ
+FY_START_MONTH = 3
+EXPORT_DELAY = 3     # 続けて保存したときにまとめて 1 回書く（秒）
+EXPORT_RETRY = 60    # 書けなかったときにやり直すまでの秒数
+
+_export_lock = threading.Lock()
+_export_pending = set()   # 書き出し待ちの年度
+_export_timer = None
+_export_status = {}       # 年度 → {"path", "ok", "at", "error"}
+
+
+def fiscal_year(date_str):
+    """'2027-02-10' → 2026（3 月始まり）。日付として読めなければ None。"""
+    m = re.match(r"(\d{4})-(\d{2})", date_str or "")
+    if not m:
+        return None
+    y, mo = int(m.group(1)), int(m.group(2))
+    return y if mo >= FY_START_MONTH else y - 1
+
+
+def export_path(fy):
+    return os.path.join(EXPORT_DIR, f"{fy}年度", f"076- ロス調査シート（{PLANT}{fy}）アプリ出力.xlsx")
+
+
+def save_fiscal_year(conn, fy):
+    """年度のシートを共有フォルダへ書く。一時ファイルに書いてから置き換える（途中で壊れたファイルを残さない）。"""
+    path = export_path(fy)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    data = export_workbook(conn, f"{fy}-{FY_START_MONTH:02d}", f"{fy + 1}-{FY_START_MONTH - 1:02d}").getvalue()
+    tmp = os.path.join(os.path.dirname(path), f"~書き込み中_{os.getpid()}_{threading.get_ident()}.xlsx")
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    return path
+
+
+def _export_error(e):
+    if isinstance(e, PermissionError):
+        return "ファイルが Excel で開かれているか、書き込みの権限がありません（閉じると自動でやり直します）"
+    if isinstance(e, FileNotFoundError):
+        return "保存先のフォルダに接続できません（共有フォルダ・ネットワークを確認してください）"
+    return str(e)
+
+
+def export_now(fys):
+    """指定した年度をすぐ書き出す。年度 → 状態 を返す（書けなかった年度はやり直し待ちに入れる）。"""
+    conn = connect()
+    failed = False
+    try:
+        for fy in sorted(fys):
+            st = {"path": export_path(fy), "at": dt.datetime.now().isoformat(timespec="seconds")}
+            try:
+                save_fiscal_year(conn, fy)
+                st |= {"ok": True, "error": None}
+            except Exception as e:  # noqa: BLE001  保存に失敗してもアプリは止めない
+                st |= {"ok": False, "error": _export_error(e)}
+                failed = True
+                with _export_lock:
+                    _export_pending.add(fy)
+            with _export_lock:
+                _export_status[fy] = st
+    finally:
+        conn.close()
+    if failed:
+        _schedule(EXPORT_RETRY)
+    return {fy: _export_status[fy] for fy in fys}
+
+
+def _run_pending():
+    global _export_timer
+    with _export_lock:
+        fys = set(_export_pending)
+        _export_pending.clear()
+        _export_timer = None
+    if fys:
+        export_now(fys)
+
+
+def _schedule(delay):
+    global _export_timer
+    with _export_lock:
+        if _export_timer:
+            _export_timer.cancel()
+        _export_timer = threading.Timer(delay, _run_pending)
+        _export_timer.daemon = True
+        _export_timer.start()
+
+
+def schedule_export(*dates):
+    """ロスの製造日（変更前・変更後）を渡すと、その年度を少し後に書き出す。"""
+    fys = {fiscal_year(d) for d in dates} - {None}
+    if not EXPORT_DIR or not fys:
+        return
+    with _export_lock:
+        _export_pending.update(fys)
+    _schedule(EXPORT_DELAY)
+
+
+def export_status():
+    with _export_lock:
+        return {"dir": EXPORT_DIR, "pending": sorted(_export_pending),
+                "files": [dict(st, fy=fy) for fy, st in sorted(_export_status.items(), reverse=True)]}
 
 
 # ---------------------------------------------------------------- コマンド

@@ -471,12 +471,15 @@ async function renderLosses(id) {
       <div class="tabs-actions">
         <button class="btn" id="loss-rate" title="ロス金額 =（ライン停止ロス時間 + 検品ロス時間）× 時間単価">単価 ${fmtNum(lossMeta.hourly_rate)}円/h</button>
         <button class="btn" id="loss-export">Excel出力</button>
+        <button class="btn" id="loss-autosave" title="登録・変更すると、その年度のシートを共有フォルダへ自動で保存します">共有フォルダ <span id="loss-as-st" class="muted small"></span></button>
       </div>
     </div>
     <div id="loss-body"></div>`;
   $$(".tabs [data-tab]").forEach(a => a.addEventListener("click", e => { e.preventDefault(); lossState.tab = a.dataset.tab; renderLosses(); }));
   $("#loss-rate").addEventListener("click", openLossRate);
   $("#loss-export").addEventListener("click", openLossExport);
+  $("#loss-autosave").addEventListener("click", openLossAutosave);
+  showAutosaveMark();
   const el = $("#loss-body");
   if (lossState.tab === "confirm") await drawLossConfirm(el);
   else if (lossState.tab === "summary") await drawLossSummary(el);
@@ -577,7 +580,7 @@ async function drawLossConfirm(el) {
     sync(tr);
     $(".lc-eq", tr).addEventListener("change", () => sync(tr));
     $(".lc-ok", tr).addEventListener("click", async () => {
-      try { await confirmRow(tr); toast("確定しました"); refreshBadges(); if (!$("[data-lc]", el)) renderLosses(); }
+      try { await confirmRow(tr); toast("確定しました"); checkAutosaveLater(); refreshBadges(); if (!$("[data-lc]", el)) renderLosses(); }
       catch (ex) { toast(ex.message); }
     });
     $(".lc-open", tr).addEventListener("click", () => openLossForm(+tr.dataset.lc));
@@ -610,9 +613,50 @@ async function drawLossSummary(el) {
   const byCause = groupBy(list, x => x.cause_type || "（未記入）", lossMeta.causes);
   const byEq = groupBy(list.filter(x => x.equipment_id && x.equipment_confirmed), x => x.equipment_id)
     .map(([, l]) => l).sort((a, b) => sum(b, "loss_amount") - sum(a, "loss_amount") || b.length - a.length).slice(0, 15);
+  // シート「記載すべきロス」の分類ごとに集計し、基準に届かないもの・記入もれを拾う
+  const guide = lossMeta.loss_guide || [];
+  const blank = v => v == null || v === "";
+  const issues = new Map();  // ロス id → 要確認の理由
+  const flag = (x, why) => { if (!issues.has(x.id)) issues.set(x.id, { x, why: [] }); issues.get(x.id).why.push(why); };
+  const kinds = guide.map(g => {
+    const l = list.filter(x => x.loss_type === g.type);
+    const missing = l.filter(x => g.need.some(([k]) => blank(x[k])));
+    missing.forEach(x => flag(x, `記入もれ: ${g.need.filter(([k]) => blank(x[k])).map(([, label]) => label).join("・")}`));
+    const below = g.min ? l.filter(x => !blank(x[g.min[0]]) && +x[g.min[0]] < g.min[1]) : [];
+    below.forEach(x => flag(x, `基準未満（${g.min_label}）`));
+    return { ...g, l, missing, below };
+  });
+  const known = new Set(guide.map(g => g.type));
+  const others = guide.length ? list.filter(x => !known.has(x.loss_type)) : [];  // サーバーが古く基準が来ないときは出さない
+  others.forEach(x => flag(x, x.loss_type ? `分類「${x.loss_type}」はシートの分類にない` : "ロス分類が未記入"));
+  if (others.length) kinds.push({ type: "分類なし・その他", rule: "シートの分類（ライン停止・検品・手直し・配合ミス・廃棄ロス・評価減）のどれかに直してください", need: [], l: others, missing: [], below: [], other: true });
+  const chip = (cls, text) => `<span class="lv ${cls}" style="margin:0 4px 2px 0">${text}</span>`;
+  const kindRow = k => `<tr>
+    <td>${k.other ? `<strong>${h(k.type)}</strong>` : lossTypeBadge(k.type)}<div class="muted small ls-rule">${h(k.rule)}</div>
+      ${k.need.length ? `<div class="muted small">書くこと: ${k.need.map(([, label]) => h(label)).join("・")}</div>` : ""}</td>
+    <td class="num">${k.l.length}</td><td class="num">${fmtNum(sum(k.l, "stop_min"))}</td><td class="num">${fmtNum(sum(k.l, "inspect_min"))}</td>
+    <td class="num">${fmtNum(sum(k.l, "loss_amount"))}</td><td class="num">${fmtNum(sum(k.l, "waste_amount"))}</td>
+    <td class="num"><strong>${fmtNum(sum(k.l, "loss_amount") + sum(k.l, "waste_amount"))}</strong></td>
+    <td>${bar(sum(k.l, "loss_amount") + sum(k.l, "waste_amount"))}</td>
+    <td>${k.missing.length ? chip("soon", `記入もれ ${k.missing.length}件`) : ""}${k.below.length ? chip("unknown", `${h(k.min_label)} ${k.below.length}件`) : ""}${k.other && k.l.length ? chip("over", `分類を直す ${k.l.length}件`) : ""}${!k.missing.length && !k.below.length && !k.other && k.l.length ? '<span class="muted small">OK</span>' : ""}</td>
+  </tr>`;
+  const issueList = [...issues.values()].sort((a, b) => (a.x.occurred_date || "").localeCompare(b.x.occurred_date || ""));
   el.innerHTML = `
     <div class="toolbar"><label class="month-nav">期間 <input type="month" id="ls-from" value="${h(lossState.from)}"> 〜 <input type="month" id="ls-to" value="${h(lossState.to)}"></label>
       <span class="muted">金額は円。ロス時間 = 停止・検品の時間 × 人数</span></div>
+    ${guide.length ? `<div class="section-title"><h2>記載すべきロス（ロス分類別）</h2></div>
+    <p class="muted small" style="margin:0 0 8px">ロス調査シート「記載すべきロス」の分類と基準です。「記入もれ」は書くことが空のもの、「基準未満」は記載が要らないかもしれないものです。</p>
+    <div class="table-wrap"><table class="list plain ls-kinds"><thead><tr><th>ロス分類と記載の基準</th><th class="num">件数</th><th class="num">停止(分)</th><th class="num">検品(分)</th><th class="num">ロス金額</th><th class="num">廃棄・差損</th><th class="num">合計(円)</th><th>構成比</th><th>要確認</th></tr></thead><tbody>
+      ${kinds.map(kindRow).join("")}
+      <tr class="ls-total"><td><strong>合計</strong></td><td class="num">${list.length}</td><td class="num">${fmtNum(sum(list, "stop_min"))}</td><td class="num">${fmtNum(sum(list, "inspect_min"))}</td>
+        <td class="num">${fmtNum(sum(list, "loss_amount"))}</td><td class="num">${fmtNum(sum(list, "waste_amount"))}</td><td class="num"><strong>${fmtNum(total)}</strong></td><td></td>
+        <td>${issueList.length ? `${issueList.length}件` : ""}</td></tr></tbody></table></div>
+    ${issueList.length ? `<details class="ls-issues" ${issueList.length <= 10 ? "open" : ""}><summary>要確認のロス <b>${issueList.length}件</b> <span class="muted small">クリックで開いて直せます</span></summary>
+      <div class="table-wrap"><table class="list"><thead><tr><th>製造日</th><th>ロス分類</th><th>ライン</th><th>品名・発生状況</th><th>確認すること</th></tr></thead><tbody>
+      ${issueList.map(({ x, why }) => `<tr data-loss="${x.id}" style="cursor:pointer">
+        <td class="nowrap">${fmtDate(x.occurred_date)}</td><td>${lossTypeBadge(x.loss_type) || '<span class="muted">（未記入）</span>'}</td><td class="nowrap">${h(x.line || "")}</td>
+        <td class="clip">${h(x.product_name || "")}<div class="muted small">${h(x.situation || "")}</div></td>
+        <td>${why.map(w => `<div>${h(w)}</div>`).join("")}</td></tr>`).join("")}</tbody></table></div></details>` : ""}` : ""}
     <div class="section-title"><h2>月別</h2></div>
     <div class="table-wrap"><table class="list plain">${head("月")}<tbody>
       ${months.map(m => row(fmtMonth(m), list.filter(x => (x.occurred_date || "").startsWith(m)))).join("")}
@@ -627,6 +671,7 @@ async function drawLossSummary(el) {
   const go = () => { const f = $("#ls-from").value, t = $("#ls-to").value; if (f && t && f <= t) { lossState.from = f; lossState.to = t; drawLossSummary(el); } };
   $("#ls-from").addEventListener("change", go);
   $("#ls-to").addEventListener("change", go);
+  $$(".ls-issues [data-loss]", el).forEach(tr => tr.addEventListener("click", () => openLossForm(+tr.dataset.loss)));
   bindRowClicks(el);
 }
 
@@ -661,6 +706,50 @@ function openLossExport() {
   $("#lx-to").addEventListener("change", upd);
   $("#lx-go").addEventListener("click", () => setTimeout(closeModal, 300));
   upd();
+}
+
+/* 共有フォルダへの自動保存（losses.py の schedule_export）。状態の表示と「今すぐ保存」 */
+async function showAutosaveMark() {
+  const st = await api("/losses/autosave").catch(() => null);
+  const mark = $("#loss-as-st");
+  if (!st || !mark) return st;
+  const bad = st.files.filter(f => !f.ok);
+  mark.textContent = !st.dir ? "（未設定）" : bad.length ? "⚠ 未保存" : st.pending.length ? "保存待ち" : st.files.length ? "✓" : "";
+  mark.style.color = bad.length ? "var(--danger, #c00)" : "";
+  return st;
+}
+/* ロスを保存したあと、共有フォルダに書けたか少し待って確かめる（書けなければ知らせる） */
+function checkAutosaveLater() {
+  setTimeout(async () => {
+    const st = await showAutosaveMark();
+    const bad = st?.files.filter(f => !f.ok) || [];
+    if (bad.length) toast(`共有フォルダの Excel を保存できませんでした: ${bad[0].error}`, 6000);
+  }, 6000);
+}
+async function openLossAutosave() {
+  const st = await api("/losses/autosave");
+  const month = lossState.month || state.meta.today.slice(0, 7);
+  const fy = +lossFyStart(month).slice(0, 4);
+  const fmtAt = s => s ? s.replace("T", " ").slice(0, 16).replace(/-/g, "/") : "";
+  openModal("共有フォルダへの自動保存", `
+    <p class="hint">ロスを登録・変更・削除・設備確定すると、その年度（3月〜翌2月）のロス調査シートを共有フォルダへ自動で保存します。
+      Excel で開かれていて書けないときは、閉じたあと 1 分以内に自動でやり直します。</p>
+    <p><span class="muted small">保存先</span><br><code style="word-break:break-all">${h(st.dir || "（未設定）")}</code></p>
+    ${st.files.length ? `<div class="table-wrap"><table class="list plain"><thead><tr><th>年度</th><th>状態</th><th>日時</th></tr></thead><tbody>
+      ${st.files.map(f => `<tr><td class="nowrap">${f.fy}年度</td>
+        <td>${f.ok ? "保存しました" : `<span style="color:var(--danger, #c00)">⚠ ${h(f.error)}</span>`}<div class="muted small" style="word-break:break-all">${h(f.path)}</div></td>
+        <td class="nowrap">${h(fmtAt(f.at))}</td></tr>`).join("")}</tbody></table></div>`
+      : `<p class="muted small">このアプリを起動してから、まだ保存していません。</p>`}
+    ${st.pending.length ? `<p class="muted small">保存待ち: ${st.pending.map(y => `${y}年度`).join("・")}</p>` : ""}`, `
+    <button type="button" class="btn" data-close>閉じる</button>
+    <button type="button" class="btn primary" id="las-go" ${st.dir ? "" : "disabled"}>${fy}年度を今すぐ保存</button>`);
+  $("#las-go").addEventListener("click", async () => {
+    const b = $("#las-go");
+    b.disabled = true; b.textContent = "保存中…";
+    try { await api("/losses/autosave", { method: "POST", body: { month } }); toast(`${fy}年度のシートを共有フォルダに保存しました`); closeModal(); }
+    catch (ex) { toast(ex.message, 6000); b.disabled = false; b.textContent = `${fy}年度を今すぐ保存`; }
+    showAutosaveMark();
+  });
 }
 
 /* ロスの登録・編集。preset.record_id があれば、その作業記録から開いた（保存するとつなぐ） */
@@ -780,12 +869,13 @@ async function openLossForm(id, preset = {}) {
       if (data.occurred_date && location.hash.startsWith("#/losses")) lossState.month = data.occurred_date.slice(0, 7);
       closeModal();
       toast(data.make_record ? "保存しました（作業記録も作りました）" : "保存しました");
+      checkAutosaveLater();
       router();
     } catch (ex) { err.textContent = ex.message; err.hidden = false; }
   };
   $("#lf-del")?.addEventListener("click", async () => {
     if (!confirm(`このロスを削除しますか？${x.record_id ? "\n（一緒に作った作業記録は設備の履歴として残ります）" : ""}`)) return;
-    try { await api(`/losses/${id}`, { method: "DELETE" }); closeModal(); toast("削除しました"); router(); }
+    try { await api(`/losses/${id}`, { method: "DELETE" }); closeModal(); toast("削除しました"); checkAutosaveLater(); router(); }
     catch (ex) { toast(ex.message); }
   });
 }
