@@ -2148,8 +2148,8 @@ def notify_test():
     if not EMAIL_RE.match(email):
         abort(400, "メールアドレスを入力してください")
     try:
-        notify.send_mail(notify.load_config(), [email], "【設備保全】テストメール",
-                         "設備保全アプリからのテストメールです。このメールが届いていれば送信設定は正しく動いています。")
+        cfg = notify.load_config()
+        notify.send_mail(cfg, [email], *notify.test_message(cfg))
     except Exception as e:
         abort(400, f"送信できませんでした: {e}")
     return jsonify(ok=True)

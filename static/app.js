@@ -3500,13 +3500,18 @@ async function renderNotify() {
       <div class="card">
         <h3>送信設定 ${st.configured ? lvBadge("ok", "✓ 設定済み") : lvBadge("over", "未設定")}</h3>
         <dl class="info">
+          ${st.method === "notes" ? `
+          <dt>送信方法</dt><dd>Notes クライアント</dd>
+          <dt>状態</dt><dd>${h(st.notes_info)}</dd>
+          <dt>差出人</dt><dd>このパソコンの Notes にログインしている人</dd>` : `
+          <dt>送信方法</dt><dd>SMTP（メールサーバー）</dd>
           <dt>メールサーバー</dt><dd>${st.host ? `${h(st.host)}:${st.port}${st.starttls ? "（STARTTLS）" : ""}${st.auth ? "（認証あり）" : ""}` : '<span class="muted">未設定</span>'}</dd>
-          <dt>差出人</dt><dd>${h(st.from_addr) || '<span class="muted">未設定</span>'}</dd>
+          <dt>差出人</dt><dd>${h(st.from_addr) || '<span class="muted">未設定</span>'}</dd>`}
           <dt>本文のリンク</dt><dd>${h(st.app_url)}</dd>
           <dt>送るタイミング</dt><dd>平日の朝（タスクスケジューラで設定）。期限超過のままの項目は毎週${h(st.reminder_weekday)}曜にまとめて送る</dd>
           <dt>通知済み</dt><dd>${d.sent_count}件${d.last_sent ? `（最終 ${h(d.last_sent)}）` : ""}</dd>
         </dl>
-        <p class="muted" style="font-size:13px">サーバーやパスワードは画面からは変更できません。サーバー上の <span class="code">${h(st.config_path)}</span> を編集してください${st.config_exists ? "" : "（まだありません。notify.ini.example をコピーして作成）"}。</p>
+        <p class="muted" style="font-size:13px">送信方法・サーバー・パスワードは画面からは変更できません。サーバー上の <span class="code">${h(st.config_path)}</span> を編集してください${st.config_exists ? "" : "（まだありません。notify.ini.example をコピーして作成）"}。</p>
         <form id="test-form" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">
           <input type="email" name="email" placeholder="テスト送信先のアドレス" required style="flex:1;min-width:200px;padding:8px;border:1px solid #cfcec9;border-radius:6px">
           <button class="btn" ${st.configured ? "" : "disabled"}>テスト送信</button>

@@ -5,14 +5,22 @@
     python notify.py --init       今あるアラートを「通知済み」にする（初回の一斉送信を防ぐ）
     python notify.py --test 宛先  テストメールを 1 通送る
 
-送信設定は notify.ini（notify.ini.example をコピーして作る）。
-Notes（Domino）の場合は、Domino サーバーの SMTP（通常ポート 25）を指定する。
+    python notify.py --check      Notes で送れるか確認する（送信はしない。method = notes のとき）
+
+送信設定は notify.ini（notify.ini.example をコピーして作る）。送り方は 2 通り:
+  method = smtp   SMTP サーバーへ直接送る（Domino の SMTP なら通常ポート 25）
+  method = notes  このパソコンの Notes クライアントから送る（SMTP の設定は不要）。
+                  Notes は 32 ビット版のことが多いので、送信は Notes と同じビット数の
+                  PowerShell に任せる（notes_send.ps1）。Python のビット数は問わない。
 """
 import argparse
 import configparser
 import datetime as dt
+import json
 import os
 import smtplib
+import struct
+import subprocess
 import sys
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
@@ -21,6 +29,8 @@ from db import connect, init_db
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.environ.get("MAINT_NOTIFY_INI", os.path.join(BASE_DIR, "notify.ini"))
+NOTES_SCRIPT = os.path.join(BASE_DIR, "notes_send.ps1")
+NOTES_TIMEOUT = 120  # 秒。Notes がパスワード入力待ちで止まったときに諦めるまで
 WEEKDAYS = "月火水木金土日"
 LEVEL_LABEL = {"over": "期限超過", "soon": "まもなく"}
 
@@ -28,9 +38,14 @@ LEVEL_LABEL = {"over": "期限超過", "soon": "まもなく"}
 def load_config():
     cp = configparser.ConfigParser()
     cp.read(CONFIG_PATH, encoding="utf-8")
+    mail = cp["mail"] if cp.has_section("mail") else {}
     smtp = cp["smtp"] if cp.has_section("smtp") else {}
+    notes = cp["notes"] if cp.has_section("notes") else {}
     app = cp["app"] if cp.has_section("app") else {}
+    method = (mail.get("method", "smtp") or "smtp").strip().lower()
     return {
+        "method": method if method in ("smtp", "notes") else "smtp",
+        "notes_password": notes.get("password", ""),
         "host": smtp.get("host", "").strip(),
         "port": int(smtp.get("port", "25") or 25),
         "starttls": str(smtp.get("starttls", "no")).lower() in ("1", "yes", "true", "on"),
@@ -44,8 +59,15 @@ def load_config():
 
 def config_status(cfg):
     """画面表示用（パスワードは返さない）。"""
+    if cfg["method"] == "notes":
+        notes_ok, notes_msg = notes_powershell()
+        configured = notes_ok is not None
+    else:
+        notes_msg = ""
+        configured = bool(cfg["host"] and cfg["from_addr"])
     return {
-        "configured": bool(cfg["host"] and cfg["from_addr"]),
+        "method": cfg["method"], "notes_info": notes_msg,
+        "configured": configured,
         "host": cfg["host"], "port": cfg["port"], "starttls": cfg["starttls"],
         "auth": bool(cfg["user"]), "from_addr": cfg["from_addr"], "app_url": cfg["app_url"],
         "reminder_weekday": WEEKDAYS[cfg["reminder_weekday"] % 7],
@@ -162,8 +184,39 @@ def compose_body(area, new, stale, today, cfg):
     return "\n".join(out)
 
 
+def test_message(cfg, today=None):
+    """テストメールの件名と本文。本番と同じ組み立てで、見本の項目を載せる。"""
+    today = today or dt.date.today()
+    d = lambda n: (today + dt.timedelta(days=n)).strftime("%Y/%m/%d")
+    new = [
+        {"level": "over", "label": LEVEL_LABEL["over"], "title": "真空包装機 2号（P-012）",
+         "detail": f"シール用ヒーター交換 / 期限 {d(-8)}（8日超過）"},
+        {"level": "soon", "label": LEVEL_LABEL["soon"], "title": "コンベア A（C-003）",
+         "detail": f"ベルト交換 / 期限 {d(7)}（あと7日） / 稼働 1650/2000h"},
+        {"level": "soon", "label": "研磨上限が近い", "title": "スライサー刃 SN-0421（スライサー 1号）",
+         "detail": "研磨 9/10回"},
+    ]
+    stale = [{"level": "over", "label": LEVEL_LABEL["over"], "title": "排水ポンプ（W-001）",
+              "detail": f"メカニカルシール交換 / 期限 {d(-18)}（18日超過）"}]
+    head = [
+        "これは設備保全アプリからのテストメールです。このメールが届いていれば送信設定は正しく動いています。",
+        "以下は実際の通知メールの見本です（設備名・日付は架空のものです）。",
+        "-" * 40,
+        "",
+    ]
+    subject = "【設備保全】テストメール（見本: 前処理 交換アラート 新規3件 / 期限超過のまま1件）"
+    return subject, "\n".join(head) + "\n" + compose_body("前処理（見本）", new, stale, today, cfg)
+
+
 # ---------------------------------------------------------------- 送信
 def send_mail(cfg, to, subject, body):
+    if cfg["method"] == "notes":
+        _run_notes({"mode": "send", "to": list(to), "subject": subject, "body": body}, cfg)
+    else:
+        _send_smtp(cfg, to, subject, body)
+
+
+def _send_smtp(cfg, to, subject, body):
     if not cfg["host"] or not cfg["from_addr"]:
         raise RuntimeError(f"送信設定がありません。{CONFIG_PATH} の [smtp] host と from を設定してください")
     msg = EmailMessage()
@@ -179,6 +232,72 @@ def send_mail(cfg, to, subject, body):
         if cfg["user"]:
             s.login(cfg["user"], cfg["password"])
         s.send_message(msg)
+
+
+# ---------------------------------------------------------------- Notes から送る
+def _notes_clsid_bits():
+    """Lotus.NotesSession の COM が何ビットで登録されているか（32 / 64）。未登録なら None。"""
+    try:
+        import winreg
+    except ImportError:
+        return None
+    try:
+        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, r"Lotus.NotesSession\CLSID") as k:
+            clsid = winreg.QueryValue(k, None)
+    except OSError:
+        return None
+    for bits, view in ((64, winreg.KEY_WOW64_64KEY), (32, winreg.KEY_WOW64_32KEY)):
+        try:
+            winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, rf"SOFTWARE\Classes\CLSID\{clsid}\InprocServer32",
+                           0, winreg.KEY_READ | view).Close()
+            return bits
+        except OSError:
+            continue
+    return None
+
+
+def notes_powershell():
+    """Notes と同じビット数の powershell.exe。戻り値: (パス または None, 画面に出す説明)"""
+    bits = _notes_clsid_bits()
+    if bits is None:
+        return None, "このパソコンに Notes（Lotus.NotesSession）が見つかりません"
+    windir = os.environ.get("SystemRoot", r"C:\Windows")
+    py_bits = struct.calcsize("P") * 8
+    if bits == 32:
+        sub = "SysWOW64" if py_bits == 64 else "System32"
+    else:
+        sub = "Sysnative" if py_bits == 32 else "System32"  # 32 ビットの Python から 64 ビット側を呼ぶとき
+    exe = os.path.join(windir, sub, "WindowsPowerShell", "v1.0", "powershell.exe")
+    if not os.path.exists(exe):
+        return None, f"{bits} ビット版の PowerShell が見つかりません: {exe}"
+    return exe, f"このパソコンの Notes（{bits} ビット版）から送信"
+
+
+def _run_notes(payload, cfg):
+    exe, msg = notes_powershell()
+    if not exe:
+        raise RuntimeError(msg)
+    payload = dict(payload, password=cfg["notes_password"])
+    try:
+        p = subprocess.run(
+            [exe, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", NOTES_SCRIPT],
+            input=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            capture_output=True, timeout=NOTES_TIMEOUT,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"Notes が {NOTES_TIMEOUT} 秒たっても応答しません。パスワードの入力待ちで止まっている可能性があります"
+                           "（notify.ini の [notes] password を設定するか、Notes の「他の Notes 対応プログラムとパスワードを共有する」を有効にする）")
+    out = p.stdout.decode("utf-8", "replace").strip()
+    err = p.stderr.decode("utf-8", "replace").strip()
+    if p.returncode != 0:
+        raise RuntimeError(f"Notes でエラーになりました: {err or out or f'終了コード {p.returncode}'}")
+    return out
+
+
+def notes_check():
+    """Notes にログインしてメール DB を開けるか確かめる（送信はしない）。戻り値: Notes のユーザー名"""
+    return _run_notes({"mode": "check"}, load_config())
 
 
 def mark_sent(conn, keys, area=None):
@@ -230,12 +349,20 @@ if __name__ == "__main__":
     ap.add_argument("--init", action="store_true", help="今あるアラートを通知済みにする")
     ap.add_argument("--force", action="store_true", help="土日でも送る")
     ap.add_argument("--test", metavar="宛先", help="テストメールを送る")
+    ap.add_argument("--check", action="store_true", help="Notes で送れるか確認する（送信しない）")
     args = ap.parse_args()
-    if args.init:
-        init_log()
-    elif args.test:
-        send_mail(load_config(), [args.test], "【設備保全】テストメール",
-                  "設備保全アプリからのテストメールです。このメールが届いていれば送信設定は正しく動いています。")
-        print(f"テストメールを送信しました: {args.test}")
-    else:
-        sys.exit(run(dry_run=args.dry_run, force=args.force))
+    try:
+        if args.check:
+            print(notes_powershell()[1])
+            print(f"Notes にログインできました: {notes_check()}")
+        elif args.init:
+            init_log()
+        elif args.test:
+            cfg = load_config()
+            send_mail(cfg, [args.test], *test_message(cfg))
+            print(f"テストメールを送信しました: {args.test}")
+        else:
+            sys.exit(run(dry_run=args.dry_run, force=args.force))
+    except RuntimeError as e:
+        print(f"! {e}", file=sys.stderr)
+        sys.exit(1)
