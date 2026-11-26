@@ -274,7 +274,11 @@ def rule_state(rule, current_hours):
     """定期交換ルールの期限状況を返す。level: over / soon / ok / unknown"""
     out = {"days_left": None, "due_date": None, "hours_used": None, "hours_left": None}
     levels = []
-    if rule["interval_days"] and rule["last_done_date"]:
+    if rule.get("target_date"):  # 臨時（1回だけ）: 期限日だけで判定する
+        left = (dt.date.fromisoformat(rule["target_date"]) - today()).days
+        out.update(due_date=rule["target_date"], days_left=left)
+        levels.append("over" if left < 0 else "soon" if left <= SOON_DAYS else "ok")
+    elif rule["interval_days"] and rule["last_done_date"]:
         due = dt.date.fromisoformat(rule["last_done_date"]) + dt.timedelta(days=rule["interval_days"])
         left = (due - today()).days
         out.update(due_date=due.isoformat(), days_left=left)
@@ -477,7 +481,8 @@ def equipment_create():
             note = f"「{src['nickname'] or src['name']}」をコピーして追加"
         conn.execute(
             """INSERT INTO rules(equipment_id, title, interval_days, interval_hours, keyword, note, active)
-               SELECT ?, title, interval_days, interval_hours, keyword, note, active FROM rules WHERE equipment_id = ?""",
+               SELECT ?, title, interval_days, interval_hours, keyword, note, active FROM rules
+               WHERE equipment_id = ? AND target_date IS NULL""",
             (cur.lastrowid, int(d["copy_rules_from"])))
     log_equipment(conn, cur.lastrowid, "追加", by=request_user(), note=note)
     note_activity(detail=note)
@@ -682,6 +687,8 @@ def after_record_saved(conn, rec_id, v):
                    last_hours = CASE WHEN interval_hours IS NOT NULL THEN ? ELSE last_hours END
                WHERE id = ?""",
             (v["done_date"], eq["current_hours"] if eq and eq["current_hours"] is not None else 0, v["rule_id"]))
+        # 臨時の項目は 1 回やれば終わり。停止にしてアラートから外す
+        conn.execute("UPDATE rules SET active = 0 WHERE id = ? AND target_date IS NOT NULL", (v["rule_id"],))
     if v.get("part_serial"):
         for serial in [s.strip() for s in v["part_serial"].split(",") if s.strip()]:
             p = conn.execute("SELECT id FROM parts WHERE serial=?", (serial,)).fetchone()
@@ -830,7 +837,7 @@ def equipment_file_delete(file_id):
 
 # ---------------------------------------------------------------- 定期交換ルール
 RULE_FIELDS = ["equipment_id", "title", "interval_days", "interval_hours", "last_done_date", "last_hours",
-               "note", "active"]
+               "note", "active", "target_date"]
 
 
 def clean_rule(d):
@@ -841,6 +848,9 @@ def clean_rule(d):
     for f in ("interval_hours", "last_hours"):
         if v.get(f) is not None:
             v[f] = float(v[f])
+    if v.get("target_date"):  # 臨時の項目は期限日だけで管理する（間隔は持たない）
+        dt.date.fromisoformat(v["target_date"])  # 形式チェック
+        v.update(interval_days=None, interval_hours=None, last_hours=None)
     return v
 
 
@@ -854,8 +864,8 @@ def rule_create():
     v = clean_rule(body())
     if not v.get("equipment_id") or not v.get("title"):
         abort(400, "設備と項目名は必須です")
-    if not v.get("interval_days") and not v.get("interval_hours"):
-        abort(400, "間隔（日数か稼働時間）を入力してください")
+    if not v.get("interval_days") and not v.get("interval_hours") and not v.get("target_date"):
+        abort(400, "間隔（日数か稼働時間）か、臨時の期限日を入力してください")
     conn = db()
     cur = conn.execute(f"INSERT INTO rules({','.join(v)}) VALUES ({','.join('?' * len(v))})", list(v.values()))
     conn.commit()
@@ -926,11 +936,19 @@ def schedule():
     overdue, hours_only = [], []
     for r in rules:
         base = {k: r[k] for k in ("equipment_id", "equipment_name", "equipment_nickname", "equipment_code", "area",
-                                  "title", "level", "interval_days", "interval_hours")} | {"rule_id": r["id"]}
+                                  "title", "level", "interval_days", "interval_hours", "target_date")} | {"rule_id": r["id"]}
+        planned = planned_by_rule.get(r["id"])
+        if r["target_date"]:  # 臨時: 予定日が入っていればその予定だけ、なければ期限日に置く。見込みは出さない
+            if planned:
+                continue
+            if r["days_left"] < 0:
+                overdue.append(base | {"due_date": r["due_date"], "days_left": r["days_left"], "last_done_date": None})
+            elif s <= r["due_date"] <= e:
+                events.append(base | {"date": r["due_date"], "type": "due"})
+            continue
         if not r["interval_days"]:
             hours_only.append(base | {"hours_left": r["hours_left"]})
             continue
-        planned = planned_by_rule.get(r["id"])
         if planned:
             nxt = dt.date.fromisoformat(planned)
         elif r["due_date"] and r["days_left"] >= 0:
@@ -955,7 +973,7 @@ def schedule():
     return jsonify(events=events, overdue=overdue, hours_only=hours_only, today=today().isoformat(),
                    rules=[{k: r[k] for k in ("id", "equipment_id", "equipment_name", "equipment_nickname", "equipment_code",
                                              "title", "level", "interval_days", "interval_hours", "last_done_date",
-                                             "due_date")} for r in rules])
+                                             "due_date", "target_date")} for r in rules])
 
 
 # ---------------------------------------------------------------- 部品・研磨
@@ -1782,6 +1800,8 @@ def calib_temp_rows(conn, form, raw_rows):
                "action_no": blank_to_none(norm(r.get("action_no") or "").strip())}
         for f, label in (("ref_display", "基準温度計の表示"), ("ref_corrected", "基準温度計の補正温度"), ("inst_display", "庫内温度計の表示温度")):
             row[f] = _calib_num(r.get(f), label, where)
+        if row["ref_corrected"] is None:
+            row["ref_corrected"] = row["ref_display"]  # Ａが空欄なら基準温度計の表示をそのまま使う（補正なし）
         if row["zone"] and row["zone"] not in form["zones"]:
             abort(400, f"{where}: 検査温度は {'・'.join(form['zones'])} から選んでください")
         if row["min_display"] is not None and row["min_display"] not in form["min_displays"]:

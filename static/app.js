@@ -1041,7 +1041,7 @@ async function renderPlans() {
       </div>
       <button class="btn primary lg" id="new-rule">項目を追加</button>
     </div>
-    <p class="muted" style="font-size:13px;margin:0 0 10px">日数基準は前回実施日から、稼働時間基準は設備のアワーメーター（設備台帳で入力）から判定します。「14日以内」または「残り2割以下」で「まもなく」になります。</p>
+    <p class="muted" style="font-size:13px;margin:0 0 10px">日数基準は前回実施日から、稼働時間基準は設備のアワーメーター（設備台帳で入力）から、臨時の項目は期限日から判定します。「14日以内」または「残り2割以下」で「まもなく」になります。臨時の項目は完了の作業記録を保存すると終わります。</p>
     <div class="table-wrap"><table class="list responsive"><thead><tr>
       <th>状態</th><th>設備</th><th>項目</th><th>間隔</th><th>前回実施</th><th>次回期限（日数）</th><th>稼働時間</th><th></th>
     </tr></thead><tbody id="rules-body"></tbody></table></div>`;
@@ -1050,10 +1050,10 @@ async function renderPlans() {
     const show = new Set($$(".lv-filter").filter(c => c.checked).map(c => c.value));
     $("#rules-body").innerHTML = rules.filter(r => show.has(r.level)).map(r => `
       <tr data-rule="${r.id}" style="${r.active ? "" : "opacity:.5"}">
-        <td>${lvBadge(r.level)}${r.active ? "" : ' <span class="muted">停止中</span>'}</td>
+        <td>${lvBadge(r.level)}${ruleOff(r)}</td>
         <td class="eqcol" data-label="設備">${eqLabel(r)}</td>
         <td data-label="項目"><strong>${h(r.title)}</strong>${r.note ? `<div class="muted" style="font-size:12px">${h(r.note)}</div>` : ""}</td>
-        <td class="nowrap" data-label="間隔">${[r.interval_days ? `${r.interval_days}日` : "", r.interval_hours ? `${r.interval_hours}h` : ""].filter(Boolean).join(" / ")}</td>
+        <td class="nowrap" data-label="間隔">${ruleInterval(r)}</td>
         <td class="nowrap" data-label="前回">${r.last_done_date ? fmtDate(r.last_done_date) : '<span class="muted">未登録</span>'}</td>
         <td class="nowrap" data-label="期限">${r.due_date ? `${fmtDate(r.due_date)}<br>${r.days_left < 0 ? `<span class="warn-date">${-r.days_left}日超過</span>` : `<span class="muted">あと${r.days_left}日</span>`}` : "—"}</td>
         <td data-label="稼働">${r.interval_hours ? hoursMeter(r) : '<span class="muted">—</span>'}</td>
@@ -1067,6 +1067,14 @@ async function renderPlans() {
   draw();
 }
 
+/* 項目の間隔の表示。臨時（期限日だけの 1 回きり）の項目は「臨時」 */
+function ruleInterval(r) {
+  if (r.target_date) return `<span class="kind rinji">臨時</span>`;
+  return [r.interval_days ? `${r.interval_days}日` : "", r.interval_hours ? `${r.interval_hours}h` : ""].filter(Boolean).join(" / ");
+}
+/* 停止中の表示。臨時の項目が止まっているのは実施済み（完了） */
+const ruleOff = r => r.active ? "" : ` <span class="muted">${r.target_date ? "完了" : "停止中"}</span>`;
+
 function hoursMeter(r) {
   if (r.current_hours == null) return `<span class="muted">メーター未入力</span>`;
   const pct = Math.max(0, Math.min(100, (r.hours_used / r.interval_hours) * 100));
@@ -1077,7 +1085,7 @@ function hoursMeter(r) {
 }
 
 function recordForRule(r) {
-  openRecordForm(null, { equipment_id: r.equipment_id, rule_id: r.id, kind: "定期", content: r.title });
+  openRecordForm(null, { equipment_id: r.equipment_id, rule_id: r.id, kind: r.target_date ? "臨時" : "定期", content: r.title });
 }
 
 async function openRuleActions(id) {
@@ -1088,7 +1096,7 @@ async function openRuleActions(id) {
     <dl class="info">
       <dt>設備</dt><dd>${eqLabel(r)}</dd>
       <dt>状態</dt><dd>${lvBadge(r.level)}</dd>
-      <dt>間隔</dt><dd>${[r.interval_days ? `${r.interval_days}日ごと` : "", r.interval_hours ? `${r.interval_hours}時間ごと` : ""].filter(Boolean).join("、")}</dd>
+      <dt>間隔</dt><dd>${r.target_date ? `臨時（1回だけ）${r.active ? "" : "・完了"}` : [r.interval_days ? `${r.interval_days}日ごと` : "", r.interval_hours ? `${r.interval_hours}時間ごと` : ""].filter(Boolean).join("、")}</dd>
       <dt>前回実施</dt><dd>${fmtDate(r.last_done_date) || "未登録"}</dd>
       <dt>次回期限</dt><dd>${fmtDate(r.due_date) || "—"}</dd>
       ${r.interval_hours ? `<dt>稼働時間</dt><dd>${hoursMeter(r)}</dd>` : ""}
@@ -1104,24 +1112,41 @@ async function openRuleActions(id) {
 async function openRuleForm(rule, preset = {}) {
   await loadEquipment();
   const r = rule || { active: 1, ...preset };
-  openModal(rule ? "定期項目の設定" : "定期項目を追加", `
+  const oneTime = !!r.target_date;
+  openModal(rule ? "項目の設定" : "項目を追加", `
     <div class="form-grid">
+      <div class="field full"><span>種別</span><div class="rule-type">
+        <label><input type="radio" name="rule_type" value="regular" ${oneTime ? "" : "checked"}> 定期（間隔ごとにくり返す）</label>
+        <label><input type="radio" name="rule_type" value="once" ${oneTime ? "checked" : ""}> 臨時（1回だけ・期限日を決めて修理する）</label>
+      </div></div>
       <label class="field full"><span>設備<em class="req">*</em></span><select name="equipment_id">${equipmentOptions(e => (e.status !== "廃止" && inArea(e)) || e.id == r.equipment_id, r.equipment_id)}</select></label>
-      <label class="field full"><span>項目名<em class="req">*</em></span><input name="title" value="${h(r.title || "")}" placeholder="例: フィルタースクリュー交換"></label>
-      <label class="field"><span>間隔（日数）</span><input type="number" min="1" name="interval_days" value="${h(r.interval_days ?? "")}"></label>
-      <label class="field"><span>間隔（稼働時間 h）</span><input type="number" min="1" step="0.1" name="interval_hours" value="${h(r.interval_hours ?? "")}"></label>
-      <label class="field"><span>前回実施日</span><input type="date" name="last_done_date" value="${h(r.last_done_date || "")}"></label>
-      <label class="field"><span>前回実施時のメーター値（h）</span><input type="number" min="0" step="0.1" name="last_hours" value="${h(r.last_hours ?? "")}"></label>
+      <label class="field full"><span>項目名<em class="req">*</em></span><input name="title" value="${h(r.title || "")}" placeholder="例: フィルタースクリュー交換／ベアリング異音のため交換"></label>
+      <label class="field rt-once"><span>期限日<em class="req">*</em></span><input type="date" name="target_date" value="${h(r.target_date || "")}"><span class="hint">この日を過ぎると「期限超過」、14日前から「まもなく」になります。完了の作業記録を保存すると終わります</span></label>
+      <label class="field rt-regular"><span>間隔（日数）</span><input type="number" min="1" name="interval_days" value="${h(r.interval_days ?? "")}"></label>
+      <label class="field rt-regular"><span>間隔（稼働時間 h）</span><input type="number" min="1" step="0.1" name="interval_hours" value="${h(r.interval_hours ?? "")}"></label>
+      <label class="field rt-regular"><span>前回実施日</span><input type="date" name="last_done_date" value="${h(r.last_done_date || "")}"></label>
+      <label class="field rt-regular"><span>前回実施時のメーター値（h）</span><input type="number" min="0" step="0.1" name="last_hours" value="${h(r.last_hours ?? "")}"></label>
       <label class="field full"><span>根拠・メモ</span><textarea name="note">${h(r.note || "")}</textarea></label>
-      <label class="field"><span>有効</span><select name="active"><option value="1" ${r.active ? "selected" : ""}>有効</option><option value="0" ${r.active ? "" : "selected"}>停止</option></select></label>
+      <label class="field"><span>有効</span><select name="active"><option value="1" ${r.active ? "selected" : ""}>有効</option><option value="0" ${r.active ? "" : "selected"}>${oneTime ? "完了・停止" : "停止"}</option></select></label>
     </div><p class="err" id="form-err" hidden></p>`, `
     ${rule ? `<button type="button" class="btn danger left" id="del">削除</button>` : ""}
     <button type="button" class="btn" data-close>キャンセル</button>
     <button type="submit" class="btn primary">保存</button>`);
   const form = $("#modal-form");
+  const syncType = () => {
+    const once = form.rule_type.value === "once";
+    $$(".rt-once", form).forEach(el => (el.hidden = !once));
+    $$(".rt-regular", form).forEach(el => (el.hidden = once));
+  };
+  $$('[name="rule_type"]', form).forEach(el => el.addEventListener("change", syncType));
+  syncType();
   form.onsubmit = async e => {
     e.preventDefault();
-    const data = Object.fromEntries(new FormData(form));
+    const { rule_type, ...data } = Object.fromEntries(new FormData(form));
+    if (rule_type === "once") {
+      if (!data.target_date) { $("#form-err").textContent = "臨時の項目は期限日を入れてください"; $("#form-err").hidden = false; return; }
+      Object.assign(data, { interval_days: "", interval_hours: "", last_hours: "" });
+    } else data.target_date = "";
     try {
       if (rule) await api(`/rules/${rule.id}`, { method: "PUT", body: data });
       else await api("/rules", { method: "POST", body: data });
@@ -1129,7 +1154,7 @@ async function openRuleForm(rule, preset = {}) {
     } catch (ex) { $("#form-err").textContent = ex.message; $("#form-err").hidden = false; }
   };
   if (rule) $("#del").addEventListener("click", async () => {
-    if (!confirm("この定期項目を削除しますか？（作業履歴は残ります）")) return;
+    if (!confirm("この項目を削除しますか？（作業履歴は残ります）")) return;
     await api(`/rules/${rule.id}`, { method: "DELETE" });
     closeModal(); toast("削除しました"); router();
   });
@@ -1213,7 +1238,7 @@ function openPlanForm(date, preset = {}) {
 async function scheduleRule(ruleInfo, date) {
   await api("/records", {
     method: "POST",
-    body: { equipment_id: ruleInfo.equipment_id, rule_id: ruleInfo.rule_id, kind: "定期", status: "未着手",
+    body: { equipment_id: ruleInfo.equipment_id, rule_id: ruleInfo.rule_id, kind: ruleInfo.target_date ? "臨時" : "定期", status: "未着手",
             done_date: date, content: ruleInfo.title, author: currentUser() },
   });
   toast(`${fmtDate(date)} に予定を入れました`);
@@ -1303,7 +1328,7 @@ async function drawMonth() {
         if (b.dataset.act === "open") openRecordForm(ev.id);
         else if (b.dataset.act === "complete") { await completePlanned(ev); router(); }
         else if (b.dataset.act === "schedule") { await scheduleRule(ev, iso); router(); }
-        else if (b.dataset.act === "record") recordForRule({ id: ev.rule_id, equipment_id: ev.equipment_id, title: ev.title });
+        else if (b.dataset.act === "record") recordForRule({ id: ev.rule_id, equipment_id: ev.equipment_id, title: ev.title, target_date: ev.target_date });
         else if (b.dataset.act === "rule") openRuleActions(ev.rule_id);
       } catch (ex) { toast(ex.message); }
     }));
@@ -1351,7 +1376,7 @@ async function drawMonth() {
   bindOverdue(d.overdue);
   drawSide();
 }
-const pickRule = r => ({ rule_id: r.rule_id, equipment_id: r.equipment_id, title: r.title });
+const pickRule = r => ({ rule_id: r.rule_id, equipment_id: r.equipment_id, title: r.title, target_date: r.target_date });
 
 function dayItem(ev) {
   const key = evKey(ev);
@@ -1382,7 +1407,7 @@ function overduePanel(list) {
     <div class="table-wrap"><table class="list responsive plain"><thead><tr><th>設備</th><th>項目</th><th>前回実施</th><th>期限</th><th>予定日</th></tr></thead><tbody>
       ${list.map((r, i) => `<tr>
         <td class="eqcol" data-label="設備"><span class="ev-grip" draggable="true" data-od="${i}" title="カレンダーの日付へドラッグ">⠿</span> ${eqLabel({ equipment_code: r.equipment_code, equipment_name: r.equipment_nickname || r.equipment_name })}</td>
-        <td data-label="項目"><strong>${h(r.title)}</strong> <span class="muted">${r.interval_days}日ごと</span></td>
+        <td data-label="項目"><strong>${h(r.title)}</strong> ${r.target_date ? ruleInterval(r) : `<span class="muted">${r.interval_days}日ごと</span>`}</td>
         <td class="nowrap" data-label="前回">${fmtDate(r.last_done_date) || '<span class="muted">未登録</span>'}</td>
         <td class="nowrap" data-label="期限">${r.due_date ? `${fmtDate(r.due_date)} <span class="warn-date">${-r.days_left}日超過</span>` : '<span class="muted">前回不明</span>'}</td>
         <td class="nowrap"><input type="date" class="od-date" data-od="${i}" value="${state.meta.today}"> <button class="btn small primary od-go" data-od="${i}">予定に入れる</button></td>
@@ -1438,7 +1463,7 @@ async function drawYearPlan() {
       ${groups.map(([, rs]) => rs.map((r, i) => `<tr>
         ${i === 0 ? `<td rowspan="${rs.length}" class="eqcol"><a href="#/equipment/${r.equipment_id}">${h(eqName(r))}</a></td>` : ""}
         <td><a href="#" data-rule-open="${r.id}">${h(r.title)}</a>${overdue.has(r.id) ? ` ${lvBadge("over", "超過")}` : ""}</td>
-        <td class="nowrap muted">${[r.interval_days ? `${r.interval_days}日` : "", r.interval_hours ? `${r.interval_hours}h` : ""].filter(Boolean).join(" / ")}</td>
+        <td class="nowrap muted">${ruleInterval(r)}</td>
         ${Array.from({ length: 12 }, (_, m) => cell(r, m + 1)).join("")}
       </tr>`).join("")).join("")}
     </tbody></table></div>` : `<p class="empty">定期項目がありません。<a href="#/plans">交換アラート</a>から追加してください</p>`}`;
@@ -1563,14 +1588,17 @@ async function renderEquipment(id) {
   const subsHtml = (key, list, depth, order) => {
     if (!list.some(e => subPath(e)[depth])) return itemsHtml(list);
     // 枠の並びは db.py の SUBGROUP_ORDER の順、なければ稼働中の設備の順（廃止を表示しても枠の順が変わらないように）。
-    // ただし小分類がすべて英数字で始まる（Aライン・Bライン など）ときは名前順
+    // ただし SUBGROUP_ORDER にない枠は、英数字で始まるもの（Aライン・Bライン など）を名前順で先に、
+    // それ以外はその後ろに、「その他」という名前の枠は最後に置く
     const active = [...list].sort((a, b) => (a.status === "廃止") - (b.status === "廃止"));
     const seg = e => subPath(e)[depth];
     let subs = groupBy([...active.filter(seg), ...active.filter(e => !seg(e))], seg, order);
-    const named = subs.filter(([, l]) => seg(l[0]));
-    if (named.every(([s]) => /^[A-Za-z0-9]/.test(norm(s)))) {
-      subs = [...named.sort(([a], [b]) => norm(a).localeCompare(norm(b), "ja", { numeric: true })),
-        ...subs.filter(([, l]) => !seg(l[0]))];
+    const alnum = s => /^[A-Za-z0-9]/.test(norm(s));
+    const named = subs.filter(([s, l]) => seg(l[0]) && s !== "その他");
+    if (!order.length || named.every(([s]) => alnum(s))) {
+      subs = [...named.filter(([s]) => alnum(s)).sort(([a], [b]) => norm(a).localeCompare(norm(b), "ja", { numeric: true })),
+        ...named.filter(([s]) => !alnum(s)),
+        ...subs.filter(([s, l]) => !seg(l[0]) || s === "その他")];
     }
     return `<div class="eq-subs">${subs.map(([s, l]) => {
       const k = `${key}|${s}`;
@@ -1739,10 +1767,10 @@ async function renderEquipmentDetail(id) {
       </div>
     </div>
 
-    <div class="section-title"><h2>定期交換・点検項目</h2><button class="btn small" id="add-rule">項目を追加</button></div>
+    <div class="section-title"><h2>定期交換・点検項目 <span class="muted" style="font-size:13px;font-weight:normal">（臨時の修理も登録できます）</span></h2><button class="btn small" id="add-rule">項目を追加</button></div>
     ${eq.rules.length ? `<div class="table-wrap"><table class="list responsive"><thead><tr><th>状態</th><th>項目</th><th>間隔</th><th>前回</th><th>次回期限</th><th>稼働時間</th></tr></thead><tbody>
-      ${eq.rules.map(r => `<tr data-rule="${r.id}"><td>${lvBadge(r.level)}</td><td><strong>${h(r.title)}</strong></td>
-        <td class="nowrap">${[r.interval_days ? `${r.interval_days}日` : "", r.interval_hours ? `${r.interval_hours}h` : ""].filter(Boolean).join(" / ")}</td>
+      ${eq.rules.map(r => `<tr data-rule="${r.id}" style="${r.active ? "" : "opacity:.5"}"><td>${lvBadge(r.level)}${ruleOff(r)}</td><td><strong>${h(r.title)}</strong></td>
+        <td class="nowrap">${ruleInterval(r)}</td>
         <td class="nowrap">${fmtDate(r.last_done_date) || "—"}</td>
         <td class="nowrap">${fmtDate(r.due_date) || "—"}</td>
         <td>${r.interval_hours ? hoursMeter(r) : "—"}</td></tr>`).join("")}
@@ -2064,7 +2092,7 @@ function calRound(a, step) {
   return (sign * tenths) / 10 || 0;
 }
 function calCompute(r, limit, inclusive = false) {  // inclusive: ±limit 以下なら合（デジタル温度計）。false: ±limit 未満なら合（庫内温度計）
-  const rounded = calRound(r.ref_corrected, r.min_display);
+  const rounded = calRound(r.ref_corrected ?? r.ref_display, r.min_display);  // Ａが空欄なら基準温度計の表示をそのまま使う（保存時も同じ）
   const error = rounded != null && r.inst_display != null ? Math.round((r.inst_display - rounded) * 10) / 10 || 0 : null;
   const over = error != null && (inclusive ? Math.abs(error) > limit + 1e-9 : Math.abs(error) >= limit - 1e-9);
   const result = r.daily_ok === "否" ? "否" : error == null ? null : over ? "否" : "合";
@@ -2097,10 +2125,62 @@ function calSummary(f, c) {
   return c.inspector || "";
 }
 
+/* 校正タブの最初の画面: 様式ごとの最新の記録 ＋ すべての様式の記録の一覧 */
+const CAL_ALL = "";
+const calUnit = f => ({ temp: "台", dt: "件", scale: "台", timer: "件", conveyor: "回" }[f.type]);
+const calIsTemp = f => f.type === "temp" || f.type === "dt" || f.type === "scale";
+function calVerdict(f, c) {
+  if (f.type === "conveyor") return c.result ? calResult(c.result) : '<span class="muted">未判定</span>';
+  const u = calUnit(f);
+  return `${c.ng_count ? `<span class="lv over">否 ${c.ng_count}${u}</span> ` : ""}${c.ok_count ? `<span class="lv ok">合 ${c.ok_count}${u}</span>` : ""}`;
+}
+async function drawCalibrationsAll(el, forms) {
+  const list = await api("/calibrations");
+  const byForm = new Map(forms.map(k => [k, list.filter(c => c.form === k)]));
+  const formSelect = `<select id="cal-form"><option value="${CAL_ALL}" selected>すべての様式（一覧）</option>${forms.map(k => `<option value="${h(k)}">${h(calMeta.forms[k].title)}</option>`).join("")}</select>`;
+  el.innerHTML = `
+    <div class="toolbar"><div class="cal-title">${formSelect}<span class="muted">記録 ${list.length}件</span></div></div>
+    <div class="table-wrap"><table class="list responsive"><thead><tr>
+      <th>様式</th><th>記録</th><th>最新の検査日</th><th>最新の判定</th><th></th>
+    </tr></thead><tbody>${forms.map(k => {
+      const f = calMeta.forms[k], recs = byForm.get(k), last = recs[0];
+      const canNew = !calIsTemp(f) || f.instruments.length;
+      return `<tr data-form="${h(k)}">
+        <td data-label="様式"><strong>${h(f.title)}</strong> <span class="muted">${h(f.code || "")}</span></td>
+        <td data-label="記録">${recs.length}件</td>
+        <td class="nowrap" data-label="最新の検査日">${last ? `<a href="#" data-open-cal="${last.id}" data-stop>${fmtDate(last.inspected_on)}</a>` : '<span class="muted">まだありません</span>'}</td>
+        <td data-label="最新の判定">${last ? calVerdict(f, last) : ""}</td>
+        <td class="nowrap"><button class="btn small" data-new-cal="${h(k)}" data-stop ${canNew ? "" : "disabled"}>${calIsTemp(f) ? "検査を記録" : "校正を記録"}</button></td>
+      </tr>`;
+    }).join("")}</tbody></table></div>
+    <h3 class="cal-all-h">すべての記録</h3>
+    <div class="table-wrap"><table class="list responsive"><thead><tr>
+      <th>検査年月日</th><th>様式</th><th>内容</th><th>件数</th><th>判定</th><th>確認</th><th></th>
+    </tr></thead><tbody>${list.map(c => {
+      const f = calMeta.forms[c.form];
+      if (!f) return "";
+      return `<tr data-cal="${c.id}">
+        <td class="nowrap" data-label="検査年月日"><strong>${fmtDate(c.inspected_on)}</strong>${c.extra?.inspected_time ? ` <span class="muted">${h(c.extra.inspected_time)}</span>` : ""}</td>
+        <td data-label="様式">${h(f.title)}</td>
+        <td data-label="内容">${h(calSummary(f, c))}</td>
+        <td data-label="件数">${c.row_count}${calUnit(f)}</td>
+        <td data-label="判定">${calVerdict(f, c)}</td>
+        <td data-label="確認">${h(f.approvals.filter(([k]) => c[k]).map(([k, l]) => `${l} ${c[k]}`).join("・"))}</td>
+        <td><a class="btn small" href="/print/calibrations/${c.id}" target="_blank" rel="noopener" data-stop>印刷</a></td>
+      </tr>`;
+    }).join("") || `<tr><td colspan="7" class="empty">まだ記録はありません。上の表の「記録」ボタンから入れてください。</td></tr>`}
+    </tbody></table></div>`;
+  $("#cal-form").addEventListener("change", e => { calibState.form = e.target.value; drawCalibrations(el); });
+  $$("[data-form]", el).forEach(tr => tr.addEventListener("click", e => { if (!e.target.closest("[data-stop]")) { calibState.form = tr.dataset.form; drawCalibrations(el); } }));
+  $$("[data-new-cal]", el).forEach(b => b.addEventListener("click", () => openCalibration(null, b.dataset.newCal)));
+  $$("[data-open-cal]", el).forEach(a => a.addEventListener("click", e => { e.preventDefault(); openCalibration(+a.dataset.openCal); }));
+  $$("[data-cal]", el).forEach(tr => tr.addEventListener("click", e => { if (!e.target.closest("[data-stop]")) openCalibration(+tr.dataset.cal); }));
+}
+
 async function drawCalibrations(el) {
   await loadCalMeta(true);  // 庫内温度計が増えたときのため毎回読み直す
   const forms = calMeta.order || Object.keys(calMeta.forms);
-  if (!forms.includes(calibState.form)) calibState.form = forms[0];
+  if (calibState.form === CAL_ALL || !forms.includes(calibState.form)) { calibState.form = CAL_ALL; return drawCalibrationsAll(el, forms); }
   const f = calMeta.forms[calibState.form];
   const temp = f.type === "temp" || f.type === "dt" || f.type === "scale";  // 測定機器ごとの行がある様式
   const list = await api("/calibrations?form=" + encodeURIComponent(calibState.form));
@@ -2112,7 +2192,7 @@ async function drawCalibrations(el) {
   el.innerHTML = `
     <div class="toolbar">
       <div class="cal-title">
-        ${forms.length > 1 ? `<select id="cal-form">${forms.map(k => `<option value="${h(k)}" ${k === calibState.form ? "selected" : ""}>${h(calMeta.forms[k].title)}</option>`).join("")}</select>`
+        ${forms.length > 1 ? `<select id="cal-form"><option value="${CAL_ALL}">すべての様式（一覧）</option>${forms.map(k => `<option value="${h(k)}" ${k === calibState.form ? "selected" : ""}>${h(calMeta.forms[k].title)}</option>`).join("")}</select>`
           : `<strong>${h(f.title)}</strong>`}
         <span class="muted">様式：${h(f.code)}</span>
       </div>
@@ -2171,17 +2251,19 @@ function calTempBody(f, c) {
         <td>${num("ref_display", r.ref_display)}</td><td>${num("ref_corrected", r.ref_corrected)}</td>
         <td class="calc" data-out="rounded"></td>
         <td>${num("inst_display", r.inst_display)}</td>
-        <td class="calc" data-out="error"></td><td data-out="result"></td><td class="calc" data-out="correction"></td>
+        <td class="calc" data-out="error"></td><td class="calc" data-out="result"></td><td class="calc" data-out="correction"></td>
         <td><input name="action_no" value="${h(r.action_no || "")}" class="short"></td>
       </tr>`).join("")}</tbody></table>
-      <p class="hint">検査しなかった機器の行は空欄のままにすると残りません。</p>`,
+      <p class="hint">灰色の欄（処理後の温度・器差・判定・補正温度）は自動で入ります。補正温度（Ａ）が空欄のときは基準温度計の表示をそのまま使います。検査しなかった機器の行は空欄のままにすると残りません。</p>`,
     read: tr => {
       const g = name => $(`[name=${name}]`, tr).value;
       return { instrument_id: lines[+tr.dataset.n].instrument_id, min_display: calNum(g("min_display")), daily_ok: g("daily_ok"), zone: g("zone"),
         ref_display: calNum(g("ref_display")), ref_corrected: calNum(g("ref_corrected")), inst_display: calNum(g("inst_display")), action_no: g("action_no") };
     },
     update(tr) {
-      const out = calCompute(this.read(tr), f.limit);
+      const r = this.read(tr);
+      $("[name=ref_corrected]", tr).placeholder = r.ref_display ?? "";
+      const out = calCompute(r, f.limit);
       $("[data-out=rounded]", tr).textContent = calFmt(out.rounded);
       $("[data-out=error]", tr).textContent = calFmt(out.error, true);
       $("[data-out=correction]", tr).textContent = calFmt(out.correction, true);
@@ -2224,10 +2306,10 @@ function calDtBody(f, c) {
         ${rounding ? `<td>${r.canRound ? `<select name="min_display">${f.min_displays.map(v => `<option value="${v}" ${+r.min_display === v ? "selected" : ""}>${v.toFixed(1)}℃</option>`).join("")}</select>` : '<input type="hidden" name="min_display" value="0.1"><span class="muted">—</span>'}</td>
           <td class="calc" data-out="rounded"></td>` : ""}
         <td>${rounding ? "" : '<input type="hidden" name="min_display" value="0.1">'}${num("inst_display", r.inst_display)}</td>
-        <td class="calc" data-out="error"></td><td data-out="result"></td><td class="calc" data-out="correction"></td>
+        <td class="calc" data-out="error"></td><td class="calc" data-out="result"></td><td class="calc" data-out="correction"></td>
         <td><input name="action_no" value="${h(r.action_no || "")}" class="short"></td>
       </tr>`).join("")}</tbody></table>
-      <p class="hint">検査しなかった行は空欄のままにすると残りません。</p>`,
+      <p class="hint">灰色の欄は自動で入ります。ａが空欄のときは標準温度計の表示をそのまま使います。検査しなかった行は空欄のままにすると残りません。</p>`,
     read: tr => {
       const g = name => $(`[name=${name}]`, tr)?.value ?? "";
       return { instrument_id: lines[+tr.dataset.n].instrument_id, min_display: calNum(g("min_display")), daily_ok: g("daily_ok"), zone: g("zone"),
@@ -2235,7 +2317,9 @@ function calDtBody(f, c) {
     },
     update(tr) {
       const line = lines[+tr.dataset.n];
-      const out = calCompute(this.read(tr), f.limit, true);
+      const r = this.read(tr);
+      $("[name=ref_corrected]", tr).placeholder = r.ref_display ?? "";
+      const out = calCompute(r, f.limit, true);
       const rc = $("[data-out=rounded]", tr);
       if (rc) rc.textContent = line.canRound ? calFmt(out.rounded) : "";
       $("[data-out=error]", tr).textContent = calFmt(out.error, true);
@@ -2362,9 +2446,9 @@ function calFreeBody(f, c) {
   };
 }
 
-async function openCalibration(id) {
+async function openCalibration(id, form = calibState.form) {
   await loadCalMeta();
-  const c = id ? await api(`/calibrations/${id}`) : { form: calibState.form, inspected_on: state.meta.today, inspector: currentUser(), rows: [], extra: {} };
+  const c = id ? await api(`/calibrations/${id}`) : { form, inspected_on: state.meta.today, inspector: currentUser(), rows: [], extra: {} };
   const f = calMeta.forms[c.form];
   if (!f) { toast("様式が見つかりません"); return; }
   const temp = f.type === "temp" || f.type === "dt" || f.type === "scale";  // 測定機器ごとの行がある様式

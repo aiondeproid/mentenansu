@@ -87,7 +87,8 @@ CREATE TABLE IF NOT EXISTS rules (
     last_hours REAL,
     keyword TEXT,              -- 履歴から前回実施日を拾うキーワード
     note TEXT,
-    active INTEGER DEFAULT 1
+    active INTEGER DEFAULT 1,
+    target_date TEXT           -- 臨時（1回だけ）の項目の期限日。入っていれば間隔は使わず、完了したら停止にする
 );
 
 -- シリアル管理部品（フィルタースクリュー等）
@@ -449,6 +450,7 @@ SUBGROUP_ORDER = {
     "加熱・殺菌": ["焼き", "蒸煮"],
     "包装・充填・計数": ["包装", "充填", "計数", "印字"],
     "検査機（X線・金検）": ["X線", "金検"],
+    "搬送": ["バケットコンベア", "検品コンベア", "バーコンベア"],
 }
 
 
@@ -583,6 +585,8 @@ def init_db(conn):
             conn.execute(f"ALTER TABLE calibrations ADD COLUMN {col} TEXT")
     if "data" not in {r["name"] for r in conn.execute("PRAGMA table_info(calibration_rows)")}:
         conn.execute("ALTER TABLE calibration_rows ADD COLUMN data TEXT")
+    if "target_date" not in {r["name"] for r in conn.execute("PRAGMA table_info(rules)")}:
+        conn.execute("ALTER TABLE rules ADD COLUMN target_date TEXT")  # 臨時の項目（期限日だけ・1回だけ）
     for table in ("parts", "part_catalog"):
         if "location" not in {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN location TEXT")  # 保管場所

@@ -722,7 +722,8 @@ dialog#modal.wide { width: min(1240px, calc(100vw - 24px)); }
 .cal-table th { background: var(--surface-2); font-weight: 600; font-size: 12px; line-height: 1.3; }
 .cal-table input, .cal-table select { width: 82px; padding: 4px; font-size: 14px; }
 .cal-table input.short { width: 64px; }
-.cal-table td.calc { font-variant-numeric: tabular-nums; min-width: 56px; font-weight: 600; }
+.cal-table td.calc { font-variant-numeric: tabular-nums; min-width: 56px; font-weight: 600; background: var(--surface-2); }
+.cal-table td.calc:empty::after { content: "自動"; color: var(--muted, #999); font-weight: 400; font-size: 11px; }
 .cal-table tr.ng td { background: var(--lv-over-bg); }
 .cal-table input.mini { width: 58px; }
 .cal-free input[name=device] { width: 140px; }
@@ -769,3 +770,9 @@ dialog#modal.wide { width: min(1240px, calc(100vw - 24px)); }
 }
 .field .check input, .check input { width: auto; flex: none; }
 .check { justify-content: flex-start; }
+.cal-all-h { margin: 18px 0 8px; font-size: 15px; }
+#cal-body tr[data-form] { cursor: pointer; }
+
+/* 項目の種別（定期 / 臨時） */
+.rule-type { display: flex; flex-wrap: wrap; gap: 6px 18px; padding-top: 4px; }
+.rule-type label { display: inline-flex; align-items: center; gap: 4px; font-weight: normal; cursor: pointer; }
